@@ -62,6 +62,8 @@ def successful_invocations(events: list[dict[str, Any]]) -> tuple[set[str], dict
         event_type = event.get("event_type")
         invocation_id = event.get("invocation_id")
         if event_type == "invocation_attempt" and _nonempty_string(invocation_id):
+            if str(invocation_id) in attempts:
+                errors.append(f"invocation {invocation_id} has duplicate attempts")
             attempts[str(invocation_id)] = event
         elif event_type == "invocation_result" and _nonempty_string(invocation_id):
             if str(invocation_id) in results:
@@ -86,6 +88,34 @@ def successful_invocations(events: list[dict[str, Any]]) -> tuple[set[str], dict
         if result.get("result") == "success":
             successful.add(attempt_capability)
     return successful, results, errors
+
+
+def _host_observed_invocation(
+    events: list[dict[str, Any]], invocation_id: str, *, actor: Any
+) -> bool:
+    pair = [
+        event for event in events
+        if isinstance(event, dict)
+        and event.get("invocation_id") == invocation_id
+        and event.get("event_type") in {"invocation_attempt", "invocation_result"}
+    ]
+    if len(pair) != 2:
+        return False
+    attempts = [event for event in pair if event.get("event_type") == "invocation_attempt"]
+    results = [event for event in pair if event.get("event_type") == "invocation_result"]
+    if len(attempts) != 1 or len(results) != 1:
+        return False
+    attempt, result = attempts[0], results[0]
+    return bool(
+        result.get("result") == "success"
+        and attempt.get("actor") == actor
+        and result.get("actor") == actor
+        and attempt.get("capability") == result.get("capability")
+        and attempt.get("identity_assurance") == "host-hook-observed"
+        and result.get("identity_assurance") == "host-hook-observed"
+        and verify_record(attempt)
+        and verify_record(result)
+    )
 
 
 def _validate_goal(state: dict[str, Any], errors: list[str]) -> None:
@@ -234,7 +264,7 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
         if state.get("runtime") != "test":
             execution = executions.get(str(record.get("execution_id") or ""))
             if not isinstance(execution, dict) or not verify_record(execution):
-                errors.append(f"evidence {evidence_id} lacks trusted core execution attestation")
+                errors.append(f"evidence {evidence_id} lacks a valid local-core execution attestation")
             else:
                 bindings = {
                     "evidence_id": evidence_id,
@@ -255,7 +285,7 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     "artifact_hash": record.get("artifact_hash"),
                 }
                 if any(execution.get(key) != value for key, value in bindings.items()):
-                    errors.append(f"evidence {evidence_id} does not match trusted core execution")
+                    errors.append(f"evidence {evidence_id} does not match the locally attested core execution")
                 if execution.get("artifact_hash") != execution.get("output_sha256"):
                     errors.append(f"evidence {evidence_id} artifact is not bound to the complete gate output")
                 if execution.get("output_summary") != record.get("output_summary"):
@@ -343,7 +373,7 @@ def _validate_intents(
         or signed_manifest.get("contract") != "RequestManifest/v3"
         or not verify_record(signed_manifest)
     ):
-        errors.append("atomic request manifest lacks trusted core attestation")
+        errors.append("atomic request manifest lacks a valid local-core integrity attestation")
     else:
         bindings = {
             "goal_id": goal.get("goal_id"),
@@ -503,19 +533,17 @@ def _validate_changes_and_reviews(
         if not _nonempty_string(path) or not _path_allowed(str(path), allowed):
             errors.append(f"out-of-scope diff: {path}")
     if files:
-        review_policy = state.get("quality_profile", {}).get("review", {})
-        required_bindings = set(review_policy.get("record_must_bind", [])) if isinstance(review_policy, dict) else set()
-        require_invocations = {"implementer_invocation_id", "reviewer_invocation_id"}.issubset(required_bindings)
         _, invocation_results, invocation_errors = successful_invocations(events)
         errors.extend(invocation_errors)
         for field in ("base", "head", "diff_hash", "implementer", "implementer_responsibility_group"):
             if not _nonempty_string(changes.get(field)):
                 errors.append(f"changes.{field} missing")
         implementer_invocation = str(changes.get("implementer_invocation_id") or "")
-        if require_invocations:
-            result = invocation_results.get(implementer_invocation)
-            if not implementer_invocation or not isinstance(result, dict) or result.get("result") != "success" or result.get("actor") != changes.get("implementer"):
-                errors.append("changes implementer identity lacks a successful correlated invocation")
+        result = invocation_results.get(implementer_invocation)
+        if not implementer_invocation or not isinstance(result, dict) or result.get("result") != "success" or result.get("actor") != changes.get("implementer"):
+            errors.append("changes implementer identity lacks a successful correlated invocation")
+        elif not _host_observed_invocation(events, implementer_invocation, actor=changes.get("implementer")):
+            errors.append("changes implementer identity is not host-hook-observed")
         if changes.get("diff") and sha256_text(str(changes["diff"])) != changes.get("diff_hash"):
             errors.append("changes.diff_hash does not match diff content")
         reviews = state.get("reviews")
@@ -533,23 +561,22 @@ def _validate_changes_and_reviews(
                     errors.append(f"review {review.get('review_id')} belongs to a different goal version")
                 if review.get("reviewer") == changes.get("implementer") or review.get("implementer") != changes.get("implementer"):
                     errors.append(f"review {review.get('review_id')} actor/implementer identity is not independent")
-                if require_invocations:
-                    reviewer_invocation = str(review.get("reviewer_invocation_id") or "")
-                    reviewer_result = invocation_results.get(reviewer_invocation)
-                    if (
-                        not reviewer_invocation
-                        or not isinstance(reviewer_result, dict)
-                        or reviewer_result.get("result") != "success"
-                        or reviewer_result.get("actor") != review.get("reviewer")
-                    ):
-                        errors.append(f"review {review.get('review_id')} reviewer identity lacks a successful correlated invocation")
-                    if review.get("implementer_invocation_id") != implementer_invocation or reviewer_invocation == implementer_invocation:
-                        errors.append(f"review {review.get('review_id')} invocation identities are not independently bound")
-                    assurance = review.get("actor_identity_assurance")
-                    if assurance not in {"host-hook-observed", "declared-codex"}:
-                        errors.append(f"review {review.get('review_id')} actor identity assurance missing")
-                    elif assurance == "declared-codex":
-                        warnings.append("Codex reviewer independence is auditable but not cryptographically host-enforced")
+                reviewer_invocation = str(review.get("reviewer_invocation_id") or "")
+                reviewer_result = invocation_results.get(reviewer_invocation)
+                if (
+                    not reviewer_invocation
+                    or not isinstance(reviewer_result, dict)
+                    or reviewer_result.get("result") != "success"
+                    or reviewer_result.get("actor") != review.get("reviewer")
+                ):
+                    errors.append(f"review {review.get('review_id')} reviewer identity lacks a successful correlated invocation")
+                elif not _host_observed_invocation(events, reviewer_invocation, actor=review.get("reviewer")):
+                    errors.append(f"review {review.get('review_id')} reviewer identity is not host-hook-observed")
+                if review.get("implementer_invocation_id") != implementer_invocation or reviewer_invocation == implementer_invocation:
+                    errors.append(f"review {review.get('review_id')} invocation identities are not independently bound")
+                assurance = review.get("actor_identity_assurance")
+                if assurance != "host-hook-observed":
+                    errors.append(f"review {review.get('review_id')} actor identity assurance is not host-hook-observed")
                 if review.get("diff_hash") != changes.get("diff_hash") or review.get("base") != changes.get("base") or review.get("head") != changes.get("head"):
                     errors.append(f"review {review.get('review_id')} not bound to current base/head/diff")
                 rerun_ids = review.get("rerun_evidence_ids", [])
@@ -694,6 +721,16 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
     warnings: list[str] = []
     if not isinstance(state, dict) or not state:
         return {"valid": False, "health": "invalid", "errors": ["state must be a non-empty object"], "warnings": []}
+    authority = state.get("attestation_authority")
+    if not (
+        isinstance(authority, dict)
+        and authority.get("contract") == "AttestationAuthority/v3"
+        and authority.get("assurance") == "local-integrity-only"
+        and authority.get("same_user_adversary_resistant") is False
+    ):
+        errors.append("attestation authority limitation is missing or overstated")
+    else:
+        warnings.append("local HMAC provides operational tamper evidence, not a security boundary against same-user processes")
     _validate_goal(state, errors)
     _validate_spec(state, errors)
     goal = state.get("goal", {}) if isinstance(state.get("goal"), dict) else {}

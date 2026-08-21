@@ -182,20 +182,27 @@ def test_project_review_policy_binds_distinct_successful_actor_invocations(valid
     state["reviews"][0].update({
         "implementer_invocation_id": "inv-1",
         "reviewer_invocation_id": "inv-review",
-        "actor_identity_assurance": "declared-codex",
+        "actor_identity_assurance": "host-hook-observed",
     })
-    events.extend([
-        {"event_type": "invocation_attempt", "invocation_id": "inv-review", "capability": "independent-reviewer", "actor": "reviewer-a"},
-        {"event_type": "invocation_result", "invocation_id": "inv-review", "capability": "independent-reviewer", "actor": "reviewer-a", "result": "success"},
-    ])
     report = validate_state(state, events)
     assert report["valid"], report
-    assert any("not cryptographically host-enforced" in warning for warning in report["warnings"])
+    assert any("not a security boundary" in warning for warning in report["warnings"])
 
+    state["reviews"][0]["actor_identity_assurance"] = "declared-codex"
+    assert "not host-hook-observed" in messages(state, events)
+    state["reviews"][0]["actor_identity_assurance"] = "host-hook-observed"
     state["reviews"][0]["reviewer_invocation_id"] = "inv-1"
     result = messages(state, events)
     assert "reviewer identity lacks a successful correlated invocation" in result
     assert "invocation identities are not independently bound" in result
+
+
+def test_local_hmac_is_declared_as_integrity_only_not_host_security(valid_bundle):
+    state, events = valid_bundle
+    assert state["attestation_authority"]["same_user_adversary_resistant"] is False
+    report = validate_state(state, events)
+    assert report["valid"], report
+    assert any("same-user processes" in warning for warning in report["warnings"])
 
 
 def test_invented_waiver_fails_but_original_user_authorization_is_bound(valid_bundle):

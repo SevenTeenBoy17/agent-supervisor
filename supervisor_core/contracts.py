@@ -29,6 +29,30 @@ def _unique(items: list[Any]) -> list[Any]:
     return result
 
 
+def _merge_contract_rows(previous: list[Any], current: list[Any]) -> list[Any]:
+    """Append genuinely new contract rows without replacing prior identities."""
+    result = copy.deepcopy(previous)
+    seen: set[str] = set()
+    for item in result:
+        if isinstance(item, dict):
+            marker = str(item.get("criterion_id") or item.get("intent_id") or item.get("description") or item.get("text") or "")
+        else:
+            marker = str(item)
+        if marker:
+            seen.add(marker)
+    for item in current:
+        if isinstance(item, dict):
+            marker = str(item.get("criterion_id") or item.get("intent_id") or item.get("description") or item.get("text") or "")
+        else:
+            marker = str(item)
+        if marker and marker in seen:
+            continue
+        result.append(copy.deepcopy(item))
+        if marker:
+            seen.add(marker)
+    return result
+
+
 def build_goal(
     message: str,
     *,
@@ -43,18 +67,28 @@ def build_goal(
     supplied = copy.deepcopy(supplied or {})
     previous_goal = previous_goal or {}
     same_identity = change_mode in {"continue", "extend"} and previous_goal.get("goal_id")
-    goal_id = str(previous_goal["goal_id"]) if same_identity else str(supplied.get("goal_id") or stable_id("goal"))
+    if same_identity:
+        goal_id = str(previous_goal["goal_id"])
+    elif previous_goal and change_mode == "replace":
+        # A replacement is a new goal even when a caller tries to recycle the
+        # previous id. The superseded round remains independently addressable.
+        goal_id = stable_id("goal")
+    else:
+        goal_id = str(supplied.get("goal_id") or stable_id("goal"))
     version = int(previous_goal.get("version", 0)) + 1 if same_identity else int(supplied.get("version", 1))
     previous_criteria = _list(previous_goal.get("acceptance_criteria"))
     supplied_criteria = _list(supplied.get("acceptance_criteria"))
     if change_mode == "continue" and previous_goal:
-        objective = str(supplied.get("objective") or previous_goal.get("objective") or message).strip()
-        raw_criteria = supplied_criteria if "acceptance_criteria" in supplied else previous_criteria
+        objective = str(previous_goal.get("objective") or supplied.get("objective") or message).strip()
+        raw_criteria = _merge_contract_rows(previous_criteria, supplied_criteria)
     elif change_mode == "extend" and previous_goal:
         extension = str(supplied.get("objective") or message).strip()
         previous_objective = str(previous_goal.get("objective") or "").strip()
         objective = extension if supplied.get("objective") else " — ".join(item for item in (previous_objective, extension) if item)
-        raw_criteria = _unique(previous_criteria + (supplied_criteria or [{"description": extension, "domain": "config-agent", "expected_evidence": default_evidence or ["goal-output"]}]))
+        raw_criteria = _merge_contract_rows(
+            previous_criteria,
+            supplied_criteria or [{"description": extension, "domain": "config-agent", "expected_evidence": default_evidence or ["goal-output"]}],
+        )
     else:
         objective = str(supplied.get("objective") or message).strip()
         raw_criteria = supplied_criteria
@@ -197,6 +231,13 @@ def new_state(
         "intents": intents,
         "intent_manifest": intent_manifest,
         "request_manifest": request_manifest,
+        "attestation_authority": {
+            "contract": "AttestationAuthority/v3",
+            "scheme": "local-process-hmac-sha256",
+            "assurance": "local-integrity-only",
+            "same_user_adversary_resistant": False,
+            "limitation": "detects accidental/out-of-band mutation but is not a host security boundary",
+        },
         "tasks": [],
         "evidence": [],
         "reviews": [],
@@ -214,11 +255,12 @@ def new_state(
 
 
 def invocation_event(
-    *, invocation_id: str, capability: str, stage: str, result: str | None, actor: str, details: dict[str, Any] | None = None
+    *, invocation_id: str, capability: str, stage: str, result: str | None, actor: str,
+    details: dict[str, Any] | None = None, identity_assurance: str = "declared-runtime"
 ) -> dict[str, Any]:
     if stage not in {"attempt", "result"}:
         raise ValueError("invocation stage must be attempt or result")
-    return {
+    event = {
         "contract": "InvocationEvent/v3",
         "event_type": f"invocation_{stage}",
         "invocation_id": invocation_id,
@@ -226,9 +268,13 @@ def invocation_event(
         "stage": stage,
         "result": result if stage == "result" else None,
         "actor": actor,
+        "identity_assurance": identity_assurance,
         "details": details or {},
         "timestamp": utc_now(),
     }
+    if identity_assurance == "host-hook-observed":
+        event["attestation"] = sign_record(event)
+    return event
 
 
 def validate_review_shape(review: Any) -> bool:

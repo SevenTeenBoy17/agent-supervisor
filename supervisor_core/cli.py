@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from datetime import timedelta
 import json
 import os
 import re
@@ -18,7 +19,7 @@ from .discovery import baseline_report, parse_roots, scan_skills, write_baseline
 from .finalize import finalize_round
 from .lifecycle import read_project_config, read_quality_profile, start_round
 from .routing import route_intents, split_intents
-from .rollout import apply_observation, promote, rollback_active_version
+from .rollout import active_version_snapshot, apply_observation, promote, reset_rollback_cycle, rollback_active_version
 from .storage import StateContext, atomic_write_bytes, atomic_write_json, default_round, default_session, prune_old_state
 from .util import json_load, parse_time, redact, sha256_bytes, sha256_text, stable_id, utc_now
 from .validation import validate_state
@@ -214,7 +215,7 @@ def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_ty
         record = _record_from_payload(payload, event_type)
         apply_observation(state.setdefault("rollout", {}), record)
         if state["rollout"].get("rollback", {}).get("required") and not state["rollout"].get("rollback", {}).get("performed"):
-            rollback = rollback_active_version()
+            rollback = rollback_active_version(expected_active=active_version_snapshot())
             state["rollout"]["rollback"].update(rollback)
             if not rollback.get("performed"):
                 state["health"] = "degraded"
@@ -329,6 +330,8 @@ def _run_registered_gate(
     gate = _registered_gate(state, gate_id)
     if not gate:
         raise InvalidState(f"gate is not registered in QualityProfile: {gate_id}")
+    global_gates_at_start = state.get("quality_profile", {}).get("global_gates", [])
+    gate_active_identity = active_version_snapshot() if gate_id in global_gates_at_start else None
     command = list(gate["command"])
     execution_id = stable_id("execution")
     evidence_id = str(request.get("evidence_id") or stable_id("evidence"))
@@ -434,7 +437,10 @@ def _run_registered_gate(
         elif gate_id == "config.historical-replay":
             kind, values = "historical_replay", {"passed": exit_code == 0}
         elif gate_id in global_gates:
-            kind, values = "global_gate", {"result": "success" if exit_code == 0 else "failed"}
+            kind, values = "global_gate", {
+                "result": "success" if exit_code == 0 else "failed",
+                "active_version": copy.deepcopy(gate_active_identity),
+            }
         if kind:
             observation = {
                 "contract": "RolloutObservation/v3",
@@ -447,13 +453,103 @@ def _run_registered_gate(
             }
             observation["attestation"] = sign_record(observation)
 
+            claim_started_at = utc_now()
+            lease_seconds = max(1, int(os.environ.get("AGENT_SUPERVISOR_ROLLBACK_CLAIM_LEASE_SECONDS", "30")))
+            claim_expires_at = (
+                parse_time(claim_started_at) + timedelta(seconds=lease_seconds)
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            rollback_claim_id = stable_id("rollback-claim", f"{observation['observation_id']}:{claim_started_at}")
+            claimed: dict[str, Any] = {"value": False, "expected_active": None, "recovery": False}
+
             def update_rollout(current: dict[str, Any]) -> dict[str, Any]:
                 target = copy.deepcopy(current or latest.get("rollout", {}))
-                return apply_observation(target, observation)
+                apply_observation(target, observation)
+                row = target.setdefault("rollback", {})
+                claim_status = str(row.get("claim_status") or "")
+                expired = False
+                if claim_status == "in_progress":
+                    try:
+                        expired = parse_time(str(row.get("claim_expires_at") or "")) <= parse_time(claim_started_at)
+                    except ValueError:
+                        expired = True
+                legacy_incomplete = row.get("attempted") is True and row.get("performed") is not True and not claim_status
+                recovery = claim_status == "retriable" or (claim_status == "in_progress" and expired) or legacy_incomplete
+                first_claim = row.get("attempted") is not True
+                bound_expected = target.get("metrics", {}).get("global_gate_active_identity")
+                original_expected = row.get("expected_active") if recovery else bound_expected
+                concrete_expected = (
+                    isinstance(original_expected, dict)
+                    and bool(str(original_expected.get("version") or "").strip())
+                    and bool(str(original_expected.get("path") or "").strip())
+                )
+                if (
+                    row.get("required") is True
+                    and row.get("performed") is not True
+                    and (first_claim or recovery)
+                    and concrete_expected
+                ):
+                    row.update({
+                        "attempted": True,
+                        "performed": False,
+                        "claim_id": rollback_claim_id,
+                        "claim_status": "in_progress",
+                        "expected_active": copy.deepcopy(original_expected),
+                        "attempt_count": int(row.get("attempt_count", 0)) + 1,
+                        "recovery_count": int(row.get("recovery_count", 0)) + (1 if recovery else 0),
+                        "attempted_at": claim_started_at,
+                        "claim_expires_at": claim_expires_at,
+                    })
+                    claimed["value"] = True
+                    claimed["expected_active"] = copy.deepcopy(original_expected)
+                    claimed["recovery"] = recovery
+                return target
 
             project_rollout = ctx.update_project_rollout(update_rollout)
+            rollback_result: dict[str, Any] | None = None
+            if claimed["value"]:
+                try:
+                    rollback_result = rollback_active_version(expected_active=claimed["expected_active"])
+                except Exception as exc:  # Claim is made retriable below; pointer CAS keeps replay safe.
+                    rollback_result = {
+                        "performed": False,
+                        "reason": f"{type(exc).__name__}-before-pointer-confirmation",
+                        "target": None,
+                    }
+
+                def record_rollback(current: dict[str, Any]) -> dict[str, Any]:
+                    row = current.setdefault("rollback", {})
+                    if row.get("claim_id") != rollback_claim_id:
+                        return current
+                    performed = rollback_result.get("performed") is True
+                    row.update({
+                        "performed": performed,
+                        "claim_status": "completed" if performed else "retriable",
+                        "target": rollback_result.get("target"),
+                        "target_active": copy.deepcopy(rollback_result.get("target_active")),
+                        "reason": rollback_result.get("reason"),
+                        "completed_at": utc_now(),
+                    })
+                    if rollback_result.get("reason") == "active-version-cas-mismatch":
+                        reset_rollback_cycle(current, "claim-active-version-cas-mismatch")
+                        return current
+                    if not performed:
+                        row["claim_expires_at"] = utc_now()
+                    return current
+
+                project_rollout = ctx.update_project_rollout(record_rollback)
             ctx.update(lambda state_value: state_value.update({"rollout": copy.deepcopy(project_rollout), "updated_at": utc_now()}))
             ctx.append_event(observation)
+            if rollback_result is not None:
+                ctx.append_event({
+                    "event_type": "rollout_auto_rollback",
+                    "status": "performed" if rollback_result.get("performed") else "retriable",
+                    "target": rollback_result.get("target"),
+                    "reason": rollback_result.get("reason"),
+                    "claim_id": rollback_claim_id,
+                    "recovery": claimed.get("recovery") is True,
+                })
+                if rollback_result.get("performed") is not True:
+                    ctx.update(lambda state_value: state_value.update({"health": "degraded", "updated_at": utc_now()}))
     except Exception as exc:
         ctx.update(lambda state_value: state_value.update({"health": "degraded", "updated_at": utc_now()}))
         ctx.append_event({"event_type": "rollout_gate_degraded", "status": "degraded", "summary": type(exc).__name__})
@@ -881,6 +977,28 @@ def command_hook(args: argparse.Namespace) -> int:
             return EXIT_COMPLETE
         ctx = _context(ns, require_existing=args.event != "SessionStart")
         if args.event == "SessionStart":
+            if isinstance(adapter, dict) and adapter.get("degraded_prior") is True:
+                ctx.session_root.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(
+                    ctx.session_root / "adapter-health.json",
+                    {
+                        "contract": "AdapterHealth/v3",
+                        "runtime": ns.runtime,
+                        "session": ns.session,
+                        "health": "degraded",
+                        "degraded_prior": True,
+                        "acknowledged_at": utc_now(),
+                        "recovery_requires": "durable active round acknowledgement",
+                    },
+                )
+                print(json.dumps({
+                    "agent_supervisor": {"health": "degraded", "durable_ack": True},
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": "Supervisor v3 detected prior degraded operation; the marker remains until the next goal round records it.",
+                    },
+                }, ensure_ascii=False))
+                return EXIT_DEGRADED
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "Supervisor v3 ready; goal will be classified on the next prompt."}}))
             return EXIT_COMPLETE
         state = ctx.load()
@@ -890,6 +1008,7 @@ def command_hook(args: argparse.Namespace) -> int:
             ctx.append_event({"event_type": "adapter_recovered", "status": "degraded", "degraded_prior": True, "adapter_version": adapter.get("adapter_version")})
         tool_name = str(payload.get("tool_name") or payload.get("tool") or "unknown")
         tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+        host_actor = str(payload.get("agent_id") or payload.get("subagent_id") or payload.get("actor") or "claude")
         capability_name = str(
             tool_input.get("skill")
             or tool_input.get("capability")
@@ -924,7 +1043,10 @@ def command_hook(args: argparse.Namespace) -> int:
                     })
                 print(json.dumps(output, ensure_ascii=False))
                 return EXIT_COMPLETE
-            ctx.append_event(invocation_event(invocation_id=invocation_id, capability=capability_name, stage="attempt", result=None, actor="claude", details={"summary": f"{tool_name} attempt"}))
+            ctx.append_event(invocation_event(
+                invocation_id=invocation_id, capability=capability_name, stage="attempt", result=None,
+                actor=host_actor, details={"summary": f"{tool_name} attempt"}, identity_assurance="host-hook-observed",
+            ))
             print("{}")
             return EXIT_COMPLETE
         if args.event in {"PostToolUse", "PostToolUseFailure"}:
@@ -942,7 +1064,10 @@ def command_hook(args: argparse.Namespace) -> int:
             )
             result_name = "failed" if failed else "success"
             ctx.update(lambda state_value: _record_breaker_result(state_value, capability_name, result_name))
-            ctx.append_event(invocation_event(invocation_id=invocation_id, capability=capability_name, stage="result", result=result_name, actor="claude", details={"summary": f"{tool_name} completed"}))
+            ctx.append_event(invocation_event(
+                invocation_id=invocation_id, capability=capability_name, stage="result", result=result_name,
+                actor=host_actor, details={"summary": f"{tool_name} completed"}, identity_assurance="host-hook-observed",
+            ))
             print("{}")
             return EXIT_COMPLETE
         if args.event == "SubagentStop":
@@ -989,7 +1114,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.0.0")
+    parser.add_argument("--version", action="version", version="3.0.1")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

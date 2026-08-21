@@ -29,6 +29,56 @@ def test_continue_extend_keep_goal_identity_and_replace_supersedes(tmp_path):
     assert c2.load()["superseded_by"]["goal_id"] == s3["goal"]["goal_id"]
 
 
+def test_unresolved_criteria_and_intents_survive_continue_and_replace_forces_new_id(tmp_path):
+    first_ctx = context(tmp_path, "carry-r1")
+    first = start_round(
+        first_ctx,
+        message="requirement A",
+        change_mode="continue",
+        execution_mode="warn",
+        project_config={},
+        quality_profile={},
+        goal_supplied={
+            "goal_id": "goal-a",
+            "objective": "Finish requirement A",
+            "acceptance_criteria": [{"criterion_id": "criterion-a", "description": "A passes", "expected_evidence": ["gate-a"]}],
+        },
+        intents_supplied=[{"intent_id": "intent-a", "text": "finish A", "status": "deferred", "reason": "still pending"}],
+    )
+    second_ctx = context(tmp_path, "carry-r2")
+    second = start_round(
+        second_ctx,
+        message="continue with B",
+        change_mode="continue",
+        execution_mode="warn",
+        project_config={},
+        quality_profile={},
+        goal_supplied={
+            "goal_id": "goal-a",
+            "objective": "Silently replace A",
+            "acceptance_criteria": [{"criterion_id": "criterion-b", "description": "B passes", "expected_evidence": ["gate-b"]}],
+        },
+        intents_supplied=[{"intent_id": "intent-a", "text": "finish B", "status": "deferred", "reason": "new work"}],
+    )
+    assert second["goal"]["goal_id"] == first["goal"]["goal_id"]
+    assert second["goal"]["objective"] == "Finish requirement A"
+    assert {row["criterion_id"] for row in second["goal"]["acceptance_criteria"]} == {"criterion-a", "criterion-b"}
+    assert {row["text"] for row in second["intents"]} == {"finish A", "finish B"}
+    assert len({row["intent_id"] for row in second["intents"]}) == 2
+
+    replacement_ctx = context(tmp_path, "carry-r3")
+    replacement = start_round(
+        replacement_ctx,
+        message="replace with C",
+        change_mode="replace",
+        execution_mode="warn",
+        project_config={},
+        quality_profile={},
+        goal_supplied={"goal_id": second["goal"]["goal_id"], "objective": "C"},
+    )
+    assert replacement["goal"]["goal_id"] != second["goal"]["goal_id"]
+
+
 def test_adapter_default_scope_uses_project_lease_and_carries_records(tmp_path):
     c1 = context(tmp_path, "r1")
     first = start_round(

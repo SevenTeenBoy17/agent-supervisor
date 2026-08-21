@@ -29,8 +29,12 @@
     },
     "InvocationEvent": {
       "type": "object",
-      "required": ["invocation_id", "capability", "stage", "actor", "timestamp"],
-      "properties": {"stage": {"enum": ["attempt", "result"]}, "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", null]}}
+      "required": ["invocation_id", "capability", "stage", "actor", "identity_assurance", "timestamp"],
+      "properties": {
+        "stage": {"enum": ["attempt", "result"]},
+        "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", null]},
+        "identity_assurance": {"enum": ["host-hook-observed", "declared-runtime"]}
+      }
     },
     "EvidenceRecord": {
       "type": "object",
@@ -38,8 +42,22 @@
     },
     "ReviewRecord": {
       "type": "object",
-      "required": ["review_id", "goal_id", "goal_version", "reviewer", "responsibility_group", "implementer", "base", "head", "diff_hash", "rerun_evidence_ids", "verdict"],
-      "properties": {"verdict": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"]}}
+      "required": ["review_id", "goal_id", "goal_version", "reviewer", "responsibility_group", "implementer", "base", "head", "diff_hash", "rerun_evidence_ids", "verdict", "implementer_invocation_id", "reviewer_invocation_id", "actor_identity_assurance"],
+      "properties": {
+        "verdict": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"]},
+        "actor_identity_assurance": {"const": "host-hook-observed"}
+      }
+    },
+    "AttestationAuthority": {
+      "type": "object",
+      "required": ["contract", "scheme", "assurance", "same_user_adversary_resistant", "limitation"],
+      "properties": {
+        "contract": {"const": "AttestationAuthority/v3"},
+        "scheme": {"const": "local-process-hmac-sha256"},
+        "assurance": {"const": "local-integrity-only"},
+        "same_user_adversary_resistant": {"const": false},
+        "limitation": {"type": "string", "minLength": 1}
+      }
     }
   }
 }

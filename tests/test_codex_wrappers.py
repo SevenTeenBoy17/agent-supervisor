@@ -49,7 +49,7 @@ def _write_record(path: Path, record: dict) -> None:
     path.write_text(json.dumps({"record": record}, ensure_ascii=False), encoding="utf-8")
 
 
-def test_powershell_thin_adapters_can_complete_a_real_round(tmp_path):
+def test_powershell_thin_adapters_audit_but_do_not_overclaim_host_identity(tmp_path):
     workspace = tmp_path / "Codex 包装器 workspace"
     supervisor_dir = workspace / ".agent-supervisor"
     supervisor_dir.mkdir(parents=True)
@@ -119,6 +119,7 @@ def test_powershell_thin_adapters_can_complete_a_real_round(tmp_path):
         "files": delta["files"], "base": delta["base"], "head": delta["head"],
         "diff_hash": delta["diff_hash"], "domains": ["config/agent"],
         "implementer": "codex-worker", "implementer_responsibility_group": "implementation",
+        "implementer_invocation_id": "invocation-wrapper",
         "test_changes": {},
     })
     _run_script(
@@ -176,6 +177,8 @@ def test_powershell_thin_adapters_can_complete_a_real_round(tmp_path):
         "implementer": "codex-worker", "base": delta["base"], "head": delta["head"],
         "diff_hash": delta["diff_hash"], "rerun_evidence_ids": ["evidence-wrapper"],
         "verdict": "APPROVE", "category": "config-agent",
+        "implementer_invocation_id": "invocation-wrapper", "reviewer_invocation_id": "review-invocation-wrapper",
+        "actor_identity_assurance": "declared-codex",
     })
     _run_script(
         "supervisor-record.ps1",
@@ -183,9 +186,11 @@ def test_powershell_thin_adapters_can_complete_a_real_round(tmp_path):
         env=env,
     )
 
-    final = _run_script("supervisor-finalize.ps1", common, env=env)
-    assert final["terminal_state"] == "complete"
-    assert json.loads(state_file.read_text(encoding="utf-8"))["validation"]["valid"] is True
+    final = _run_script("supervisor-finalize.ps1", common, env=env, expected=2)
+    assert final["terminal_state"] == "incomplete"
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["validation"]["valid"] is False
+    assert any("host-hook-observed" in error for error in persisted["validation"]["errors"])
     _run_script("supervisor-handoff.ps1", common, env=env)
     session_hash = hashlib.sha256(b"wrapper-session").hexdigest()
     assert (workspace / ".agent-supervisor" / "handoffs" / session_hash / "latest.md").is_file()

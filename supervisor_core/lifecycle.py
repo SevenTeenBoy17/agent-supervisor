@@ -110,7 +110,27 @@ def start_round(
         default_evidence_by_domain=evidence_by_domain,
     )
     atomic_intents = intents_supplied if intents_supplied is not None else split_intents(message)
-    intents = normalize_intents(atomic_intents, message)
+    new_intents = normalize_intents(atomic_intents, message)
+    carried_intents: list[dict[str, Any]] = []
+    if previous and change_mode in {"continue", "extend"}:
+        for prior in previous.get("intents", []) if isinstance(previous.get("intents"), list) else []:
+            if isinstance(prior, dict) and prior.get("status") not in {"covered", "skipped"}:
+                carried = copy.deepcopy(prior)
+                carried["carried_from_goal_version"] = previous_goal.get("version") if previous_goal else None
+                carried_intents.append(carried)
+    intents = carried_intents
+    used_intent_ids = {str(row.get("intent_id") or "") for row in intents}
+    for incoming in new_intents:
+        candidate = str(incoming.get("intent_id") or "")
+        if not candidate or candidate in used_intent_ids:
+            suffix = len(intents) + 1
+            candidate = f"intent-{suffix}"
+            while candidate in used_intent_ids:
+                suffix += 1
+                candidate = f"intent-{suffix}"
+            incoming["intent_id"] = candidate
+        used_intent_ids.add(candidate)
+        intents.append(incoming)
     state = new_state(
         goal,
         intents,

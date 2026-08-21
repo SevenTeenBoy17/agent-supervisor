@@ -2,7 +2,7 @@
 
 from .constants import EXIT_BLOCKED, EXIT_COMPLETE, EXIT_DEGRADED, EXIT_INCOMPLETE, EXIT_INVALID
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 __all__ = [
     "EXIT_COMPLETE",

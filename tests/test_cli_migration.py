@@ -99,7 +99,7 @@ def test_gate_runner_attests_real_exit_and_rejects_self_report(tmp_path, capsys,
     events = [json.loads(line) for line in state_file.with_name("events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event.get("event_type") == "gate_execution" and event.get("exit_code") == 99 for event in events)
     report = validate_state(state, events)
-    assert not any("lacks trusted core execution" in error for error in report["errors"])
+    assert not any("lacks a valid local-core execution" in error for error in report["errors"])
     assert any("required quality gate missing" in error for error in report["errors"])
 
     forged = {
@@ -116,7 +116,7 @@ def test_gate_runner_attests_real_exit_and_rejects_self_report(tmp_path, capsys,
     capsys.readouterr()
     forged_state = json.loads(state_file.read_text(encoding="utf-8"))
     forged_report = validate_state(forged_state, events)
-    assert any("lacks trusted core execution attestation" in error for error in forged_report["errors"])
+    assert any("lacks a valid local-core execution attestation" in error for error in forged_report["errors"])
 
 
 def test_two_failures_open_breaker_and_require_configured_fallback(tmp_path, capsys):
@@ -146,7 +146,7 @@ def test_bin_bootstrap_runs_from_arbitrary_cwd(tmp_path):
     script = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
     completed = subprocess.run([sys.executable, str(script), "--version"], cwd=tmp_path, text=True, capture_output=True)
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "3.0.0"
+    assert completed.stdout.strip() == "3.0.1"
 
 
 def test_hook_session_start_handles_unicode_space_path(tmp_path):
@@ -158,6 +158,32 @@ def test_hook_session_start_handles_unicode_space_path(tmp_path):
     assert completed.returncode == 0
     result = json.loads(completed.stdout)
     assert "ready" in result["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_does_not_claim_recovery_before_a_goal_round_acknowledges_degraded_state(tmp_path):
+    workspace = tmp_path / "degraded 中文 path"
+    workspace.mkdir()
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    payload = json.dumps({
+        "session_id": "degraded-session",
+        "cwd": str(workspace),
+        "hook_event_name": "SessionStart",
+        "_agent_supervisor_adapter": {"adapter_version": "3.0.1", "degraded_prior": True},
+    }, ensure_ascii=False)
+    env = dict(os.environ)
+    env.update({"USERPROFILE": str(isolated_home), "HOME": str(isolated_home)})
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-m", "supervisor_core", "hook", "--runtime", "claude", "--event", "SessionStart"],
+        cwd=root, input=payload, text=True, capture_output=True, encoding="utf-8", env=env, check=False,
+    )
+    assert completed.returncode == 4
+    result = json.loads(completed.stdout)
+    assert result["agent_supervisor"] == {"health": "degraded", "durable_ack": True}
+    health_records = list((isolated_home / ".agent-supervisor" / "state").rglob("adapter-health.json"))
+    assert len(health_records) == 1
+    assert json.loads(health_records[0].read_text(encoding="utf-8"))["recovery_requires"] == "durable active round acknowledgement"
 
 
 def test_goal_change_classifier_never_silently_replaces_unfinished_work():
