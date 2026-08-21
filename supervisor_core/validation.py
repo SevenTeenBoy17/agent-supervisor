@@ -242,7 +242,8 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
     ids: set[str] = set()
     by_id: dict[str, dict[str, Any]] = {}
     satisfied_labels: dict[str, set[str]] = {}
-    gate_commands = _registered_gate_commands(state.get("quality_profile", {}))
+    gate_definitions = _registered_gate_definitions(state.get("quality_profile", {}))
+    gate_commands = {gate_id: list(row["command"]) for gate_id, row in gate_definitions.items()}
     executions = {
         str(event.get("execution_id")): event
         for event in events
@@ -283,6 +284,8 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     "collector_responsibility_group": record.get("collector_responsibility_group"),
                     "output_sha256": record.get("output_sha256"),
                     "artifact_hash": record.get("artifact_hash"),
+                    "resolved_executable": record.get("resolved_executable"),
+                    "resolved_executable_sha256": record.get("resolved_executable_sha256"),
                 }
                 if any(execution.get(key) != value for key, value in bindings.items()):
                     errors.append(f"evidence {evidence_id} does not match the locally attested core execution")
@@ -330,6 +333,18 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
             errors.append(f"evidence {evidence_id} gate is not registered in QualityProfile")
         elif isinstance(command, dict) and command.get("args") != gate_commands.get(str(record.get("gate_id"))):
             errors.append(f"evidence {evidence_id} command does not match registered gate")
+        gate_definition = gate_definitions.get(str(record.get("gate_id")))
+        if state.get("runtime") != "test" and isinstance(gate_definition, dict) and not gate_definition.get("builtin"):
+            resolved_executable = record.get("resolved_executable")
+            is_absolute = _nonempty_string(resolved_executable) and (
+                Path(str(resolved_executable)).is_absolute()
+                or bool(re.match(r"^[A-Za-z]:[\\/]", str(resolved_executable)))
+                or str(resolved_executable).startswith("\\\\")
+            )
+            if not is_absolute:
+                errors.append(f"evidence {evidence_id} resolved executable path is missing or not absolute")
+            if not _valid_hash(record.get("resolved_executable_sha256")):
+                errors.append(f"evidence {evidence_id} resolved executable hash invalid")
         if record.get("goal_id") != goal.get("goal_id") or record.get("goal_version") != goal.get("version"):
             errors.append(f"evidence {evidence_id} belongs to a different goal version")
         changes = state.get("changes", {})

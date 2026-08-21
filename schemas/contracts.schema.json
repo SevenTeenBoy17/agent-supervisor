@@ -38,7 +38,11 @@
     },
     "EvidenceRecord": {
       "type": "object",
-      "required": ["evidence_id", "execution_id", "criterion_id", "goal_id", "goal_version", "command", "cwd", "collected_at", "exit_code", "output_summary", "artifact_hash", "output_sha256", "base", "head", "diff_hash", "collector", "collector_responsibility_group", "gate_id", "relevant"]
+      "required": ["evidence_id", "execution_id", "criterion_id", "goal_id", "goal_version", "command", "resolved_executable", "resolved_executable_sha256", "cwd", "collected_at", "exit_code", "output_summary", "artifact_hash", "output_sha256", "base", "head", "diff_hash", "collector", "collector_responsibility_group", "gate_id", "relevant"],
+      "properties": {
+        "resolved_executable": {"type": ["string", "null"]},
+        "resolved_executable_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
     },
     "ReviewRecord": {
       "type": "object",

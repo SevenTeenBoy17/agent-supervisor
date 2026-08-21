@@ -6,7 +6,6 @@ from datetime import timedelta
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +20,7 @@ from .lifecycle import read_project_config, read_quality_profile, start_round
 from .routing import route_intents, split_intents
 from .rollout import active_version_snapshot, apply_observation, promote, reset_rollback_cycle, rollback_active_version
 from .storage import StateContext, atomic_write_bytes, atomic_write_json, default_round, default_session, prune_old_state
-from .util import json_load, parse_time, redact, sha256_bytes, sha256_text, stable_id, utc_now
+from .util import json_load, parse_time, redact, sha256_bytes, sha256_file, sha256_text, stable_id, utc_now
 from .validation import validate_state
 
 
@@ -237,6 +236,68 @@ def _registered_gate(state: dict[str, Any], gate_id: str) -> dict[str, Any] | No
     return _registered_gate_definitions(state.get("quality_profile", {})).get(gate_id)
 
 
+def _windows_executable_candidates(path: Path, pathext: str) -> list[Path]:
+    extensions: list[str] = []
+    for raw in (pathext or ".COM;.EXE;.BAT;.CMD").split(";"):
+        extension = raw.strip()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension.casefold() not in {item.casefold() for item in extensions}:
+            extensions.append(extension)
+    path_text = str(path)
+    if any(path_text.casefold().endswith(extension.casefold()) for extension in extensions):
+        return [path]
+    return [Path(f"{path}{extension}") for extension in extensions]
+
+
+def _resolve_gate_command(
+    command: list[str], *, cwd: str, environ: dict[str, str] | None = None
+) -> tuple[list[str], str, str]:
+    """Resolve argv[0] without Windows' implicit current-directory search."""
+    if not command or not str(command[0]).strip():
+        raise FileNotFoundError("registered gate command is empty")
+    environment = os.environ if environ is None else environ
+    token = str(command[0])
+    lookup_token = token[1:-1] if len(token) >= 2 and token[0] == token[-1] == '"' else token
+    explicit = os.path.isabs(lookup_token) or bool(os.path.dirname(lookup_token))
+    if os.name == "nt" and re.match(r"^[A-Za-z]:", lookup_token):
+        explicit = True
+
+    bases: list[Path] = []
+    if explicit:
+        base = Path(os.path.expandvars(os.path.expanduser(lookup_token)))
+        if not base.is_absolute():
+            base = Path(cwd) / base
+        bases.append(base)
+    else:
+        for raw_entry in str(environment.get("PATH") or "").split(os.pathsep):
+            entry = raw_entry.strip().strip('"')
+            if not entry:
+                continue
+            expanded = os.path.expandvars(os.path.expanduser(entry))
+            if not os.path.isabs(expanded):
+                continue
+            bases.append(Path(expanded) / lookup_token)
+
+    candidates: list[Path] = []
+    for base in bases:
+        if os.name == "nt":
+            candidates.extend(_windows_executable_candidates(base, str(environment.get("PATHEXT") or "")))
+        else:
+            candidates.append(base)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved.is_file() and (os.name == "nt" or os.access(resolved, os.X_OK)):
+            executable_hash = sha256_file(resolved)
+            return [str(resolved), *command[1:]], str(resolved), executable_hash
+    raise FileNotFoundError(f"registered gate executable was not found in trusted PATH entries: {token}")
+
+
 def _evaluate_builtin_gate(
     state: dict[str, Any], events: list[dict[str, Any]], builtin: str, *, finalize_internal: bool
 ) -> tuple[int, dict[str, Any]]:
@@ -336,6 +397,8 @@ def _run_registered_gate(
     execution_id = stable_id("execution")
     evidence_id = str(request.get("evidence_id") or stable_id("evidence"))
     started_at = utc_now()
+    resolved_executable: str | None = None
+    resolved_executable_sha256: str | None = None
     if gate.get("builtin"):
         exit_code, artifact = _evaluate_builtin_gate(
             state, ctx.events(), str(gate["builtin"]), finalize_internal=finalize_internal
@@ -343,8 +406,11 @@ def _run_registered_gate(
         combined = json.dumps(artifact, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     else:
         try:
+            execution_command, resolved_executable, resolved_executable_sha256 = _resolve_gate_command(
+                command, cwd=str(state.get("workspace") or ctx.workspace)
+            )
             completed = subprocess.run(
-                command,
+                execution_command,
                 cwd=str(state.get("workspace") or ctx.workspace),
                 capture_output=True,
                 text=True,
@@ -352,6 +418,7 @@ def _run_registered_gate(
                 errors="replace",
                 timeout=int(request.get("timeout_seconds") or 1200),
                 check=False,
+                shell=False,
             )
             exit_code = int(completed.returncode)
             combined = ((completed.stdout or "") + ("\n" if completed.stdout and completed.stderr else "") + (completed.stderr or ""))
@@ -377,6 +444,8 @@ def _run_registered_gate(
         "goal_id": goal.get("goal_id"),
         "goal_version": goal.get("version"),
         "command": {"category": "quality-gate", "args": command},
+        "resolved_executable": resolved_executable,
+        "resolved_executable_sha256": resolved_executable_sha256,
         "cwd": str(state.get("workspace") or ctx.workspace),
         "state_started_at": state.get("started_at"),
         "started_at": started_at,
@@ -404,6 +473,8 @@ def _run_registered_gate(
         "goal_id": execution["goal_id"],
         "goal_version": execution["goal_version"],
         "command": {"category": "quality-gate", "args": command},
+        "resolved_executable": resolved_executable,
+        "resolved_executable_sha256": resolved_executable_sha256,
         "cwd": str(state.get("workspace") or ctx.workspace),
         "collected_at": execution["collected_at"],
         "exit_code": exit_code,
@@ -1114,7 +1185,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.0.1")
+    parser.add_argument("--version", action="version", version="3.0.2")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

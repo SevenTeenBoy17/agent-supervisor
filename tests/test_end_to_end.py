@@ -12,6 +12,8 @@ import pytest
 import supervisor_core.cli as cli_module
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
+from supervisor_core.util import sha256_file
+from supervisor_core.validation import validate_state
 from supervisor_core.workspace import capture_workspace_snapshot, workspace_delta
 
 
@@ -40,6 +42,108 @@ def run_hook(event: str, payload: dict, env: dict[str, str], expected: int = 0) 
     )
     assert completed.returncode == expected, completed.stdout + completed.stderr
     return json.loads(completed.stdout or "{}")
+
+
+def test_gate_runner_attests_registered_argv_and_resolved_executable(tmp_path):
+    workspace = tmp_path / "Windows shim workspace"
+    workspace.mkdir()
+    ctx = StateContext.build(
+        runtime="codex",
+        project="shim-project",
+        workspace=str(workspace),
+        session="shim-session",
+        round_id="shim-round",
+        state_root=tmp_path / "state",
+    )
+    registered = [sys.executable, "-c", "print('executable attested')"]
+    start_round(
+        ctx,
+        message="run registered shim gate",
+        change_mode="replace",
+        execution_mode="observe",
+        quality_profile={"common_gates": [{"id": "gate.shim", "command": registered}]},
+    )
+    evidence, execution, code = cli_module._run_registered_gate(
+        ctx,
+        {
+            "event_type": "gate_run",
+            "actor": "trusted-runner",
+            "record": {
+                "gate_id": "gate.shim",
+                "criterion_id": "criterion-1",
+                "collector_responsibility_group": "trusted-runtime",
+            },
+        },
+    )
+    assert code == 0
+    assert evidence["exit_code"] == 0
+    assert execution["command"]["args"] == registered
+    assert "executable attested" in execution["output_summary"]
+    assert execution["resolved_executable"] == str(Path(sys.executable).resolve())
+    assert execution["resolved_executable_sha256"] == sha256_file(Path(sys.executable).resolve())
+    assert evidence["resolved_executable"] == execution["resolved_executable"]
+    assert evidence["resolved_executable_sha256"] == execution["resolved_executable_sha256"]
+
+    tampered = ctx.load()
+    tampered["evidence"][0]["resolved_executable_sha256"] = "0" * 64
+    errors = validate_state(tampered, ctx.events())["errors"]
+    assert any("does not match the locally attested core execution" in error for error in errors)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PATH/PATHEXT regression")
+@pytest.mark.parametrize(
+    ("registered", "shim_name"),
+    [
+        (["npm"], "npm.cmd"),
+        (["tool.v1", "--label", "value with spaces"], "tool.v1.cmd"),
+    ],
+)
+def test_windows_gate_resolution_never_prefers_workspace_local_cmd(
+    tmp_path, monkeypatch, registered, shim_name
+):
+    workspace = tmp_path / "adversarial workspace"
+    trusted_bin = tmp_path / "trusted bin"
+    workspace.mkdir()
+    trusted_bin.mkdir()
+    (workspace / shim_name).write_text("@echo FAKE_WORKSPACE_GATE_PASS\r\n", encoding="utf-8")
+    trusted_shim = trusted_bin / shim_name
+    trusted_shim.write_text("@echo TRUSTED_PATH_GATE_PASS\r\n", encoding="utf-8")
+
+    ctx = StateContext.build(
+        runtime="codex",
+        project="path-hijack-project",
+        workspace=str(workspace),
+        session="path-hijack-session",
+        round_id="path-hijack-round",
+        state_root=tmp_path / "state",
+    )
+    start_round(
+        ctx,
+        message="reject workspace executable shadowing",
+        change_mode="replace",
+        execution_mode="observe",
+        quality_profile={"common_gates": [{"id": "gate.path", "command": registered}]},
+    )
+    monkeypatch.setenv("PATH", str(trusted_bin))
+    monkeypatch.setenv("PATHEXT", ".CMD")
+    evidence, execution, code = cli_module._run_registered_gate(
+        ctx,
+        {
+            "event_type": "gate_run",
+            "actor": "trusted-runner",
+            "record": {
+                "gate_id": "gate.path",
+                "criterion_id": "criterion-1",
+                "collector_responsibility_group": "trusted-runtime",
+            },
+        },
+    )
+    assert code == 0
+    assert "TRUSTED_PATH_GATE_PASS" in execution["output_summary"]
+    assert "FAKE_WORKSPACE_GATE_PASS" not in execution["output_summary"]
+    assert execution["command"]["args"] == registered
+    assert execution["resolved_executable"] == str(trusted_shim.resolve())
+    assert evidence["resolved_executable_sha256"] == sha256_file(trusted_shim.resolve())
 
 
 def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_review(tmp_path):

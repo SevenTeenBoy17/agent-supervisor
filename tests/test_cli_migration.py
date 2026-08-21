@@ -146,7 +146,7 @@ def test_bin_bootstrap_runs_from_arbitrary_cwd(tmp_path):
     script = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
     completed = subprocess.run([sys.executable, str(script), "--version"], cwd=tmp_path, text=True, capture_output=True)
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "3.0.1"
+    assert completed.stdout.strip() == "3.0.2"
 
 
 def test_hook_session_start_handles_unicode_space_path(tmp_path):
