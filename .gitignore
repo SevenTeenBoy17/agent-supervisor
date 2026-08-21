@@ -1,0 +1,25 @@
+# Runtime state and hook spools
+state/
+.attestation-key
+active-version.json
+logs/
+spool/
+*.jsonl
+*.lock
+
+# Test/build caches
+.pytest_cache/
+.pytest-tmp/
+.pytest-tmp*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local environments and private settings
+.venv/
+venv/
+.env
+.env.*
+!.env.example

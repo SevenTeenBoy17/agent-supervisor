@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.agent-supervisor/v3/contracts.schema.json",
+  "title": "Agent Supervisor v3 contracts",
+  "$defs": {
+    "GoalContract": {
+      "type": "object",
+      "required": ["goal_id", "version", "original_request_sha256", "change_mode", "objective", "acceptance_criteria", "scope", "constraints", "non_goals", "assumptions", "risks"],
+      "properties": {
+        "goal_id": {"type": "string", "minLength": 1},
+        "version": {"type": "integer", "minimum": 1},
+        "original_request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "change_mode": {"enum": ["continue", "extend", "replace"]},
+        "objective": {"type": "string", "minLength": 1},
+        "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Criterion"}},
+        "scope": {"type": "object", "required": ["in", "out"]},
+        "constraints": {"type": "array"}, "non_goals": {"type": "array"}, "assumptions": {"type": "array"}, "risks": {"type": "array"}
+      }
+    },
+    "Criterion": {
+      "type": "object",
+      "required": ["criterion_id", "description", "domain", "expected_evidence", "required"],
+      "properties": {"criterion_id": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "domain": {"type": "string", "minLength": 1}, "expected_evidence": {"type": "array", "minItems": 1}, "required": {"type": "boolean"}}
+    },
+    "IntentCoverage": {
+      "type": "object",
+      "required": ["intent_id", "text", "status", "reason", "capability_ids"],
+      "properties": {"status": {"enum": ["covered", "skipped", "deferred", "unavailable", "failed"]}, "capability_ids": {"type": "array"}}
+    },
+    "InvocationEvent": {
+      "type": "object",
+      "required": ["invocation_id", "capability", "stage", "actor", "timestamp"],
+      "properties": {"stage": {"enum": ["attempt", "result"]}, "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", null]}}
+    },
+    "EvidenceRecord": {
+      "type": "object",
+      "required": ["evidence_id", "execution_id", "criterion_id", "goal_id", "goal_version", "command", "cwd", "collected_at", "exit_code", "output_summary", "artifact_hash", "output_sha256", "base", "head", "diff_hash", "collector", "collector_responsibility_group", "gate_id", "relevant"]
+    },
+    "ReviewRecord": {
+      "type": "object",
+      "required": ["review_id", "goal_id", "goal_version", "reviewer", "responsibility_group", "implementer", "base", "head", "diff_hash", "rerun_evidence_ids", "verdict"],
+      "properties": {"verdict": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"]}}
+    }
+  }
+}

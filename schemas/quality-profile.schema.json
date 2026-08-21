@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.agent-supervisor/v3/quality-profile.schema.json",
+  "title": "QualityProfile v3",
+  "type": "object",
+  "required": ["profile_version", "global_gates", "domains"],
+  "properties": {
+    "profile_version": {"type": "integer", "const": 3},
+    "global_gates": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "domains": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["required_gates"],
+        "properties": {"required_gates": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}
+      }
+    }
+  }
+}
