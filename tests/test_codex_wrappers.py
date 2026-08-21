@@ -201,3 +201,40 @@ def test_powershell_thin_adapters_audit_but_do_not_overclaim_host_identity(tmp_p
     )
     assert after_handoff["files"] == delta["files"]
     assert after_handoff["diff_hash"] == delta["diff_hash"]
+
+
+def test_powershell_finalize_adapter_exposes_blocked_terminal(tmp_path):
+    workspace = tmp_path / "Codex blocked workspace"
+    supervisor_dir = workspace / ".agent-supervisor"
+    supervisor_dir.mkdir(parents=True)
+    (supervisor_dir / "project.json").write_text(json.dumps({
+        "project_id": "codex-blocked-wrapper-e2e",
+        "supervisor_scope": {
+            "allowed_change_globs": [".agent-supervisor/**"],
+            "out_of_scope_globs": [],
+        },
+    }), encoding="utf-8")
+
+    fake_home = tmp_path / "isolated-home"
+    fake_home.mkdir()
+    env = os.environ.copy()
+    env["USERPROFILE"] = str(fake_home)
+    env["HOME"] = str(fake_home)
+    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(ROOT / "active-version.json")
+    env["AGENT_SUPERVISOR_ATTESTATION_KEY_FILE"] = str(tmp_path / "attestation.key")
+    env["CODEX_THREAD_ID"] = "blocked-wrapper-session"
+    common = [
+        "-Workspace", str(workspace), "-SessionId", "blocked-wrapper-session",
+        "-RoundId", "blocked-wrapper-round",
+    ]
+
+    started = _run_script(
+        "supervisor-bootstrap.ps1",
+        [*common, "-Message", "Record a genuine external blocker", "-ChangeMode", "replace", "-ExecutionMode", "observe"],
+        env=env,
+    )
+    final = _run_script("supervisor-finalize.ps1", [*common, "-Blocked"], env=env, expected=3)
+
+    assert final["terminal_state"] == "blocked"
+    persisted = json.loads(Path(started["state_file"]).read_text(encoding="utf-8"))
+    assert persisted["terminal_state"] == "blocked"

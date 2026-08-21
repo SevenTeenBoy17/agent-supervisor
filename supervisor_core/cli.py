@@ -1185,7 +1185,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.0.3")
+    parser.add_argument("--version", action="version", version="3.0.4")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)
