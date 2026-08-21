@@ -68,6 +68,8 @@ Registered command gates must be executed through the core's `gate_run` event (o
 
 On Windows, the trusted runner resolves the first argv token through absolute `PATH` entries and `PATHEXT` (for example, `npm` to `npm.cmd`) while excluding implicit current-directory and relative-`PATH` lookup. Explicit relative paths remain relative to the registered gate workspace. Execution keeps `shell=False`; signed execution and evidence bind both the unchanged QualityProfile argv and the resolved executable's absolute path plus SHA-256.
 
+Workspace evidence excludes Supervisor runtime state (`.agent-supervisor/handoffs`, state/log/cache/spool files, `.codex-supervisor`) and test caches. Required handoff/timeline maintenance therefore cannot manufacture an implementation diff, while versioned Supervisor contracts, fixtures, adapters, and scripts remain in scope.
+
 ### Security boundary (explicit limitation)
 
 The local HMAC is an operational integrity and correlation mechanism, not a security boundary against another process running as the same OS user. Such a process can ultimately read or invoke local code and credentials. Every state therefore declares `AttestationAuthority/v3` with `assurance=local-integrity-only` and `same_user_adversary_resistant=false`. A changed round additionally requires two distinct, signed `host-hook-observed` invocation pairs; Codex's explicit events are recorded as `declared-runtime` and cannot satisfy that gate. This makes the limitation visible and fail-closed instead of describing local signatures as cryptographic host enforcement.

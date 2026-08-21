@@ -8,6 +8,25 @@ from typing import Any
 from .util import sha256_bytes, sha256_text, utc_now
 
 
+def _runtime_only_path(relative: str) -> bool:
+    parts = tuple(part.casefold() for part in Path(relative.replace("\\", "/")).parts)
+    if not parts:
+        return False
+    if parts[0] == ".codex-supervisor":
+        return True
+    if "__pycache__" in parts and parts[-1].endswith((".pyc", ".pyo")):
+        return True
+    if parts[0] != ".agent-supervisor" or len(parts) < 2:
+        return False
+    if parts[1] == ".pytest_cache" or parts[1].startswith(".pytest-tmp"):
+        return True
+    return parts[1] in {
+        "handoffs", "state", "logs", "spool", "cache",
+        "timeline.jsonl", "ledger.json", "status.md", "context-snapshot.md",
+        "current-goal.md", "handoff.md", ".attestation-key",
+    }
+
+
 def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         ["git", "-C", str(workspace), *args],
@@ -33,7 +52,7 @@ def _relative_files(workspace: Path, extra_globs: list[str]) -> set[str]:
                     result.add(path.relative_to(workspace).as_posix())
         except (OSError, ValueError):
             continue
-    return result
+    return {relative for relative in result if not _runtime_only_path(relative)}
 
 
 def capture_workspace_snapshot(workspace: str, extra_globs: list[str] | None = None) -> dict[str, Any]:

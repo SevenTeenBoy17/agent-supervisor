@@ -195,3 +195,9 @@ def test_powershell_thin_adapters_audit_but_do_not_overclaim_host_identity(tmp_p
     session_hash = hashlib.sha256(b"wrapper-session").hexdigest()
     assert (workspace / ".agent-supervisor" / "handoffs" / session_hash / "latest.md").is_file()
     assert not (workspace / ".agent-supervisor" / "handoff.md").exists()
+    after_handoff = workspace_delta(
+        baseline,
+        capture_workspace_snapshot(str(workspace), baseline["extra_globs"]),
+    )
+    assert after_handoff["files"] == delta["files"]
+    assert after_handoff["diff_hash"] == delta["diff_hash"]
