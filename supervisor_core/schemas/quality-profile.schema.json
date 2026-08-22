@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-supervisor.local/schemas/core-quality-profile-v3.json",
+  "type": "object",
+  "required": [
+    "$schema",
+    "global_gates",
+    "common_gates",
+    "completion_policy",
+    "test_integrity",
+    "review"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schema_version": {"type": "string", "minLength": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "global_gates": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "common_gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/commandGate"}
+    },
+    "gates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/gate"}
+    },
+    "domains": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/domain"}
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/profile"}
+    },
+    "completion_policy": {
+      "type": "object",
+      "required": [
+        "binary_only",
+        "model_self_score_is_evidence",
+        "validator_error_terminal",
+        "allowed_terminal_states",
+        "complete_requires_all_applicable_gates",
+        "unresolved_p0_p1_blocks_complete"
+      ],
+      "properties": {
+        "binary_only": {"const": true},
+        "model_self_score_is_evidence": {"const": false},
+        "validator_error_terminal": {"const": "degraded"},
+        "allowed_terminal_states": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "allOf": [
+            {"contains": {"const": "complete"}},
+            {"contains": {"const": "incomplete"}},
+            {"contains": {"const": "blocked"}},
+            {"contains": {"const": "user-waived"}}
+          ],
+          "items": {"type": "string", "minLength": 1}
+        },
+        "complete_requires_all_applicable_gates": {"const": true},
+        "unresolved_p0_p1_blocks_complete": {"const": true}
+      },
+      "additionalProperties": true
+    },
+    "test_integrity": {
+      "type": "object",
+      "required": ["separate_review_required_for", "green_tests_alone_are_sufficient"],
+      "properties": {
+        "separate_review_required_for": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "green_tests_alone_are_sufficient": {"const": false}
+      },
+      "additionalProperties": true
+    },
+    "review": {
+      "type": "object",
+      "required": [
+        "implementer_and_reviewer_groups_must_differ",
+        "required_verdicts",
+        "record_must_bind"
+      ],
+      "properties": {
+        "implementer_and_reviewer_groups_must_differ": {"const": true},
+        "required_verdicts": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "allOf": [
+            {"contains": {"const": "APPROVE"}},
+            {"contains": {"const": "REQUEST_CHANGES"}},
+            {"contains": {"const": "NEEDS_DISCUSSION"}}
+          ],
+          "items": {"type": "string", "minLength": 1}
+        },
+        "record_must_bind": {
+          "type": "array",
+          "minItems": 9,
+          "uniqueItems": true,
+          "allOf": [
+            {"contains": {"const": "actor"}},
+            {"contains": {"const": "responsibility_group"}},
+            {"contains": {"const": "base"}},
+            {"contains": {"const": "head"}},
+            {"contains": {"const": "diff_hash"}},
+            {"contains": {"const": "rerun_evidence"}},
+            {"contains": {"const": "implementer_invocation_id"}},
+            {"contains": {"const": "reviewer_invocation_id"}},
+            {"contains": {"const": "actor_identity_assurance"}}
+          ],
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "gateBase": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "command": {"$ref": "#/$defs/command"},
+        "precondition": {"$ref": "#/$defs/command"},
+        "builtin": {"type": "string", "minLength": 1},
+        "predicate": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "commandGate": {
+      "allOf": [
+        {"$ref": "#/$defs/gateBase"},
+        {"required": ["command"]}
+      ]
+    },
+    "gate": {
+      "allOf": [
+        {"$ref": "#/$defs/gateBase"},
+        {"anyOf": [{"required": ["command"]}, {"required": ["builtin"]}]}
+      ]
+    },
+    "domain": {
+      "type": "object",
+      "required": ["required_gates"],
+      "properties": {
+        "required_gates": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": true
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "gates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/gate"}
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

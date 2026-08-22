@@ -16,6 +16,17 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+@pytest.fixture(autouse=True)
+def isolated_attestation_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AGENT_SUPERVISOR_ATTESTATION_KEY_FILE",
+        str(tmp_path / "attestation.key"),
+    )
+
+
 @pytest.fixture
 def valid_bundle():
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -79,4 +90,17 @@ def valid_bundle():
     }
     request_manifest["attestation"] = sign_record(request_manifest)
     state["request_manifest"] = request_manifest
+    invocation_binding = {
+        "runtime": state["runtime"],
+        "project": state["project"],
+        "workspace": str(Path(state["workspace"]).resolve()),
+        "session": state["session"],
+        "round": state["round"],
+        "goal_id": state["goal"]["goal_id"],
+        "goal_version": state["goal"]["version"],
+        "request_manifest_sha256": canonical_sha256(request_manifest),
+    }
+    for event in events:
+        event["details"].update(invocation_binding)
+        event["attestation"] = sign_record(event)
     return copy.deepcopy(state), copy.deepcopy(events)

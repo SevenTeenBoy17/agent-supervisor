@@ -2,12 +2,124 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from supervisor_core.cli import _classify_goal_change, main
 from supervisor_core.validation import validate_state
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CODEX_ADAPTER_FILES = (
+    "codex-supervisor-hook.py",
+    "supervisor-bootstrap.ps1",
+    "supervisor-core.ps1",
+    "supervisor-event.ps1",
+    "supervisor-finalize.ps1",
+    "supervisor-gate.ps1",
+    "supervisor-handoff.ps1",
+    "supervisor-record.ps1",
+    "supervisor-turn-ended.ps1",
+    "supervisor-validate.ps1",
+)
+CLAUDE_ADAPTER_FILES = ("sup-v3-hook.py", "sup-selftest.py", "sup-discover.py")
+
+
+def _validate_adapter_roots(
+    roots: tuple[Path, Path], *, installation_expected: bool
+) -> str | None:
+    exists = tuple(root.exists() for root in roots)
+    if not any(exists) and not installation_expected:
+        return "global Claude/Codex adapters are not installed on this host"
+    if not all(exists):
+        raise RuntimeError(f"partial adapter installation: {roots}")
+    missing = [
+        str(root / "scripts" / filename)
+        for root, filenames in zip(roots, (CODEX_ADAPTER_FILES, CLAUDE_ADAPTER_FILES), strict=True)
+        for filename in filenames
+        if not (root / "scripts" / filename).is_file()
+    ]
+    if missing:
+        raise RuntimeError(f"adapter installation is damaged; missing: {', '.join(missing)}")
+    return None
+
+
+def _resolve_adapter_roots() -> tuple[tuple[Path, Path], str | None]:
+    review_bundle = ROOT.parent
+    review_bundle_mode = (review_bundle / "REVIEW_MANIFEST.json").is_file()
+    configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
+    if review_bundle_mode:
+        roots = (review_bundle / "global-codex", review_bundle / "global-claude")
+    else:
+        if configured:
+            install_home = Path(configured).resolve()
+        elif ROOT.name == ".agent-supervisor":
+            install_home = ROOT.parent
+        else:
+            install_home = Path.home()
+        roots = (
+            install_home / ".codex" / "skills" / "dev-supervisor",
+            install_home / ".claude" / "skills" / "supervisor",
+        )
+    skip_reason = _validate_adapter_roots(
+        roots,
+        installation_expected=review_bundle_mode or bool(configured),
+    )
+    return roots, skip_reason
+
+
+(CODEX_ROOT, CLAUDE_ROOT), _ADAPTER_SKIP_REASON = _resolve_adapter_roots()
+
+
+def test_adapter_roots_skip_only_when_both_are_genuinely_absent(tmp_path: Path) -> None:
+    roots = (tmp_path / "codex", tmp_path / "claude")
+    assert _validate_adapter_roots(roots, installation_expected=False)
+    roots[0].mkdir()
+    with pytest.raises(RuntimeError, match="partial adapter installation"):
+        _validate_adapter_roots(roots, installation_expected=False)
+
+
+def test_existing_but_damaged_adapter_installation_fails(tmp_path: Path) -> None:
+    roots = (tmp_path / "codex", tmp_path / "claude")
+    for root in roots:
+        (root / "scripts").mkdir(parents=True)
+    (roots[0] / "scripts" / CODEX_ADAPTER_FILES[0]).write_text("present\n", encoding="utf-8")
+    (roots[1] / "scripts" / CLAUDE_ADAPTER_FILES[0]).write_text("present\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="installation is damaged"):
+        _validate_adapter_roots(roots, installation_expected=False)
+
+
+def _hermetic_hook_env(home: Path) -> dict[str, str]:
+    codex_target = home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+    claude_target = home / ".claude" / "skills" / "supervisor" / "scripts"
+    codex_target.mkdir(parents=True)
+    claude_target.mkdir(parents=True)
+    for filename in CODEX_ADAPTER_FILES:
+        shutil.copy2(CODEX_ROOT / "scripts" / filename, codex_target / filename)
+    for filename in CLAUDE_ADAPTER_FILES:
+        shutil.copy2(CLAUDE_ROOT / "scripts" / filename, claude_target / filename)
+    env = os.environ.copy()
+    for key in (
+        "AGENT_SUPERVISOR_ACTIVE_POINTER",
+        "AGENT_SUPERVISOR_HOME",
+        "AGENT_SUPERVISOR_INSTALL_HOME",
+        "AGENT_SUPERVISOR_RELEASE_ROOT",
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "PYTHONPATH",
+    ):
+        env.pop(key, None)
+    env.update({
+        "USERPROFILE": str(home),
+        "HOME": str(home),
+        "AGENT_SUPERVISOR_INSTALL_HOME": str(home),
+    })
+    return env
 
 
 def test_invalid_cli_state_uses_exit_64(capsys):
@@ -122,8 +234,32 @@ def test_gate_runner_attests_real_exit_and_rejects_self_report(tmp_path, capsys,
 def test_two_failures_open_breaker_and_require_configured_fallback(tmp_path, capsys):
     project = tmp_path / ".agent-supervisor" / "project.json"
     project.parent.mkdir()
+    schema = project.parent / "schemas" / "project.schema.json"
+    schema.parent.mkdir()
+    schema.write_text(json.dumps({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["$schema", "project_id", "agent_roles", "supervisor_scope"],
+        "properties": {
+            "$schema": {"type": "string", "minLength": 1},
+            "project_id": {"type": "string", "minLength": 1},
+            "agent_roles": {"type": "array"},
+            "supervisor_scope": {
+                "type": "object",
+                "required": ["allowed_change_globs", "out_of_scope_globs"],
+                "properties": {
+                    "allowed_change_globs": {"type": "array", "items": {"type": "string"}},
+                    "out_of_scope_globs": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    }), encoding="utf-8")
     project.write_text(json.dumps({
-        "project_id": "p", "agent_roles": [{"id": "primary-agent", "fallback_id": "fallback-agent"}],
+        "$schema": "./schemas/project.schema.json", "project_id": "p",
+        "agent_roles": [{"id": "primary-agent", "fallback_id": "fallback-agent"}],
+        "supervisor_scope": {"allowed_change_globs": [".agent-supervisor/**"], "out_of_scope_globs": []},
     }), encoding="utf-8")
     common = ["--runtime", "codex", "--workspace", str(tmp_path), "--session", "breaker", "--round", "r", "--project-file", str(project), "--state-root", str(tmp_path / "state")]
     assert main(["start", *common, "--message", "breaker", "--change-mode", "replace", "--execution-mode", "observe"]) == 0
@@ -142,24 +278,47 @@ def test_two_failures_open_breaker_and_require_configured_fallback(tmp_path, cap
     assert response["fallback_required"] == "fallback-agent"
 
 
+@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_bin_bootstrap_runs_from_arbitrary_cwd(tmp_path):
     script = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
-    completed = subprocess.run([sys.executable, str(script), "--version"], cwd=tmp_path, text=True, capture_output=True)
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    env = _hermetic_hook_env(isolated_home)
+    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(tmp_path / "missing-active-version.json")
+    completed = subprocess.run(
+        [sys.executable, str(script), "--version"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "3.0.4"
+    assert completed.stdout.strip() == "3.1.0"
 
 
+@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_hook_session_start_handles_unicode_space_path(tmp_path):
     workspace = tmp_path / "中文 path"
     workspace.mkdir()
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
     payload = json.dumps({"session_id": "s", "cwd": str(workspace), "hook_event_name": "SessionStart"}, ensure_ascii=False)
     root = Path(__file__).resolve().parents[1]
-    completed = subprocess.run([sys.executable, "-m", "supervisor_core", "hook", "--runtime", "claude", "--event", "SessionStart"], cwd=root, input=payload, text=True, capture_output=True, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-m", "supervisor_core", "hook", "--runtime", "claude", "--event", "SessionStart"],
+        cwd=root,
+        env=_hermetic_hook_env(isolated_home),
+        input=payload,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+    )
     assert completed.returncode == 0
     result = json.loads(completed.stdout)
     assert "ready" in result["hookSpecificOutput"]["additionalContext"]
 
 
+@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_session_start_does_not_claim_recovery_before_a_goal_round_acknowledges_degraded_state(tmp_path):
     workspace = tmp_path / "degraded 中文 path"
     workspace.mkdir()
@@ -171,8 +330,7 @@ def test_session_start_does_not_claim_recovery_before_a_goal_round_acknowledges_
         "hook_event_name": "SessionStart",
         "_agent_supervisor_adapter": {"adapter_version": "3.0.1", "degraded_prior": True},
     }, ensure_ascii=False)
-    env = dict(os.environ)
-    env.update({"USERPROFILE": str(isolated_home), "HOME": str(isolated_home)})
+    env = _hermetic_hook_env(isolated_home)
     root = Path(__file__).resolve().parents[1]
     completed = subprocess.run(
         [sys.executable, "-m", "supervisor_core", "hook", "--runtime", "claude", "--event", "SessionStart"],

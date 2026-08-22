@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-import fnmatch
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .constants import CHANGE_MODES, INTENT_STATES, REVIEW_VERDICTS
+from .constants import CHANGE_MODES, EXECUTION_MODES, INTENT_STATES, REVIEW_VERDICTS
 from .attestation import verify_record
 from .contracts import validate_review_shape
 from .util import canonical_sha256, parse_time, sha256_text, utc_now
-from .workspace import capture_workspace_snapshot, workspace_delta
+from .workspace import (
+    capture_supervisor_source_snapshot,
+    capture_workspace_snapshot,
+    segment_glob_match,
+    validated_supervisor_source_snapshot_hash,
+    workspace_delta,
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PLACEHOLDER = re.compile(r"(?i)\b(?:tbd|todo|fixme|placeholder|trust\s+me|稍后|待定|未解决)\b")
@@ -24,32 +29,211 @@ def _nonempty_string_list(value: Any) -> bool:
     return isinstance(value, list) and bool(value) and all(_nonempty_string(item) for item in value)
 
 
+def _array_or_empty(value: Any, label: str, errors: list[str]) -> list[Any]:
+    """Fail closed at untrusted collection boundaries without aborting validation."""
+    if isinstance(value, list):
+        return value
+    errors.append(f"{label} must be an array")
+    return []
+
+
 def _valid_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA256.fullmatch(value))
 
 
+def _canonical_relative_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    raw = value.replace("\\", "/")
+    if raw.startswith(("/", "//")) or re.match(r"^[A-Za-z]:", raw):
+        return None
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    return "/".join(parts) or None
+
+
+def _valid_project_scope_pattern(value: Any, *, bounded: bool) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if any(marker in value for marker in ("\x00", "\r", "\n", "\\", ":")):
+        return False
+    raw_path = Path(value)
+    if raw_path.is_absolute() or ".." in raw_path.parts:
+        return False
+    normalized = "/".join(part for part in raw_path.parts if part not in {"", "."})
+    if not normalized or normalized == "~" or normalized.startswith("~/"):
+        return False
+    if bounded and (
+        value.startswith("./")
+        or normalized in {"*", "**", "**/*"}
+        or any(marker in normalized.split("/", 1)[0] for marker in ("*", "?", "["))
+    ):
+        return False
+    return True
+
+
+def _project_policy_scope(
+    state: dict[str, Any],
+    errors: list[str] | None = None,
+) -> tuple[bool, bool, list[str], list[str]]:
+    """Return configured/valid scope without collapsing an explicit bad policy."""
+    if "project_policy" not in state:
+        return False, True, [], []
+    policy = state.get("project_policy")
+    if not isinstance(policy, dict):
+        if errors is not None:
+            errors.append("project policy must be an object when configured")
+        return True, False, [], []
+
+    values: dict[str, list[str]] = {}
+    valid = True
+    for field, bounded, require_nonempty in (
+        ("allowed_change_globs", True, True),
+        ("out_of_scope_globs", False, False),
+    ):
+        raw_values = policy.get(field)
+        field_valid = (
+            isinstance(raw_values, list)
+            and (bool(raw_values) or not require_nonempty)
+            and all(_valid_project_scope_pattern(value, bounded=bounded) for value in raw_values)
+            and len(set(raw_values)) == len(raw_values)
+        ) if isinstance(raw_values, list) else False
+        if not field_valid:
+            valid = False
+            if errors is not None:
+                errors.append(f"project policy {field} invalid")
+            values[field] = []
+        else:
+            values[field] = list(raw_values)
+    return (
+        True,
+        valid,
+        values["allowed_change_globs"] if valid else [],
+        values["out_of_scope_globs"] if valid else [],
+    )
+
+
 def _path_allowed(path: str, allowed: list[str]) -> bool:
-    normalized = path.replace("\\", "/").lstrip("./")
+    normalized = _canonical_relative_path(path)
+    if normalized is None:
+        return False
     for pattern in allowed:
-        candidate = pattern.replace("\\", "/").lstrip("./")
-        if candidate.endswith("/**") and normalized.startswith(candidate[:-3].rstrip("/") + "/"):
-            return True
-        if normalized == candidate or fnmatch.fnmatch(normalized, candidate):
+        candidate = _canonical_relative_path(pattern)
+        if candidate is None:
+            continue
+        if segment_glob_match(normalized, candidate):
             return True
     return False
 
 
 def _pattern_within(child: str, parent: str) -> bool:
-    child_norm = child.replace("\\", "/").lstrip("./")
-    parent_norm = parent.replace("\\", "/").lstrip("./")
-    if child_norm in {"", "*", "**"} or child_norm.startswith("../"):
+    child_norm = _canonical_relative_path(child)
+    parent_norm = _canonical_relative_path(parent)
+    if child_norm is None or parent_norm is None or child_norm in {"*", "**"}:
         return False
     if parent_norm.endswith("/**"):
         prefix = parent_norm[:-3].rstrip("/")
         return child_norm == prefix or child_norm.startswith(prefix + "/")
+    child_parts = child_norm.split("/")
+    parent_parts = parent_norm.split("/")
+    child_has_glob = any(
+        token in segment for segment in child_parts for token in ("*", "?", "[")
+    )
+    if child_has_glob:
+        if len(child_parts) != len(parent_parts):
+            return False
+        for child_part, parent_part in zip(child_parts, parent_parts, strict=True):
+            if child_part == "**" and parent_part != "**":
+                return False
+            if any(token in child_part for token in ("*", "?", "[")):
+                if child_part != parent_part and parent_part != "*":
+                    return False
+            elif not segment_glob_match(child_part, parent_part):
+                return False
+        return True
     if any(token in parent_norm for token in ("*", "?", "[")):
-        return fnmatch.fnmatch(child_norm, parent_norm)
+        return segment_glob_match(child_norm, parent_norm)
     return child_norm == parent_norm
+
+
+def _patterns_overlap(left: str, right: str) -> bool:
+    left_norm = _canonical_relative_path(left)
+    right_norm = _canonical_relative_path(right)
+    if left_norm is None or right_norm is None:
+        return False
+
+    def segment_overlap(left_segment: str, right_segment: str) -> bool:
+        left_has_glob = any(token in left_segment for token in ("*", "?", "["))
+        right_has_glob = any(token in right_segment for token in ("*", "?", "["))
+        if not left_has_glob:
+            return segment_glob_match(left_segment, right_segment)
+        if not right_has_glob:
+            return segment_glob_match(right_segment, left_segment)
+        if left_segment == right_segment or left_segment == "*" or right_segment == "*":
+            return True
+        if "[" in left_segment or "[" in right_segment:
+            # Character-class intersection is not safely reducible to fixed
+            # prefix/suffix checks.  Stay conservative rather than miss a
+            # denied-path overlap.
+            return True
+
+        def fixed_edges(pattern: str) -> tuple[str, str]:
+            first = min(
+                (index for index, value in enumerate(pattern) if value in "*?["),
+                default=len(pattern),
+            )
+            wildcard_indexes = [
+                index for index, value in enumerate(pattern) if value in "*?["
+            ]
+            last = max(wildcard_indexes, default=-1)
+            return pattern[:first], pattern[last + 1 :] if last >= 0 else pattern
+
+        left_prefix, left_suffix = fixed_edges(left_segment)
+        right_prefix, right_suffix = fixed_edges(right_segment)
+        prefix_compatible = left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)
+        suffix_compatible = left_suffix.endswith(right_suffix) or right_suffix.endswith(left_suffix)
+        return prefix_compatible and suffix_compatible
+
+    left_parts = tuple(left_norm.split("/"))
+    right_parts = tuple(right_norm.split("/"))
+    memo: dict[tuple[int, int], bool] = {}
+
+    def intersects(left_index: int, right_index: int) -> bool:
+        key = (left_index, right_index)
+        if key in memo:
+            return memo[key]
+        if left_index == len(left_parts):
+            result = all(part == "**" for part in right_parts[right_index:])
+        elif right_index == len(right_parts):
+            result = all(part == "**" for part in left_parts[left_index:])
+        else:
+            left_part = left_parts[left_index]
+            right_part = right_parts[right_index]
+            if left_part == "**" and right_part == "**":
+                result = intersects(left_index + 1, right_index) or intersects(
+                    left_index, right_index + 1
+                )
+            elif left_part == "**":
+                result = intersects(left_index + 1, right_index) or intersects(
+                    left_index, right_index + 1
+                )
+            elif right_part == "**":
+                result = intersects(left_index, right_index + 1) or intersects(
+                    left_index + 1, right_index
+                )
+            else:
+                result = segment_overlap(left_part, right_part) and intersects(
+                    left_index + 1, right_index + 1
+                )
+        memo[key] = result
+        return result
+
+    return intersects(0, 0)
 
 
 def successful_invocations(events: list[dict[str, Any]]) -> tuple[set[str], dict[str, dict[str, Any]], list[str]]:
@@ -90,8 +274,8 @@ def successful_invocations(events: list[dict[str, Any]]) -> tuple[set[str], dict
     return successful, results, errors
 
 
-def _host_observed_invocation(
-    events: list[dict[str, Any]], invocation_id: str, *, actor: Any
+def _trusted_invocation_for_runtime(
+    events: list[dict[str, Any]], invocation_id: str, *, actor: Any, state: dict[str, Any]
 ) -> bool:
     pair = [
         event for event in events
@@ -106,16 +290,48 @@ def _host_observed_invocation(
     if len(attempts) != 1 or len(results) != 1:
         return False
     attempt, result = attempts[0], results[0]
+    goal = state.get("goal", {}) if isinstance(state.get("goal"), dict) else {}
+    request_manifest = state.get("request_manifest") if isinstance(state.get("request_manifest"), dict) else {}
+    expected_binding = {
+        "runtime": state.get("runtime"),
+        "project": state.get("project"),
+        "workspace": str(Path(str(state.get("workspace") or "")).resolve()),
+        "session": state.get("session"),
+        "round": state.get("round"),
+        "goal_id": goal.get("goal_id"),
+        "goal_version": goal.get("version"),
+        "request_manifest_sha256": canonical_sha256(request_manifest),
+    }
+    attempt_details = attempt.get("details") if isinstance(attempt.get("details"), dict) else {}
+    result_details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    attempt_assurance = attempt.get("identity_assurance")
+    result_assurance = result.get("identity_assurance")
+    accepted_assurances = _accepted_runtime_assurances(state)
     return bool(
         result.get("result") == "success"
         and attempt.get("actor") == actor
         and result.get("actor") == actor
         and attempt.get("capability") == result.get("capability")
-        and attempt.get("identity_assurance") == "host-hook-observed"
-        and result.get("identity_assurance") == "host-hook-observed"
+        and attempt_assurance == result_assurance
+        and attempt_assurance in accepted_assurances
         and verify_record(attempt)
         and verify_record(result)
+        and all(attempt_details.get(key) == value for key, value in expected_binding.items())
+        and all(result_details.get(key) == value for key, value in expected_binding.items())
     )
+
+
+def _accepted_runtime_assurances(state: dict[str, Any]) -> set[str]:
+    if state.get("runtime") == "codex":
+        # Native Codex Hooks are host observations.  Keep explicit audit as a
+        # compatibility lane for older Codex adapters and manually finalized
+        # rounds; both remain bound to signed attempt/result pairs.
+        return {"host-hook-observed", "codex-explicit-audit"}
+    return {"host-hook-observed"}
+
+
+def _runtime_assurance_accepted(state: dict[str, Any], assurance: Any) -> bool:
+    return isinstance(assurance, str) and assurance in _accepted_runtime_assurances(state)
 
 
 def _validate_goal(state: dict[str, Any], errors: list[str]) -> None:
@@ -143,6 +359,18 @@ def _validate_goal(state: dict[str, Any], errors: list[str]) -> None:
     for field in ("constraints", "non_goals", "assumptions", "risks"):
         if not isinstance(goal.get(field), list) or not all(_nonempty_string(item) for item in goal.get(field, [])):
             errors.append(f"GoalContract {field} must be a string array")
+    raw_t3_authorizations = goal.get("t3_action_authorizations", [])
+    if not isinstance(raw_t3_authorizations, list):
+        errors.append("GoalContract t3_action_authorizations must be an array")
+    else:
+        for index, authorization in enumerate(raw_t3_authorizations):
+            if not isinstance(authorization, dict) or set(authorization) != {"action_sha256", "request_sha256"}:
+                errors.append(f"GoalContract T3 authorization[{index}] structure invalid")
+                continue
+            if not _valid_hash(authorization.get("action_sha256")):
+                errors.append(f"GoalContract T3 authorization[{index}] action hash invalid")
+            if not _valid_hash(authorization.get("request_sha256")):
+                errors.append(f"GoalContract T3 authorization[{index}] granting request hash invalid")
     criteria = goal.get("acceptance_criteria")
     if not isinstance(criteria, list) or not criteria:
         errors.append("GoalContract acceptance criteria empty")
@@ -152,10 +380,12 @@ def _validate_goal(state: dict[str, Any], errors: list[str]) -> None:
         if not isinstance(criterion, dict) or not criterion:
             errors.append(f"criterion[{index}] must be a non-empty object")
             continue
-        criterion_id = criterion.get("criterion_id")
-        if not _nonempty_string(criterion_id) or criterion_id in seen:
+        raw_criterion_id = criterion.get("criterion_id")
+        criterion_id = raw_criterion_id.strip() if isinstance(raw_criterion_id, str) else ""
+        if not criterion_id or criterion_id in seen:
             errors.append(f"criterion[{index}] id missing or duplicate")
-        seen.add(str(criterion_id))
+        if criterion_id:
+            seen.add(criterion_id)
         if not _nonempty_string(criterion.get("description")) or _PLACEHOLDER.search(str(criterion.get("description", ""))):
             errors.append(f"criterion {criterion_id} description empty or unresolved")
         if not _nonempty_string_list(criterion.get("expected_evidence")):
@@ -181,25 +411,34 @@ def _validate_tasks(state: dict[str, Any], criterion_ids: set[str], evidence: di
     if not isinstance(tasks, list):
         errors.append("tasks must be an array")
         return
-    goal = state.get("goal", {})
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    criteria = goal.get("acceptance_criteria")
+    if not isinstance(criteria, list):
+        criteria = []
     criterion_expected = {
         str(row.get("criterion_id")): set(_string_values(row.get("expected_evidence")))
-        for row in goal.get("acceptance_criteria", [])
+        for row in criteria
         if isinstance(row, dict) and row.get("criterion_id")
     }
     goal_scope = goal.get("scope", {}) if isinstance(goal.get("scope"), dict) else {}
+    for field in ("in", "out"):
+        value = goal_scope.get(field)
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            errors.append(f"GoalContract scope.{field} invalid")
     goal_allowed = _string_values(goal_scope.get("in"))
-    policy = state.get("project_policy", {}) if isinstance(state.get("project_policy"), dict) else {}
-    project_allowed = _string_values(policy.get("allowed_change_globs"))
-    project_denied = _string_values(policy.get("out_of_scope_globs"))
+    project_policy_configured, project_policy_valid, project_allowed, project_denied = (
+        _project_policy_scope(state, errors)
+    )
+    active_leases: list[tuple[str, str, str, list[str]]] = []
     for index, task in enumerate(tasks):
         if not isinstance(task, dict) or not task:
             errors.append(f"task[{index}] must be a non-empty object")
             continue
         if task.get("goal_id") != goal.get("goal_id") or task.get("goal_version") != goal.get("version"):
             errors.append(f"task {task.get('task_id', index)} not linked to current goal version")
-        links = task.get("criterion_ids")
-        if not _nonempty_string_list(links) or not set(links).issubset(criterion_ids):
+        raw_links = task.get("criterion_ids")
+        links: list[str] = list(raw_links) if _nonempty_string_list(raw_links) else []
+        if not links or not set(links).issubset(criterion_ids):
             errors.append(f"task {task.get('task_id', index)} criterion links invalid")
         task_paths = task.get("allowed_paths")
         if not _nonempty_string_list(task_paths):
@@ -209,10 +448,23 @@ def _validate_tasks(state: dict[str, Any], criterion_ids: set[str], evidence: di
                 if not any(_pattern_within(allowed_path, parent) for parent in goal_allowed):
                     errors.append(f"task {task.get('task_id', index)} path exceeds GoalContract scope: {allowed_path}")
                 is_absolute = bool(re.match(r"^[A-Za-z]:[/\\]", allowed_path)) or allowed_path.startswith("/")
-                if not is_absolute and project_allowed and not any(_pattern_within(allowed_path, parent) for parent in project_allowed):
+                if (
+                    project_policy_configured
+                    and project_policy_valid
+                    and not is_absolute
+                    and not any(_pattern_within(allowed_path, parent) for parent in project_allowed)
+                ):
                     errors.append(f"task {task.get('task_id', index)} path exceeds project policy: {allowed_path}")
-                if any(_pattern_within(allowed_path, denied) or _pattern_within(denied, allowed_path) for denied in project_denied):
+                if any(_patterns_overlap(allowed_path, denied) for denied in project_denied):
                     errors.append(f"task {task.get('task_id', index)} path overlaps project out-of-scope policy: {allowed_path}")
+        if task.get("lease_status") == "active":
+            lease_id = str(task.get("lease_id") or "").strip()
+            owner = str(task.get("owner") or "").strip()
+            group = str(task.get("responsibility_group") or "").strip()
+            if not lease_id or not owner or not group:
+                errors.append(f"task {task.get('task_id', index)} active lease identity incomplete")
+            elif isinstance(task_paths, list):
+                active_leases.append((lease_id, owner, group, [str(path) for path in task_paths if isinstance(path, str)]))
         if not _nonempty_string_list(task.get("expected_evidence")):
             errors.append(f"task {task.get('task_id', index)} expected evidence empty")
         else:
@@ -230,6 +482,15 @@ def _validate_tasks(state: dict[str, Any], criterion_ids: set[str], evidence: di
                     errors.append(f"done task {task.get('task_id', index)} lacks its declared evidence types")
         elif task.get("status") not in {"superseded", "cancelled"}:
             errors.append(f"task {task.get('task_id', index)} is not done")
+    for left_index, left in enumerate(active_leases):
+        for right in active_leases[left_index + 1 :]:
+            if left[0] == right[0]:
+                continue
+            if any(_patterns_overlap(left_path, right_path) for left_path in left[3] for right_path in right[3]):
+                errors.append(
+                    "overlapping active path leases: "
+                    f"{left[0]} ({left[1]}/{left[2]}) conflicts with {right[0]} ({right[1]}/{right[2]})"
+                )
 
 
 def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: list[dict[str, Any]], errors: list[str]) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, set[str]]]:
@@ -237,22 +498,41 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
     if not isinstance(evidence, list):
         errors.append("evidence must be an array")
         return set(), {}, {}
-    goal = state.get("goal", {})
-    started = parse_time(state.get("started_at", utc_now()))
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    raw_started = state.get("started_at")
+    try:
+        if not isinstance(raw_started, str):
+            raise TypeError("started_at must be a string")
+        started = parse_time(raw_started)
+    except (TypeError, ValueError):
+        errors.append("state started_at invalid")
+        started = datetime.max.replace(tzinfo=timezone.utc)
     ids: set[str] = set()
     by_id: dict[str, dict[str, Any]] = {}
     satisfied_labels: dict[str, set[str]] = {}
     gate_definitions = _registered_gate_definitions(state.get("quality_profile", {}))
-    gate_commands = {gate_id: list(row["command"]) for gate_id, row in gate_definitions.items()}
+    gate_commands = {gate_id: list(row.get("command") or []) for gate_id, row in gate_definitions.items()}
     executions = {
         str(event.get("execution_id")): event
         for event in events
         if isinstance(event, dict) and event.get("event_type") == "gate_execution" and event.get("execution_id")
     }
+    source_snapshot_hash = (
+        validated_supervisor_source_snapshot_hash(state.get("supervisor_source_snapshot"))
+        if state.get("runtime") != "test"
+        else None
+    )
+    workspace_baseline = state.get("workspace_baseline")
+    workspace_snapshot_hash = (
+        workspace_baseline.get("snapshot_hash")
+        if isinstance(workspace_baseline, dict)
+        else None
+    )
     for index, record in enumerate(evidence):
         if not isinstance(record, dict) or not record:
             errors.append(f"evidence[{index}] must be a non-empty structured object; free text is invalid")
             continue
+        record_error_count = len(errors)
         if record.get("contract") != "EvidenceRecord/v3":
             errors.append(f"evidence[{index}] contract version invalid")
         evidence_id = record.get("evidence_id")
@@ -286,6 +566,9 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     "artifact_hash": record.get("artifact_hash"),
                     "resolved_executable": record.get("resolved_executable"),
                     "resolved_executable_sha256": record.get("resolved_executable_sha256"),
+                    "precondition": record.get("precondition"),
+                    "command_executed": record.get("command_executed"),
+                    "source_snapshot_hash": record.get("source_snapshot_hash"),
                 }
                 if any(execution.get(key) != value for key, value in bindings.items()):
                     errors.append(f"evidence {evidence_id} does not match the locally attested core execution")
@@ -295,10 +578,19 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     errors.append(f"evidence {evidence_id} output summary was rewritten after execution")
                 if execution.get("state_started_at") != state.get("started_at"):
                     errors.append(f"evidence {evidence_id} was signed for a different round start")
-                if execution.get("workspace_snapshot_hash") != state.get("workspace_baseline", {}).get("snapshot_hash"):
+                if not _valid_hash(workspace_snapshot_hash):
+                    errors.append(f"evidence {evidence_id} cannot bind to a valid workspace baseline")
+                elif execution.get("workspace_snapshot_hash") != workspace_snapshot_hash:
                     errors.append(f"evidence {evidence_id} was signed for a different workspace baseline")
-        criterion_id = record.get("criterion_id")
-        if criterion_id not in criterion_ids:
+                if (
+                    source_snapshot_hash is None
+                    or execution.get("source_snapshot_hash") != source_snapshot_hash
+                    or record.get("source_snapshot_hash") != source_snapshot_hash
+                ):
+                    errors.append(f"evidence {evidence_id} was signed for a different Supervisor source snapshot")
+        raw_criterion_id = record.get("criterion_id")
+        criterion_id = raw_criterion_id.strip() if isinstance(raw_criterion_id, str) else ""
+        if not criterion_id or criterion_id not in criterion_ids:
             errors.append(f"evidence {evidence_id} criterion link invalid")
         command = record.get("command")
         if not isinstance(command, dict) or not command or not _nonempty_string(command.get("category")) or not _nonempty_string_list(command.get("args")):
@@ -334,6 +626,22 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
         elif isinstance(command, dict) and command.get("args") != gate_commands.get(str(record.get("gate_id"))):
             errors.append(f"evidence {evidence_id} command does not match registered gate")
         gate_definition = gate_definitions.get(str(record.get("gate_id")))
+        if isinstance(gate_definition, dict):
+            expected_precondition = gate_definition.get("precondition")
+            observed_precondition = record.get("precondition")
+            if expected_precondition:
+                if not isinstance(observed_precondition, dict):
+                    errors.append(f"evidence {evidence_id} registered precondition was not attested")
+                else:
+                    precondition_command = observed_precondition.get("command")
+                    if not isinstance(precondition_command, dict) or precondition_command.get("args") != expected_precondition:
+                        errors.append(f"evidence {evidence_id} precondition command does not match registered gate")
+                    if observed_precondition.get("exit_code") != 0 or record.get("command_executed") is not True:
+                        errors.append(f"evidence {evidence_id} precondition did not pass before the main command")
+                    if not _valid_hash(observed_precondition.get("resolved_executable_sha256")):
+                        errors.append(f"evidence {evidence_id} precondition executable hash invalid")
+            elif observed_precondition is not None:
+                errors.append(f"evidence {evidence_id} contains an unregistered precondition")
         if state.get("runtime") != "test" and isinstance(gate_definition, dict) and not gate_definition.get("builtin"):
             resolved_executable = record.get("resolved_executable")
             is_absolute = _nonempty_string(resolved_executable) and (
@@ -347,11 +655,11 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                 errors.append(f"evidence {evidence_id} resolved executable hash invalid")
         if record.get("goal_id") != goal.get("goal_id") or record.get("goal_version") != goal.get("version"):
             errors.append(f"evidence {evidence_id} belongs to a different goal version")
-        changes = state.get("changes", {})
+        changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
         if changes.get("diff_hash"):
             if record.get("base") != changes.get("base") or record.get("head") != changes.get("head") or record.get("diff_hash") != changes.get("diff_hash"):
                 errors.append(f"evidence {evidence_id} is not bound to the reviewed diff")
-        if not any(message.startswith(f"evidence {evidence_id}") for message in errors):
+        if len(errors) == record_error_count:
             satisfied_labels.setdefault(str(criterion_id), set()).add(str(record.get("gate_id")))
     return ids, by_id, satisfied_labels
 
@@ -363,10 +671,12 @@ def _validate_intents(
     errors: list[str],
 ) -> None:
     intents = state.get("intents")
-    if not isinstance(intents, list) or not intents:
-        errors.append("IntentCoverage is empty")
+    if not isinstance(intents, list):
+        errors.append("intents must be an array")
         intents = []
-    success_caps, _, invocation_errors = successful_invocations(events)
+    elif not intents:
+        errors.append("IntentCoverage is empty")
+    success_caps, invocation_results, invocation_errors = successful_invocations(events)
     errors.extend(invocation_errors)
     manifest = state.get("intent_manifest")
     if not isinstance(manifest, list) or not manifest:
@@ -413,10 +723,12 @@ def _validate_intents(
             continue
         if intent.get("contract") != "IntentCoverage/v3":
             errors.append(f"intent {intent.get('intent_id', index)} contract version invalid")
-        intent_id = intent.get("intent_id")
-        if not _nonempty_string(intent_id) or intent_id in seen_intents:
+        raw_intent_id = intent.get("intent_id")
+        intent_id = raw_intent_id.strip() if isinstance(raw_intent_id, str) else ""
+        if not intent_id or intent_id in seen_intents:
             errors.append(f"intent[{index}] id missing or duplicate")
-        seen_intents.add(str(intent_id))
+        if intent_id:
+            seen_intents.add(intent_id)
         if not _nonempty_string(intent.get("text")):
             errors.append(f"intent {intent_id or index} text missing")
         if not _nonempty_string(intent.get("reason")):
@@ -428,10 +740,7 @@ def _validate_intents(
             all_skipped = False
         if status == "covered":
             capabilities = intent.get("capability_ids")
-            if intent.get("method") == "manual-specialized":
-                if not _nonempty_string(intent.get("reason")):
-                    errors.append(f"intent {intent.get('intent_id', index)} manual result lacks reason")
-            elif not _nonempty_string_list(capabilities) or not set(capabilities).intersection(success_caps):
+            if not _nonempty_string_list(capabilities) or not set(capabilities).intersection(success_caps):
                 errors.append(f"intent {intent.get('intent_id', index)} has no successful correlated invocation")
         elif status == "skipped":
             if not _nonempty_string(intent.get("reason")) or intent.get("reason") == "awaiting routing":
@@ -440,13 +749,48 @@ def _validate_intents(
             errors.append(f"intent {intent.get('intent_id', index)} unresolved with status {status}")
     if all_skipped:
         approved = False
-        for review in state.get("reviews", []):
+        request_manifest_sha256 = canonical_sha256(signed_manifest) if isinstance(signed_manifest, dict) else ""
+        reviews = state.get("reviews") if isinstance(state.get("reviews"), list) else []
+        for review in reviews:
             if not (
                 isinstance(review, dict)
                 and review.get("category") == "zero-skill-routing"
                 and review.get("verdict") == "APPROVE"
                 and validate_review_shape(review)
             ):
+                continue
+            implementer = str(review.get("implementer") or "")
+            reviewer = str(review.get("reviewer") or "")
+            implementer_group = str(review.get("implementer_responsibility_group") or "")
+            reviewer_group = str(review.get("responsibility_group") or "")
+            implementer_invocation = str(review.get("implementer_invocation_id") or "")
+            reviewer_invocation = str(review.get("reviewer_invocation_id") or "")
+            implementer_result = invocation_results.get(implementer_invocation)
+            reviewer_result = invocation_results.get(reviewer_invocation)
+            independent = bool(
+                implementer
+                and reviewer
+                and implementer != reviewer
+                and implementer_group
+                and reviewer_group
+                and implementer_group != reviewer_group
+                and implementer_invocation
+                and reviewer_invocation
+                and implementer_invocation != reviewer_invocation
+                and isinstance(implementer_result, dict)
+                and implementer_result.get("result") == "success"
+                and implementer_result.get("actor") == implementer
+                and isinstance(reviewer_result, dict)
+                and reviewer_result.get("result") == "success"
+                and reviewer_result.get("actor") == reviewer
+                and _trusted_invocation_for_runtime(events, implementer_invocation, actor=implementer, state=state)
+                and _trusted_invocation_for_runtime(events, reviewer_invocation, actor=reviewer, state=state)
+                and _runtime_assurance_accepted(state, review.get("actor_identity_assurance"))
+                and review.get("request_manifest_sha256") == request_manifest_sha256
+                and review.get("goal_id") == goal.get("goal_id")
+                and review.get("goal_version") == goal.get("version")
+            )
+            if not independent:
                 continue
             rerun_ids = review.get("rerun_evidence_ids", [])
             if not set(rerun_ids).issubset(evidence):
@@ -479,6 +823,29 @@ def _observe_workspace(state: dict[str, Any], errors: list[str]) -> dict[str, An
     return workspace_delta(baseline, current)
 
 
+def _validate_supervisor_source_snapshot(state: dict[str, Any], errors: list[str]) -> str | None:
+    """Bind a real-runtime round to the exact Supervisor core and adapter sources."""
+    if state.get("runtime") == "test":
+        return None
+    expected_hash = validated_supervisor_source_snapshot_hash(state.get("supervisor_source_snapshot"))
+    if expected_hash is None:
+        errors.append("trusted Supervisor source snapshot missing, degraded, or self-hash invalid")
+        return None
+    try:
+        current = capture_supervisor_source_snapshot()
+    except (OSError, RuntimeError, ValueError):
+        errors.append("current Supervisor source snapshot unavailable")
+        return None
+    current_hash = validated_supervisor_source_snapshot_hash(current)
+    if current_hash is None:
+        errors.append("current Supervisor source snapshot degraded or invalid")
+        return None
+    if current_hash != expected_hash:
+        errors.append("Supervisor source changed after round start")
+        return None
+    return expected_hash
+
+
 def _is_test_path(path: str) -> bool:
     normalized = path.replace("\\", "/").casefold()
     name = normalized.rsplit("/", 1)[-1]
@@ -486,7 +853,9 @@ def _is_test_path(path: str) -> bool:
         normalized.startswith("tests/")
         or "/tests/" in normalized
         or "/__tests__/" in normalized
-        or any(marker in name for marker in (".test.", ".spec.", "test_"))
+        or ".test." in name
+        or ".spec." in name
+        or name.startswith("test_")
     )
 
 
@@ -522,6 +891,7 @@ def _validate_changes_and_reviews(
     warnings: list[str],
     observed: dict[str, Any] | None,
 ) -> None:
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
     changes = state.get("changes")
     if not isinstance(changes, dict):
         errors.append("changes record missing")
@@ -541,7 +911,8 @@ def _validate_changes_and_reviews(
             if changes.get(field) != observed.get(field):
                 errors.append(f"changes.{field} does not match core-observed workspace delta")
     allowed = []
-    for task in state.get("tasks", []):
+    tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
+    for task in tasks:
         if isinstance(task, dict) and task.get("status") == "done":
             allowed.extend([p for p in task.get("allowed_paths", []) if _nonempty_string(p)])
     for path in files:
@@ -557,12 +928,12 @@ def _validate_changes_and_reviews(
         result = invocation_results.get(implementer_invocation)
         if not implementer_invocation or not isinstance(result, dict) or result.get("result") != "success" or result.get("actor") != changes.get("implementer"):
             errors.append("changes implementer identity lacks a successful correlated invocation")
-        elif not _host_observed_invocation(events, implementer_invocation, actor=changes.get("implementer")):
-            errors.append("changes implementer identity is not host-hook-observed")
+        elif not _trusted_invocation_for_runtime(events, implementer_invocation, actor=changes.get("implementer"), state=state):
+            errors.append("changes implementer identity is not bound to the active round with accepted runtime assurance")
         if changes.get("diff") and sha256_text(str(changes["diff"])) != changes.get("diff_hash"):
             errors.append("changes.diff_hash does not match diff content")
-        reviews = state.get("reviews")
-        if not isinstance(reviews, list) or not reviews:
+        reviews = state.get("reviews") if isinstance(state.get("reviews"), list) else []
+        if not reviews:
             errors.append("changed diff lacks independent ReviewRecord")
         else:
             approvals = 0
@@ -572,7 +943,7 @@ def _validate_changes_and_reviews(
                     continue
                 if review.get("responsibility_group") == changes.get("implementer_responsibility_group"):
                     errors.append(f"review {review.get('review_id')} is from implementer responsibility group")
-                if review.get("goal_id") != state.get("goal", {}).get("goal_id") or review.get("goal_version") != state.get("goal", {}).get("version"):
+                if review.get("goal_id") != goal.get("goal_id") or review.get("goal_version") != goal.get("version"):
                     errors.append(f"review {review.get('review_id')} belongs to a different goal version")
                 if review.get("reviewer") == changes.get("implementer") or review.get("implementer") != changes.get("implementer"):
                     errors.append(f"review {review.get('review_id')} actor/implementer identity is not independent")
@@ -585,13 +956,18 @@ def _validate_changes_and_reviews(
                     or reviewer_result.get("actor") != review.get("reviewer")
                 ):
                     errors.append(f"review {review.get('review_id')} reviewer identity lacks a successful correlated invocation")
-                elif not _host_observed_invocation(events, reviewer_invocation, actor=review.get("reviewer")):
-                    errors.append(f"review {review.get('review_id')} reviewer identity is not host-hook-observed")
+                elif not _trusted_invocation_for_runtime(events, reviewer_invocation, actor=review.get("reviewer"), state=state):
+                    errors.append(
+                        f"review {review.get('review_id')} reviewer identity is not bound to the active round "
+                        "with accepted runtime assurance"
+                    )
                 if review.get("implementer_invocation_id") != implementer_invocation or reviewer_invocation == implementer_invocation:
                     errors.append(f"review {review.get('review_id')} invocation identities are not independently bound")
                 assurance = review.get("actor_identity_assurance")
-                if assurance != "host-hook-observed":
-                    errors.append(f"review {review.get('review_id')} actor identity assurance is not host-hook-observed")
+                if not _runtime_assurance_accepted(state, assurance):
+                    errors.append(
+                        f"review {review.get('review_id')} actor identity assurance is not host-hook-observed or another accepted assurance for {state.get('runtime')}"
+                    )
                 if review.get("diff_hash") != changes.get("diff_hash") or review.get("base") != changes.get("base") or review.get("head") != changes.get("head"):
                     errors.append(f"review {review.get('review_id')} not bound to current base/head/diff")
                 rerun_ids = review.get("rerun_evidence_ids", [])
@@ -613,7 +989,7 @@ def _validate_changes_and_reviews(
         observed_test_change = bool(observed and any(_is_test_path(path) for path in observed.get("files", [])))
         risky = declared_risky or observed_test_change
         if risky:
-            integrity = [r for r in state.get("reviews", []) if isinstance(r, dict) and r.get("category") == "test-integrity" and r.get("verdict") == "APPROVE"]
+            integrity = [r for r in reviews if isinstance(r, dict) and r.get("category") == "test-integrity" and r.get("verdict") == "APPROVE"]
             if not integrity:
                 errors.append("test deletion/skip/threshold/assertion change lacks separate test-integrity review")
 
@@ -652,24 +1028,72 @@ def _registered_gate_definitions(profile: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(row, dict) or not _nonempty_string(row.get("id")):
             continue
         if _nonempty_string_list(row.get("command")):
-            result[str(row["id"])] = {"command": list(row["command"]), "builtin": None}
+            precondition = list(row["precondition"]) if _nonempty_string_list(row.get("precondition")) else None
+            result[str(row["id"])] = {
+                "command": list(row["command"]),
+                "precondition": precondition,
+                "builtin": None,
+            }
         elif row.get("builtin") in {"intent-coverage", "claim-source-map", "goal-finalize"}:
             builtin = str(row["builtin"])
-            result[str(row["id"])] = {"command": ["supervisor-builtin", builtin], "builtin": builtin}
+            result[str(row["id"])] = {
+                "command": ["supervisor-builtin", builtin],
+                "precondition": None,
+                "builtin": builtin,
+            }
     return result
 
 
+def _validate_gate_registry(profile: Any, errors: list[str]) -> None:
+    if not isinstance(profile, dict):
+        return
+    rows: list[Any] = []
+    rows.extend(profile.get("common_gates", []) if isinstance(profile.get("common_gates"), list) else [])
+    rows.extend(profile.get("gates", []) if isinstance(profile.get("gates"), list) else [])
+    profiles = profile.get("profiles", {})
+    if isinstance(profiles, dict):
+        for profile_row in profiles.values():
+            if isinstance(profile_row, dict) and isinstance(profile_row.get("gates"), list):
+                rows.extend(profile_row["gates"])
+    seen: set[str] = set()
+    supported_builtins = {"intent-coverage", "claim-source-map", "goal-finalize"}
+    for row in rows:
+        if not isinstance(row, dict) or not _nonempty_string(row.get("id")):
+            continue
+        gate_id = str(row["id"])
+        if gate_id in seen:
+            errors.append(f"duplicate quality gate id: {gate_id}")
+        seen.add(gate_id)
+        if "builtin" in row and row.get("builtin") not in supported_builtins:
+            errors.append(f"quality gate {gate_id} has unsupported builtin")
+
+
 def _registered_gate_commands(profile: Any) -> dict[str, list[str]]:
-    return {gate_id: list(row["command"]) for gate_id, row in _registered_gate_definitions(profile).items()}
+    return {gate_id: list(row.get("command") or []) for gate_id, row in _registered_gate_definitions(profile).items()}
 
 
 def _validate_quality(state: dict[str, Any], evidence: dict[str, dict[str, Any]], errors: list[str], observed: dict[str, Any] | None) -> None:
     profile = state.get("quality_profile")
-    domains = set(state.get("changes", {}).get("domains", []))
+    _validate_gate_registry(profile, errors)
+    changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
+    raw_domains = changes.get("domains")
+    domains = {
+        value for value in raw_domains
+        if isinstance(value, str) and value.strip()
+    } if isinstance(raw_domains, list) else set()
     if isinstance(profile, dict) and observed:
-        domains.update(_domains_from_observed(profile, [str(path) for path in observed.get("files", [])]))
+        observed_files = observed.get("files") if isinstance(observed, dict) else []
+        domains.update(_domains_from_observed(
+            profile,
+            [str(path) for path in observed_files] if isinstance(observed_files, list) else [],
+        ))
     if not domains:
-        domains = {str(c.get("domain")) for c in state.get("goal", {}).get("acceptance_criteria", []) if isinstance(c, dict) and c.get("domain")}
+        goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+        criteria = goal.get("acceptance_criteria")
+        domains = {
+            str(c.get("domain"))
+            for c in criteria if isinstance(c, dict) and c.get("domain")
+        } if isinstance(criteria, list) else set()
     if not isinstance(profile, dict) or not profile:
         errors.append("quality profile missing")
         return
@@ -683,8 +1107,12 @@ def _validate_quality(state: dict[str, Any], evidence: dict[str, dict[str, Any]]
 
 
 def _validate_criteria_and_waivers(state: dict[str, Any], satisfied_labels: dict[str, set[str]], errors: list[str]) -> set[str]:
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    criteria = goal.get("acceptance_criteria")
+    if not isinstance(criteria, list):
+        criteria = []
     required_rows = [
-        c for c in state.get("goal", {}).get("acceptance_criteria", [])
+        c for c in criteria
         if isinstance(c, dict) and c.get("required", True)
     ]
     required = {str(c.get("criterion_id")) for c in required_rows}
@@ -697,17 +1125,25 @@ def _validate_criteria_and_waivers(state: dict[str, Any], satisfied_labels: dict
     }
     unmet = required - satisfied
     valid_waived: set[str] = set()
+    raw_authorizations = goal.get("waiver_authorizations")
+    if "waiver_authorizations" in goal and not isinstance(raw_authorizations, list):
+        errors.append("GoalContract waiver_authorizations must be an array")
     authorizations = {
         (str(row.get("criterion_id")), str(row.get("request_sha256")))
-        for row in state.get("goal", {}).get("waiver_authorizations", [])
+        for row in raw_authorizations
         if isinstance(row, dict)
-    }
-    for waiver in state.get("waivers", []):
+    } if isinstance(raw_authorizations, list) else set()
+    raw_waivers = state.get("waivers")
+    if not isinstance(raw_waivers, list):
+        errors.append("waivers must be an array")
+        raw_waivers = []
+    for waiver in raw_waivers:
         if not isinstance(waiver, dict) or not waiver:
             errors.append("waiver must be a structured object")
             continue
-        criterion_id = waiver.get("criterion_id")
-        if criterion_id not in required:
+        raw_criterion_id = waiver.get("criterion_id")
+        criterion_id = raw_criterion_id.strip() if isinstance(raw_criterion_id, str) else ""
+        if not criterion_id or criterion_id not in required:
             errors.append("waiver criterion link invalid")
         elif (
             waiver.get("contract") == "UserWaiver/v3"
@@ -736,6 +1172,9 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
     warnings: list[str] = []
     if not isinstance(state, dict) or not state:
         return {"valid": False, "health": "invalid", "errors": ["state must be a non-empty object"], "warnings": []}
+    events = _array_or_empty(events, "events", errors)
+    if not isinstance(state.get("reviews"), list):
+        errors.append("reviews must be an array")
     authority = state.get("attestation_authority")
     if not (
         isinstance(authority, dict)
@@ -746,10 +1185,28 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
         errors.append("attestation authority limitation is missing or overstated")
     else:
         warnings.append("local HMAC provides operational tamper evidence, not a security boundary against same-user processes")
+    if state.get("runtime") == "codex":
+        warnings.append(
+            "Codex native host-hook-observed evidence uses host lifecycle observation; codex-explicit-audit compatibility evidence is auditable local evidence, not host lifecycle observation or a hard host block"
+        )
+    raw_execution_mode = state.get("execution_mode")
+    normalized_execution_mode = (
+        raw_execution_mode.strip().casefold()
+        if isinstance(raw_execution_mode, str)
+        else ""
+    )
+    if normalized_execution_mode not in EXECUTION_MODES or raw_execution_mode != normalized_execution_mode:
+        errors.append("execution mode invalid or non-canonical")
+    _validate_supervisor_source_snapshot(state, errors)
     _validate_goal(state, errors)
     _validate_spec(state, errors)
     goal = state.get("goal", {}) if isinstance(state.get("goal"), dict) else {}
-    criterion_ids = {str(c.get("criterion_id")) for c in goal.get("acceptance_criteria", []) if isinstance(c, dict) and c.get("criterion_id")}
+    criteria = goal.get("acceptance_criteria")
+    criterion_ids = {
+        str(c["criterion_id"]).strip()
+        for c in criteria
+        if isinstance(c, dict) and _nonempty_string(c.get("criterion_id"))
+    } if isinstance(criteria, list) else set()
     evidence_ids, evidence_by_id, satisfied_labels = _validate_evidence(state, criterion_ids, events, errors)
     _validate_tasks(state, criterion_ids, evidence_by_id, errors)
     _validate_intents(state, events, evidence_by_id, errors)

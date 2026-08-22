@@ -23,10 +23,31 @@ def _sensitive_key(key: str) -> bool:
         r"(?:^|_)(?:secret|token|password|passwd|api_key|access_key|private_key|client_secret|credential|cookie)s?$",
         normalized,
     ))
+
+
+_SECRET_FIELD_NAME = r"(?:api[_-]?key|token|password|passwd|secret|authorization)"
+_QUOTED_TEXT_SECRET_PATTERNS = (
+    (
+        re.compile(
+            rf'''(?i)(?P<prefix>(?<![A-Za-z0-9_])(?:"{_SECRET_FIELD_NAME}"|'{_SECRET_FIELD_NAME}'|{_SECRET_FIELD_NAME})\s*[=:]\s*)"(?:\\.|[^"\\])*"'''
+        ),
+        '"',
+    ),
+    (
+        re.compile(
+            rf"""(?i)(?P<prefix>(?<![A-Za-z0-9_])(?:"{_SECRET_FIELD_NAME}"|'{_SECRET_FIELD_NAME}'|{_SECRET_FIELD_NAME})\s*[=:]\s*)'(?:\\.|[^'\\])*'"""
+        ),
+        "'",
+    ),
+)
 _TEXT_SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"),
+    re.compile(
+        r'''(?i)(authorization\s*:\s*)(?!\[REDACTED\])(?:(?:bearer|basic)\s+)?[^\s,;}\]"']+'''
+    ),
     re.compile(r"(?i)(bearer\s+)[a-z0-9._~+\-/=]+"),
-    re.compile(r"(?i)((?:api[_-]?key|token|password|passwd|secret|authorization)\s*[=:]\s*)[^\s,;]+"),
+    re.compile(
+        rf'''(?i)((?<![A-Za-z0-9_])(?:"{_SECRET_FIELD_NAME}"|'{_SECRET_FIELD_NAME}'|{_SECRET_FIELD_NAME})\s*[=:]\s*)(?!\[REDACTED\])[^\s,;}}\]"']+'''
+    ),
     re.compile(r"(?<![A-Za-z0-9_])(?:sk-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})(?![A-Za-z0-9_])"),
 )
 
@@ -36,7 +57,13 @@ def utc_now() -> str:
 
 
 def parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # Older state may contain ISO timestamps without an explicit offset. Treat
+    # those as UTC (the supervisor's only clock domain), then normalize all
+    # aware values so comparisons never mix naive and aware datetimes.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -104,6 +131,11 @@ def redact(value: Any, key: str = "") -> Any:
         return result
     if isinstance(value, str):
         clean = value
+        for pattern, quote in _QUOTED_TEXT_SECRET_PATTERNS:
+            clean = pattern.sub(
+                lambda match, delimiter=quote: f"{match.group('prefix')}{delimiter}[REDACTED]{delimiter}",
+                clean,
+            )
         for pattern in _TEXT_SECRET_PATTERNS:
             if pattern.groups:
                 clean = pattern.sub(lambda match: match.group(1) + "[REDACTED]", clean)
@@ -113,11 +145,52 @@ def redact(value: Any, key: str = "") -> Any:
     return value
 
 
+def redact_for_persistence(value: Any) -> Any:
+    """Redact unbound data while refusing to corrupt integrity-bound records.
+
+    Supervisor state contains local signatures and hashes that are validated on
+    every finalize.  Silently redacting one of their inputs would protect the
+    secret but leave an authoritative record that can never validate.  Reject
+    that write instead; callers can record a bounded degraded/invalid-state
+    error without persisting either the secret or a forged replacement hash.
+    """
+    clean = redact(value)
+
+    def reject_changed_bindings(original: Any, sanitized: Any) -> None:
+        if isinstance(original, dict) and isinstance(sanitized, dict):
+            if "attestation" in original and original != sanitized:
+                raise ValueError("redaction would mutate an attested record")
+            for key, original_hash in original.items():
+                if not isinstance(key, str) or not key.endswith("_sha256"):
+                    continue
+                bound_key = key[:-7]
+                if bound_key in original and sanitized.get(bound_key) != original.get(bound_key):
+                    raise ValueError(f"redaction would mutate hash-bound field: {bound_key}")
+                if sanitized.get(key) != original_hash:
+                    raise ValueError(f"redaction would mutate integrity hash: {key}")
+            for key, child in original.items():
+                reject_changed_bindings(child, sanitized.get(str(key)))
+        elif isinstance(original, (list, tuple)) and isinstance(sanitized, list):
+            for child, clean_child in zip(original, sanitized, strict=False):
+                reject_changed_bindings(child, clean_child)
+
+    reject_changed_bindings(value, clean)
+    if isinstance(value, dict) and isinstance(clean, dict) and isinstance(value.get("request_manifest"), dict):
+        # RequestManifest binds the complete GoalContract and the atomic intent
+        # text hashes.  Do not let state-level redaction invalidate that signed
+        # manifest after it has been constructed.
+        for field in ("goal", "intents", "intent_manifest", "request_manifest"):
+            if field in value and clean.get(field) != value.get(field):
+                raise ValueError(f"redaction would mutate request-manifest-bound field: {field}")
+    return clean
+
+
 def json_load(path: Path, default: Any = None) -> Any:
-    if not path.exists():
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return default
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
 
 
 def truthy_env(name: str, default: bool = False) -> bool:

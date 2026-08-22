@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-supervisor.local/schemas/core-project-config-v3.json",
+  "type": "object",
+  "required": ["$schema", "project_id", "supervisor_scope"],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schema_version": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "quality_profile": {"$ref": "#/$defs/relativePath"},
+    "execution_mode": {"enum": ["observe", "warn", "enforce"]},
+    "supervisor_scope": {
+      "type": "object",
+      "required": ["allowed_change_globs", "out_of_scope_globs"],
+      "properties": {
+        "allowed_change_globs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/boundedGlob"}
+        },
+        "out_of_scope_globs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/relativePath"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "agent_roles": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/capability"}
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/capability"}
+    },
+    "privacy": {
+      "type": "object",
+      "properties": {
+        "persist_raw_prompts": {"const": false},
+        "persist_raw_command_arguments": {"const": false},
+        "redact_before_persist": {"const": true}
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!~(?:/|$))(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*[\\r\\n]).+$"
+    },
+    "boundedGlob": {
+      "allOf": [
+        {"$ref": "#/$defs/relativePath"},
+        {"pattern": "^(?!\\./)(?![^/]*(?:\\*|\\?|\\[))[^/]+(?:/.*)?$"},
+        {"not": {"enum": ["*", "**", "**/*", ".", "./*", "./**", "./**/*"]}}
+      ]
+    },
+    "capability": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "fallback_id": {"type": "string", "minLength": 1},
+        "responsibility_group": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -14,7 +14,19 @@
         "objective": {"type": "string", "minLength": 1},
         "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Criterion"}},
         "scope": {"type": "object", "required": ["in", "out"]},
-        "constraints": {"type": "array"}, "non_goals": {"type": "array"}, "assumptions": {"type": "array"}, "risks": {"type": "array"}
+        "constraints": {"type": "array"}, "non_goals": {"type": "array"}, "assumptions": {"type": "array"}, "risks": {"type": "array"},
+        "t3_action_authorizations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["action_sha256", "request_sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "action_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        }
       }
     },
     "Criterion": {

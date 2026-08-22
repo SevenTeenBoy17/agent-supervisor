@@ -10,12 +10,25 @@ from .constants import CHANGE_MODES, EXECUTION_MODES, INTENT_STATES, REVIEW_VERD
 from .util import canonical_sha256, sha256_text, stable_id, utc_now
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def _list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
+    # Contract builders may append or normalize rows. Never hand them a caller's
+    # authoritative list by reference (especially a prior signed goal record).
+    return copy.deepcopy(value) if isinstance(value, list) else []
 
 
 def _string_list(value: Any) -> list[str]:
     return [item.strip() for item in _list(value) if isinstance(item, str) and item.strip()]
+
+
+def _int_or_zero(value: Any) -> int:
+    """Normalize an untrusted optional integer without aborting contract creation."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _unique(items: list[Any]) -> list[Any]:
@@ -29,27 +42,109 @@ def _unique(items: list[Any]) -> list[Any]:
     return result
 
 
+def _t3_authorizations(value: Any) -> list[dict[str, str]]:
+    """Keep only structured, exact-action approvals from trusted prior goals."""
+    result: list[dict[str, str]] = []
+    for item in _list(value):
+        if not isinstance(item, dict):
+            continue
+        action_sha256 = str(item.get("action_sha256") or "").strip().casefold()
+        request_sha256 = str(item.get("request_sha256") or "").strip().casefold()
+        if _SHA256_RE.fullmatch(action_sha256) and _SHA256_RE.fullmatch(request_sha256):
+            result.append({
+                "action_sha256": action_sha256,
+                "request_sha256": request_sha256,
+            })
+    return _unique(result)
+
+
+def _waiver_authorizations(value: Any) -> list[dict[str, str]]:
+    """Keep only structured, hash-bound waivers from trusted prior goals."""
+    result: list[dict[str, str]] = []
+    for item in _list(value):
+        if not isinstance(item, dict):
+            continue
+        criterion_id = str(item.get("criterion_id") or "").strip()
+        request_sha256 = str(item.get("request_sha256") or "").strip().casefold()
+        if criterion_id and "\x00" not in criterion_id and _SHA256_RE.fullmatch(request_sha256):
+            result.append({
+                "criterion_id": criterion_id,
+                "request_sha256": request_sha256,
+            })
+    return _unique(result)
+
+
+def _trusted_authorization_records(
+    value: Any, *, request_sha256: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Translate a separately authenticated request binding into goal records.
+
+    Request prose and caller-supplied GoalContract fields are deliberately not
+    inputs to this function. The embedding host is responsible for authenticating
+    this metadata before passing it to ``build_goal``.
+    """
+    if value is None:
+        return [], []
+    if not isinstance(value, dict):
+        raise ValueError("trusted authorizations must be an object")
+    bound_request = str(value.get("request_sha256") or "").strip().casefold()
+    if not _SHA256_RE.fullmatch(bound_request) or bound_request != request_sha256:
+        raise ValueError("trusted authorizations request hash mismatch")
+
+    raw_waivers = value.get("waiver_criterion_ids", [])
+    raw_actions = value.get("t3_action_sha256s", [])
+    if not isinstance(raw_waivers, list) or not isinstance(raw_actions, list):
+        raise ValueError("trusted authorization identifiers must be lists")
+
+    waivers: list[dict[str, str]] = []
+    for raw in raw_waivers:
+        criterion_id = raw.strip() if isinstance(raw, str) else ""
+        if not criterion_id or "\x00" in criterion_id:
+            raise ValueError("trusted waiver criterion id is invalid")
+        waivers.append({
+            "criterion_id": criterion_id,
+            "request_sha256": request_sha256,
+        })
+
+    actions: list[dict[str, str]] = []
+    for raw in raw_actions:
+        action_sha256 = raw.strip().casefold() if isinstance(raw, str) else ""
+        if not _SHA256_RE.fullmatch(action_sha256):
+            raise ValueError("trusted T3 action hash is invalid")
+        actions.append({
+            "action_sha256": action_sha256,
+            "request_sha256": request_sha256,
+        })
+    return _unique(waivers), _unique(actions)
+
+
 def _merge_contract_rows(previous: list[Any], current: list[Any]) -> list[Any]:
     """Append genuinely new contract rows without replacing prior identities."""
     result = copy.deepcopy(previous)
     seen: set[str] = set()
+
+    def markers(item: Any) -> set[str]:
+        if isinstance(item, dict):
+            values: set[str] = set()
+            identity = str(item.get("criterion_id") or item.get("intent_id") or "").strip()
+            if identity:
+                values.add(f"id:{identity}")
+            description = str(item.get("description") or item.get("text") or "").strip()
+            if description:
+                domain = str(item.get("domain") or "general").strip() or "general"
+                values.add(f"semantic:{domain}\0{description}")
+            return values
+        value = str(item).strip()
+        return {f"semantic:general\0{value}"} if value else set()
+
     for item in result:
-        if isinstance(item, dict):
-            marker = str(item.get("criterion_id") or item.get("intent_id") or item.get("description") or item.get("text") or "")
-        else:
-            marker = str(item)
-        if marker:
-            seen.add(marker)
+        seen.update(markers(item))
     for item in current:
-        if isinstance(item, dict):
-            marker = str(item.get("criterion_id") or item.get("intent_id") or item.get("description") or item.get("text") or "")
-        else:
-            marker = str(item)
-        if marker and marker in seen:
+        item_markers = markers(item)
+        if item_markers & seen:
             continue
         result.append(copy.deepcopy(item))
-        if marker:
-            seen.add(marker)
+        seen.update(item_markers)
     return result
 
 
@@ -61,6 +156,8 @@ def build_goal(
     supplied: dict[str, Any] | None = None,
     default_evidence: list[str] | None = None,
     default_evidence_by_domain: dict[str, list[str]] | None = None,
+    default_intents: list[dict[str, Any]] | None = None,
+    trusted_authorizations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if change_mode not in CHANGE_MODES:
         raise ValueError(f"invalid change mode: {change_mode}")
@@ -78,6 +175,32 @@ def build_goal(
     version = int(previous_goal.get("version", 0)) + 1 if same_identity else int(supplied.get("version", 1))
     previous_criteria = _list(previous_goal.get("acceptance_criteria"))
     supplied_criteria = _list(supplied.get("acceptance_criteria"))
+    for index, raw in enumerate(supplied_criteria):
+        if isinstance(raw, str):
+            raw = {"description": raw}
+            supplied_criteria[index] = raw
+        if isinstance(raw, dict) and not str(raw.get("criterion_id") or "").strip():
+            description = str(raw.get("description") or "").strip()
+            domain = str(raw.get("domain") or "general").strip() or "general"
+            raw["criterion_id"] = stable_id("criterion", f"{domain}\0{description}")
+    derived_criteria: list[dict[str, Any]] = []
+    seen_defaults: set[tuple[str, str]] = set()
+    for raw_intent in _list(default_intents):
+        if not isinstance(raw_intent, dict):
+            continue
+        description = str(raw_intent.get("text") or "").strip()
+        domain = str(raw_intent.get("domain") or "general").strip() or "general"
+        marker = (domain, description)
+        if not description or marker in seen_defaults:
+            continue
+        seen_defaults.add(marker)
+        derived_criteria.append(
+            {
+                "criterion_id": stable_id("criterion", f"{domain}\0{description}"),
+                "description": description,
+                "domain": domain,
+            }
+        )
     if change_mode == "continue" and previous_goal:
         objective = str(previous_goal.get("objective") or supplied.get("objective") or message).strip()
         raw_criteria = _merge_contract_rows(previous_criteria, supplied_criteria)
@@ -87,13 +210,27 @@ def build_goal(
         objective = extension if supplied.get("objective") else " — ".join(item for item in (previous_objective, extension) if item)
         raw_criteria = _merge_contract_rows(
             previous_criteria,
-            supplied_criteria or [{"description": extension, "domain": "config-agent", "expected_evidence": default_evidence or ["goal-output"]}],
+            supplied_criteria
+            or derived_criteria
+            or [{
+                "criterion_id": stable_id("criterion", f"general\0{extension}"),
+                "description": extension,
+                "domain": "general",
+                "expected_evidence": default_evidence or ["goal-output"],
+            }],
         )
     else:
         objective = str(supplied.get("objective") or message).strip()
         raw_criteria = supplied_criteria
     if not raw_criteria:
-        raw_criteria = [{"description": objective, "domain": "config-agent", "expected_evidence": default_evidence or ["goal-output"]}]
+        raw_criteria = derived_criteria or [
+            {
+                "criterion_id": stable_id("criterion", f"general\0{objective}"),
+                "description": objective,
+                "domain": "general",
+                "expected_evidence": default_evidence or ["goal-output"],
+            }
+        ]
     criteria: list[dict[str, Any]] = []
     domain_defaults = default_evidence_by_domain or {}
     for index, raw in enumerate(raw_criteria, start=1):
@@ -102,14 +239,24 @@ def build_goal(
         if not isinstance(raw, dict):
             continue
         description = str(raw.get("description", "")).strip()
-        domain = str(raw.get("domain") or "config-agent")
-        evidence_defaults = domain_defaults.get(domain) or domain_defaults.get(domain.replace("-", "/")) or default_evidence or ["goal-output"]
+        domain = str(raw.get("domain") or "general").strip() or "general"
+        evidence_candidates = [domain, domain.replace("-", "/")]
+        if domain in {"api", "db", "database", "backend"}:
+            evidence_candidates.append("api/db")
+        if domain in {"config", "agent", "config-agent"}:
+            evidence_candidates.append("config/agent")
+        evidence_defaults: list[str] = []
+        for candidate in evidence_candidates:
+            if domain_defaults.get(candidate):
+                evidence_defaults = _string_list(domain_defaults[candidate])
+                break
+        evidence_defaults = evidence_defaults or _string_list(default_evidence) or ["goal-output"]
         criteria.append(
             {
-                "criterion_id": str(raw.get("criterion_id") or f"criterion-{index}"),
+                "criterion_id": str(raw.get("criterion_id") or stable_id("criterion", f"{domain}\0{description}")),
                 "description": description,
                 "domain": domain,
-                "expected_evidence": _string_list(raw.get("expected_evidence")) or evidence_defaults,
+                "expected_evidence": _string_list(raw.get("expected_evidence")) or list(evidence_defaults),
                 "required": bool(raw.get("required", True)),
             }
         )
@@ -119,9 +266,7 @@ def build_goal(
     def merged_list(name: str, supplied_value: Any) -> list[str]:
         previous_values = _string_list(previous_goal.get(name))
         current_values = _string_list(supplied_value)
-        if change_mode == "continue" and previous_goal and not current_values:
-            return previous_values
-        if change_mode == "extend" and previous_goal:
+        if change_mode in {"continue", "extend"} and previous_goal:
             return _unique(previous_values + current_values)
         return current_values
 
@@ -135,9 +280,22 @@ def build_goal(
         scope_out = _unique(_string_list(previous_scope.get("out")) + scope_out)
 
     request_hash = sha256_text(message)
-    waiver_authorizations = _list(previous_goal.get("waiver_authorizations")) if change_mode in {"continue", "extend"} else []
-    for match in re.finditer(r"(?i)(?:SUPERVISOR-WAIVE\s*[:：]\s*|豁免\s+)([A-Za-z0-9_.:-]+)", message):
-        waiver_authorizations.append({"criterion_id": match.group(1), "request_sha256": request_hash})
+    waiver_authorizations = (
+        _waiver_authorizations(previous_goal.get("waiver_authorizations"))
+        if change_mode in {"continue", "extend"}
+        else []
+    )
+    t3_action_authorizations = (
+        _t3_authorizations(previous_goal.get("t3_action_authorizations"))
+        if change_mode in {"continue", "extend"}
+        else []
+    )
+    trusted_waivers, trusted_t3_actions = _trusted_authorization_records(
+        trusted_authorizations,
+        request_sha256=request_hash,
+    )
+    waiver_authorizations.extend(trusted_waivers)
+    t3_action_authorizations.extend(trusted_t3_actions)
 
     return {
         "contract": "GoalContract/v3",
@@ -153,6 +311,7 @@ def build_goal(
         "assumptions": merged_list("assumptions", supplied.get("assumptions")),
         "risks": merged_list("risks", supplied.get("risks")),
         "waiver_authorizations": _unique(waiver_authorizations),
+        "t3_action_authorizations": _unique(t3_action_authorizations),
         "created_at": utc_now(),
     }
 
@@ -177,8 +336,11 @@ def normalize_intents(raw: Any, message: str = "") -> list[dict[str, Any]]:
                 "reason": str(item.get("reason") or "awaiting routing").strip(),
                 "capability_ids": _string_list(item.get("capability_ids")),
                 "method": str(item.get("method") or "capability"),
-                "phase": int(item.get("phase", 0) or 0),
+                "phase": _int_or_zero(item.get("phase")),
                 "domain": str(item.get("domain") or "general"),
+                "role": str(item.get("role") or ""),
+                "required_responsibility_groups": _string_list(item.get("required_responsibility_groups")),
+                "depends_on_intent_ids": _string_list(item.get("depends_on_intent_ids")),
             }
         )
     return intents
@@ -272,7 +434,7 @@ def invocation_event(
         "details": details or {},
         "timestamp": utc_now(),
     }
-    if identity_assurance == "host-hook-observed":
+    if identity_assurance in {"host-hook-observed", "codex-explicit-audit"}:
         event["attestation"] = sign_record(event)
     return event
 

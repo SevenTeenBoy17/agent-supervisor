@@ -11,6 +11,9 @@ spool/
 .pytest_cache/
 .pytest-tmp/
 .pytest-tmp*/
+.tmp-tests/
+.agent-supervisor/
+fallback/
 __pycache__/
 *.py[cod]
 *.egg-info/

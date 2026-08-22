@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import supervisor_core.cli as cli_module
+import supervisor_core.workspace as workspace_module
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
 from supervisor_core.util import sha256_file
@@ -18,6 +19,107 @@ from supervisor_core.workspace import capture_workspace_snapshot, workspace_delt
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _git_fixture_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(name, None)
+    return env
+
+
+def _write_install_source_fixture(home: Path) -> None:
+    roots = {
+        "codex-adapter": home / ".codex" / "skills" / "dev-supervisor" / "scripts",
+        "claude-adapter": home / ".claude" / "skills" / "supervisor" / "scripts",
+    }
+    for logical_name in workspace_module._required_supervisor_source_names():
+        prefix, _, filename = logical_name.partition("/")
+        if prefix not in roots:
+            continue
+        target = roots[prefix] / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"fixture:{logical_name}\n", encoding="utf-8")
+
+
+def _write_release_root_fixture(path: Path) -> None:
+    core = path / "supervisor_core"
+    core.mkdir(parents=True)
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    (core / "cli.py").write_text("", encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_attestation_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        "AGENT_SUPERVISOR_ATTESTATION_KEY_FILE",
+        str(tmp_path / "in-process-attestation.key"),
+    )
+
+
+def test_git_fixture_env_drops_inherited_repository_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.setenv(name, f"attacker-{name.lower()}")
+
+    env = _git_fixture_env()
+
+    assert all(name not in env for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"))
+
+
+def _trusted_quality_controls() -> dict:
+    return {
+        "completion_policy": {
+            "binary_only": True,
+            "model_self_score_is_evidence": False,
+            "validator_error_terminal": "degraded",
+            "allowed_terminal_states": ["complete", "incomplete", "blocked", "user-waived"],
+            "complete_requires_all_applicable_gates": True,
+            "unresolved_p0_p1_blocks_complete": True,
+        },
+        "test_integrity": {
+            "separate_review_required_for": ["assertion changed with implementation"],
+            "green_tests_alone_are_sufficient": False,
+        },
+        "review": {
+            "implementer_and_reviewer_groups_must_differ": True,
+            "required_verdicts": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"],
+            "record_must_bind": [
+                "actor", "responsibility_group", "base", "head", "diff_hash", "rerun_evidence",
+                "implementer_invocation_id", "reviewer_invocation_id", "actor_identity_assurance",
+            ],
+        },
+    }
+
+
+def _write_config_schemas(supervisor_dir: Path) -> tuple[str, str]:
+    schemas = supervisor_dir / "schemas"
+    schemas.mkdir(parents=True, exist_ok=True)
+    project_schema = schemas / "project.schema.json"
+    quality_schema = schemas / "quality.schema.json"
+    project_schema.write_text(json.dumps({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["$schema", "project_id", "supervisor_scope"],
+        "properties": {
+            "$schema": {"type": "string", "minLength": 1},
+            "project_id": {"type": "string", "minLength": 1},
+            "quality_profile": {"type": "string"},
+            "supervisor_scope": {"type": "object"},
+        },
+        "additionalProperties": True,
+    }), encoding="utf-8")
+    quality_schema.write_text(json.dumps({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["$schema"],
+        "properties": {"$schema": {"type": "string", "minLength": 1}},
+        "additionalProperties": True,
+    }), encoding="utf-8")
+    return "./schemas/project.schema.json", "./schemas/quality.schema.json"
 
 
 def run_cli(arguments: list[str], env: dict[str, str], expected: int = 0) -> dict:
@@ -90,6 +192,96 @@ def test_gate_runner_attests_registered_argv_and_resolved_executable(tmp_path):
     assert any("does not match the locally attested core execution" in error for error in errors)
 
 
+def test_gate_precondition_is_attested_and_failure_prevents_main_command(tmp_path):
+    workspace = tmp_path / "precondition workspace"
+    workspace.mkdir()
+    marker = workspace / "main-command-ran"
+    ctx = StateContext.build(
+        runtime="codex",
+        project="precondition-project",
+        workspace=str(workspace),
+        session="precondition-session",
+        round_id="precondition-round",
+        state_root=tmp_path / "state",
+    )
+    precondition = [sys.executable, "-c", "print('SETUP_FAILED'); raise SystemExit(7)"]
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('unsafe')",
+    ]
+    start_round(
+        ctx,
+        message="prove ordered gate setup",
+        change_mode="replace",
+        execution_mode="observe",
+        quality_profile={
+            "common_gates": [{"id": "gate.precondition", "precondition": precondition, "command": command}]
+        },
+    )
+    evidence, execution, code = cli_module._run_registered_gate(
+        ctx,
+        {
+            "event_type": "gate_run",
+            "actor": "trusted-runner",
+            "record": {
+                "gate_id": "gate.precondition",
+                "criterion_id": "criterion-1",
+                "collector_responsibility_group": "trusted-runtime",
+            },
+        },
+    )
+    assert code == 2
+    assert evidence["exit_code"] == 7
+    assert execution["precondition"]["command"]["args"] == precondition
+    assert execution["precondition"]["exit_code"] == 7
+    assert execution["command_executed"] is False
+    assert marker.exists() is False
+    assert ctx.load()["evidence"] == []
+
+
+def test_gate_success_attests_precondition_and_main_command(tmp_path):
+    workspace = tmp_path / "successful precondition workspace"
+    workspace.mkdir()
+    ctx = StateContext.build(
+        runtime="codex",
+        project="successful-precondition-project",
+        workspace=str(workspace),
+        session="successful-precondition-session",
+        round_id="successful-precondition-round",
+        state_root=tmp_path / "state",
+    )
+    precondition = [sys.executable, "-c", "print('SETUP_PASS')"]
+    command = [sys.executable, "-c", "print('MAIN_PASS')"]
+    start_round(
+        ctx,
+        message="prove ordered successful gate",
+        change_mode="replace",
+        execution_mode="observe",
+        quality_profile={
+            "common_gates": [{"id": "gate.precondition", "precondition": precondition, "command": command}]
+        },
+    )
+    evidence, execution, code = cli_module._run_registered_gate(
+        ctx,
+        {
+            "event_type": "gate_run",
+            "actor": "trusted-runner",
+            "record": {
+                "gate_id": "gate.precondition",
+                "criterion_id": "criterion-1",
+                "collector_responsibility_group": "trusted-runtime",
+            },
+        },
+    )
+    assert code == 0
+    assert execution["precondition"]["exit_code"] == 0
+    assert execution["command_executed"] is True
+    assert "SETUP_PASS" in execution["precondition"]["output_summary"]
+    assert "MAIN_PASS" in execution["output_summary"]
+    assert evidence["precondition"] == execution["precondition"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows PATH/PATHEXT regression")
 @pytest.mark.parametrize(
     ("registered", "shim_name"),
@@ -152,28 +344,38 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
     supervisor_dir.mkdir(parents=True)
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
+    project_schema, quality_schema = _write_config_schemas(supervisor_dir)
     project_file.write_text(json.dumps({
+        "$schema": project_schema,
         "project_id": "e2e",
         "quality_profile": "quality.json",
         "supervisor_scope": {"allowed_change_globs": ["config.json", ".agent-supervisor/**"], "out_of_scope_globs": ["src/**"]},
     }), encoding="utf-8")
     quality_file.write_text(json.dumps({
+        "$schema": quality_schema,
+        **_trusted_quality_controls(),
         "global_gates": ["gate.e2e"],
         "common_gates": [{"id": "gate.e2e", "command": [sys.executable, "-c", "print('E2E_GATE_PASS')"]}],
         "domains": {"config/agent": {"required_gates": ["gate.e2e"]}},
         "profiles": {"config_agent": {"applies_to": ["config.json"], "gates": []}},
     }), encoding="utf-8")
     (workspace / "config.json").write_text('{"version":1}\n', encoding="utf-8")
-    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
-    subprocess.run(["git", "-C", str(workspace), "config", "user.email", "test@example.invalid"], check=True)
-    subprocess.run(["git", "-C", str(workspace), "config", "user.name", "Supervisor E2E"], check=True)
-    subprocess.run(["git", "-C", str(workspace), "add", ".agent-supervisor/project.json", ".agent-supervisor/quality.json", "config.json"], check=True)
-    subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "baseline"], check=True)
+    git_env = _git_fixture_env()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.email", "test@example.invalid"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.name", "Supervisor E2E"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(workspace), "add", ".agent-supervisor/project.json", ".agent-supervisor/quality.json", "config.json"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "baseline"], check=True, env=git_env)
 
-    env = os.environ.copy()
+    env = _git_fixture_env()
+    install_home = tmp_path / "install-home"
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    _write_install_source_fixture(install_home)
     env["AGENT_SUPERVISOR_ATTESTATION_KEY_FILE"] = str(tmp_path / "attestation.key")
-    env["USERPROFILE"] = str(tmp_path / "home")
-    env["HOME"] = str(tmp_path / "home")
+    env["USERPROFILE"] = str(isolated_home)
+    env["HOME"] = str(isolated_home)
+    env["AGENT_SUPERVISOR_INSTALL_HOME"] = str(install_home)
     common = [
         "--runtime", "claude", "--workspace", str(workspace), "--session", "e2e-session",
         "--round", "e2e-round", "--project-file", str(project_file),
@@ -248,11 +450,15 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
     supervisor_dir.mkdir(parents=True)
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
+    project_schema, quality_schema = _write_config_schemas(supervisor_dir)
     project_file.write_text(json.dumps({
+        "$schema": project_schema,
         "project_id": "rollback-e2e", "quality_profile": "quality.json",
         "supervisor_scope": {"allowed_change_globs": [".agent-supervisor/**"], "out_of_scope_globs": []},
     }), encoding="utf-8")
     quality_file.write_text(json.dumps({
+        "$schema": quality_schema,
+        **_trusted_quality_controls(),
         "global_gates": ["gate.fail"],
         "common_gates": [{
             "id": "gate.fail",
@@ -262,15 +468,15 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
 
     current = tmp_path / "current-core"
     previous = tmp_path / "previous-core"
-    (current / "supervisor_core").mkdir(parents=True)
-    (previous / "supervisor_core").mkdir(parents=True)
+    _write_release_root_fixture(current)
+    _write_release_root_fixture(previous)
     pointer = tmp_path / "active-version.json"
     pointer.write_text(json.dumps({
         "contract": "ActiveVersionPointer/v3",
         "active": {"version": "3.1.0", "path": str(current)},
         "previous": {"version": "3.0.0", "path": str(previous)},
     }), encoding="utf-8")
-    env = os.environ.copy()
+    env = _git_fixture_env()
     env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
     env["AGENT_SUPERVISOR_ATTESTATION_KEY_FILE"] = str(tmp_path / "rollback-attestation.key")
     common = [
@@ -318,8 +524,8 @@ def test_stale_rollback_claim_recovers_before_or_after_pointer_effect(
     workspace.mkdir()
     current = tmp_path / "bad-core"
     previous = tmp_path / "good-core"
-    (current / "supervisor_core").mkdir(parents=True)
-    (previous / "supervisor_core").mkdir(parents=True)
+    _write_release_root_fixture(current)
+    _write_release_root_fixture(previous)
     pointer = tmp_path / "active-version.json"
     pointer.write_text(json.dumps({
         "contract": "ActiveVersionPointer/v3",
@@ -401,17 +607,21 @@ def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(t
     supervisor_dir.mkdir(parents=True)
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
+    project_schema, quality_schema = _write_config_schemas(supervisor_dir)
     project_file.write_text(json.dumps({
+        "$schema": project_schema,
         "project_id": "identity-bound-rollback",
         "quality_profile": "quality.json",
         "supervisor_scope": {"allowed_change_globs": [".agent-supervisor/**"], "out_of_scope_globs": []},
     }), encoding="utf-8")
     quality_file.write_text(json.dumps({
+        "$schema": quality_schema,
+        **_trusted_quality_controls(),
         "global_gates": ["gate.fail"],
         "common_gates": [{"id": "gate.fail", "command": [sys.executable, "-c", "raise SystemExit(1)"]}],
     }), encoding="utf-8")
     pointer = tmp_path / "active-version.json"
-    env = os.environ.copy()
+    env = _git_fixture_env()
     env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
     env["AGENT_SUPERVISOR_ATTESTATION_KEY_FILE"] = str(tmp_path / "identity-attestation.key")
     common = [
@@ -439,8 +649,8 @@ def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(t
 
     new_release = tmp_path / "new-release"
     old_release = tmp_path / "old-release"
-    (new_release / "supervisor_core").mkdir(parents=True)
-    (old_release / "supervisor_core").mkdir(parents=True)
+    _write_release_root_fixture(new_release)
+    _write_release_root_fixture(old_release)
     pointer.write_text(json.dumps({
         "contract": "ActiveVersionPointer/v3",
         "active": {"version": "4.0.0", "path": str(new_release)},

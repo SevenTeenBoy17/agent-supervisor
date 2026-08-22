@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,15 +25,70 @@ class RootSpec:
 
 def _frontmatter(path: Path) -> tuple[dict[str, Any], str]:
     text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
         return {}, text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    closing_index = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.rstrip("\r\n") == "---"),
+        None,
+    )
+    if closing_index is None:
         raise ValueError("unterminated YAML frontmatter")
-    metadata = yaml.safe_load(parts[1]) or {}
+    metadata = yaml.safe_load("".join(lines[1:closing_index])) or {}
     if not isinstance(metadata, dict):
         raise ValueError("YAML frontmatter must be an object")
-    return metadata, parts[2]
+    return metadata, "".join(lines[closing_index + 1 :])
+
+
+def _is_link_or_reparse(path: Path, metadata: os.stat_result | None = None) -> bool:
+    try:
+        metadata = metadata or path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or (
+            hasattr(metadata, "st_file_attributes")
+            and bool(metadata.st_file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        )
+    )
+
+
+def _scan_skill_paths(root_path: Path) -> tuple[list[Path], list[dict[str, str]]]:
+    """Enumerate regular SKILL.md files without following link/reparse entries."""
+    pending = [root_path]
+    skill_paths: list[Path] = []
+    ignored: list[dict[str, str]] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name.casefold())
+        except OSError as exc:
+            ignored.append({"path": str(directory), "reason": f"directory-scan-unavailable:{type(exc).__name__}"})
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                ignored.append({"path": str(path), "reason": f"entry-unavailable:{type(exc).__name__}"})
+                continue
+            if _is_link_or_reparse(path, metadata):
+                kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "entry"
+                ignored.append({"path": str(path), "reason": f"symlink-or-reparse-{kind}"})
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root_path)
+            except (OSError, RuntimeError, ValueError):
+                ignored.append({"path": str(path), "reason": "entry-escapes-root-or-changed"})
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+            elif stat.S_ISREG(metadata.st_mode) and entry.name == "SKILL.md":
+                skill_paths.append(path)
+    return sorted(skill_paths, key=lambda path: str(path).casefold()), ignored
 
 
 def _nearest_toml(path: Path, stop: Path) -> dict[str, Any]:
@@ -64,19 +121,51 @@ def _version_from(path: Path, metadata: dict[str, Any], toml_data: dict[str, Any
 
 
 def _version_key(version: str) -> tuple[Any, ...]:
-    pieces = re.split(r"[.\-+_]", version)
-    return tuple((0, int(piece)) if piece.isdigit() else (1, piece.lower()) for piece in pieces)
+    normalized = str(version or "").strip()
+    if not normalized or normalized.casefold() == "unknown":
+        # ``max`` selects the active duplicate, so an unversioned cache entry
+        # must never outrank a concrete installed version.
+        return (0,)
+    precedence = normalized.split("+", 1)[0]
+    core, separator, prerelease = precedence.partition("-")
+
+    def component(piece: str) -> tuple[Any, ...]:
+        if re.fullmatch(r"[0-9]+", piece):
+            significant = piece.lstrip("0") or "0"
+            return (0, len(significant), significant)
+        return (1, piece.casefold())
+
+    core_components = tuple(component(piece) for piece in re.split(r"[._]", core))
+    prerelease_components = tuple(
+        component(piece) for piece in re.split(r"[._]", prerelease)
+    ) if separator else ()
+    # A stable release outranks its prerelease. Build metadata is intentionally
+    # ignored for precedence, matching semantic-version ordering.
+    return (1, core_components, 0 if separator else 1, prerelease_components)
+
+
+def _skill_file_hash(path: Path) -> tuple[str, str]:
+    try:
+        return sha256_bytes(path.read_bytes()), ""
+    except (OSError, UnicodeError) as exc:
+        return "", f"hash-read-{type(exc).__name__}: {exc}"
 
 
 def scan_skills(roots: Iterable[RootSpec]) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     ignored: list[dict[str, str]] = []
     for root in roots:
-        root_path = root.path.expanduser().resolve()
+        try:
+            root_path = root.path.expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            ignored.append({"path": str(root.path), "reason": f"root-unavailable:{type(exc).__name__}"})
+            continue
         if not root_path.exists():
             ignored.append({"path": str(root_path), "reason": "root-missing"})
             continue
-        for path in root_path.rglob("SKILL.md"):
+        skill_paths, scan_ignored = _scan_skill_paths(root_path)
+        ignored.extend(scan_ignored)
+        for path in skill_paths:
             relative_parts = [part.lower() for part in path.relative_to(root_path).parts]
             if "upstream" in relative_parts[:-1]:
                 ignored_name = path.parent.name
@@ -100,7 +189,10 @@ def scan_skills(roots: Iterable[RootSpec]) -> dict[str, Any]:
                 description = str(metadata.get("description") or "").strip()
                 manual_only = bool(metadata.get("disable-model-invocation", False))
                 user_invocable = metadata.get("user-invocable", True) is not False
-                availability = "enabled" if root.enabled and not root.cache else ("cache-only" if root.cache else "disabled")
+                if not root.enabled:
+                    availability = "disabled"
+                else:
+                    availability = "cache-only" if root.cache else "enabled"
                 health = "healthy" if name and body.strip() else "unknown"
                 error = ""
             except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
@@ -118,6 +210,12 @@ def scan_skills(roots: Iterable[RootSpec]) -> dict[str, Any]:
                 error = f"{type(exc).__name__}: {exc}"
                 toml_data = {}
             version = _version_from(path, metadata, toml_data)
+            digest, hash_error = _skill_file_hash(path)
+            if hash_error:
+                availability = "unavailable"
+                health = "unavailable"
+                user_invocable = False
+                error = "; ".join(part for part in (error, hash_error) if part)
             records.append(
                 {
                     "id": name,
@@ -127,7 +225,7 @@ def scan_skills(roots: Iterable[RootSpec]) -> dict[str, Any]:
                     "version": version,
                     "source": root.source,
                     "path": str(path),
-                    "sha256": sha256_bytes(path.read_bytes()) if path.exists() else "",
+                    "sha256": digest,
                     "automatic": availability == "enabled" and not manual_only,
                     "manual_only": manual_only,
                     "user_invocable": user_invocable,
@@ -197,7 +295,18 @@ def parse_roots(values: list[str], runtime: str) -> list[RootSpec]:
                 installs = plugins.get(plugin_id, [])
                 if not isinstance(installs, list):
                     continue
-                existing = [row for row in installs if isinstance(row, dict) and Path(str(row.get("installPath", ""))).exists()]
+                existing: list[dict[str, Any]] = []
+                for row in installs:
+                    if not isinstance(row, dict):
+                        continue
+                    raw_install_path = row.get("installPath")
+                    if not isinstance(raw_install_path, str) or not raw_install_path.strip():
+                        continue
+                    try:
+                        if Path(raw_install_path).expanduser().is_dir():
+                            existing.append(row)
+                    except OSError:
+                        continue
                 if not existing:
                     continue
                 latest = max(existing, key=lambda row: (_version_key(str(row.get("version", "unknown"))), str(row.get("installedAt", ""))))
@@ -219,28 +328,151 @@ def baseline_report(inventory: dict[str, Any], baseline_path: Path) -> dict[str,
         expected = [row for row in baseline["items"] if isinstance(row, dict) and row.get("kind") == "skill"]
     else:
         expected = []
-    expected_by_name = {str(r.get("name") or r.get("call")): r for r in expected if isinstance(r, dict)}
-    actual_by_name = {r["name"]: r for r in inventory.get("skills", [])}
+
+    def normalized(rows: Any) -> list[dict[str, Any]]:
+        unique: dict[str, dict[str, Any]] = {}
+        for raw in rows if isinstance(rows, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            row["name"] = str(row.get("name") or row.get("call") or "")
+            if not row["name"]:
+                continue
+            identity = json.dumps(
+                {
+                    key: row.get(key)
+                    for key in (
+                        "name", "version", "source", "sha256",
+                        "availability", "manual_only",
+                    )
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            unique.setdefault(identity, row)
+        # Absolute installation paths vary by machine/profile and are mutable
+        # location metadata, not immutable capability identity.
+        return list(unique.values())
+
+    expected_rows = normalized(expected)
+    actual_rows = normalized(inventory.get("skills", []))
     ignored_by_name = {str(row.get("name")): str(row.get("reason")) for row in inventory.get("ignored", []) if isinstance(row, dict) and row.get("name")}
-    missing = [
-        {"name": name, "version": str(expected_by_name[name].get("version", "unknown")), "reason": ignored_by_name.get(name, "not-discovered")}
-        for name in expected_by_name.keys() - actual_by_name.keys()
-    ]
-    added = [{"name": name, "version": actual_by_name[name]["version"], "reason": "new-since-baseline"} for name in actual_by_name.keys() - expected_by_name.keys()]
-    changed = []
-    for name in expected_by_name.keys() & actual_by_name.keys():
-        old, new = expected_by_name[name], actual_by_name[name]
+    missing: list[dict[str, Any]] = []
+    added: list[dict[str, Any]] = []
+    changed: list[dict[str, Any]] = []
+    availability_changed: list[dict[str, Any]] = []
+
+    def row_order(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            _version_key(str(row.get("version") or "unknown")),
+            str(row.get("sha256") or ""),
+            str(row.get("manual_only") or ""),
+            str(row.get("availability") or ""),
+        )
+
+    def immutable_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(row.get("version") or "unknown"),
+            str(row.get("sha256") or ""),
+            row.get("manual_only"),
+        )
+
+    expected_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    actual_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in expected_rows:
+        expected_groups.setdefault((row["name"], str(row.get("source") or "")), []).append(row)
+    for row in actual_rows:
+        actual_groups.setdefault((row["name"], str(row.get("source") or "")), []).append(row)
+
+    paired: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for group_key in expected_groups.keys() | actual_groups.keys():
+        old_group = sorted(expected_groups.get(group_key, []), key=row_order)
+        new_group = sorted(actual_groups.get(group_key, []), key=row_order)
+
+        # Preserve exact version/hash identities first so removing one of
+        # several installed versions cannot shift ordinals and mislabel a
+        # surviving version as changed.
+        for old in list(old_group):
+            match = next(
+                (new for new in new_group if immutable_identity(new) == immutable_identity(old)),
+                None,
+            )
+            if match is not None:
+                old_group.remove(old)
+                new_group.remove(match)
+                paired.append((old, match))
+
+        # Hash/manual drift normally keeps a version stable; match that next.
+        for old in list(old_group):
+            match = next(
+                (
+                    new
+                    for new in new_group
+                    if str(new.get("version") or "unknown")
+                    == str(old.get("version") or "unknown")
+                ),
+                None,
+            )
+            if match is not None:
+                old_group.remove(old)
+                new_group.remove(match)
+                paired.append((old, match))
+
+        # Remaining one-for-one records represent an in-place version change.
+        while old_group and new_group:
+            paired.append((old_group.pop(0), new_group.pop(0)))
+        for old in old_group:
+            missing.append({
+                "name": group_key[0],
+                "version": str(old.get("version", "unknown")),
+                "source": group_key[1],
+                "reason": ignored_by_name.get(group_key[0], "not-discovered"),
+            })
+        for new in new_group:
+            added.append({
+                "name": group_key[0],
+                "version": str(new.get("version", "unknown")),
+                "source": group_key[1],
+                "reason": "new-since-baseline",
+            })
+
+    for old, new in paired:
         hash_changed = bool(old.get("sha256")) and old.get("sha256") != new.get("sha256")
-        availability_changed = bool(old.get("availability")) and old.get("availability") != new.get("availability")
         version_changed = bool(old.get("version")) and old.get("version") != new.get("version")
-        if hash_changed or availability_changed or version_changed:
-            changed.append({"name": name, "version": new["version"], "reason": "hash-version-or-availability-changed"})
+        manual_only_changed = "manual_only" in old and old.get("manual_only") != new.get("manual_only")
+        availability_transition = (
+            bool(old.get("availability"))
+            and old.get("availability") != new.get("availability")
+        )
+        if hash_changed or version_changed or manual_only_changed:
+            changed.append({
+                "name": str(new.get("name") or ""),
+                "version": str(new.get("version", "unknown")),
+                "source": str(new.get("source") or ""),
+                "reason": "hash-version-source-or-manual-changed",
+            })
+        elif availability_transition:
+            # Availability is live host state, not Skill content. Keep a
+            # privacy-bounded transition record so callers can distinguish a
+            # newly enabled/disabled capability from immutable baseline drift.
+            availability_changed.append({
+                "name": str(new.get("name") or ""),
+                "version": str(new.get("version", "unknown")),
+                "source": str(new.get("source") or ""),
+                "from": str(old.get("availability") or ""),
+                "to": str(new.get("availability") or ""),
+            })
     return {
-        "expected": len(expected),
-        "actual": len(inventory.get("skills", [])),
-        "missing": missing,
-        "added": added,
-        "changed": changed,
+        "expected": len(expected_rows),
+        "actual": len(actual_rows),
+        "missing": sorted(missing, key=lambda row: (row["name"], row["source"], row["version"])),
+        "added": sorted(added, key=lambda row: (row["name"], row["source"], row["version"])),
+        "changed": sorted(changed, key=lambda row: (row["name"], row["source"], row["version"])),
+        "availability_changed": sorted(
+            availability_changed,
+            key=lambda row: (row["name"], row["source"], row["version"]),
+        ),
         "explainable": all(row["reason"] != "not-discovered" for row in missing),
     }
 
@@ -261,22 +493,33 @@ def write_baseline(inventory: dict[str, Any], path: Path) -> None:
         ):
             continue
         source_path = Path(str(row.get("path", "")))
+        digest, _ = _skill_file_hash(source_path) if source_path.is_file() else ("", "")
         ignored_upstream.append(
             {
                 "name": str(row["name"]),
                 "version": "ignored-upstream",
                 "source": "legacy-upstream-copy",
-                "sha256": sha256_bytes(source_path.read_bytes()) if source_path.is_file() else "",
+                "path": str(source_path),
+                "sha256": digest,
                 "availability": "ignored-upstream",
                 "manual_only": False,
             }
         )
+    rows = [
+        {key: row.get(key) for key in ("name", "version", "source", "path", "sha256", "availability", "manual_only")}
+        for row in inventory.get("skills", [])
+        if isinstance(row, dict)
+    ] + ignored_upstream
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        marker = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if marker not in seen:
+            seen.add(marker)
+            deduped.append(row)
     payload = {
         "schema_version": 3,
         "created_at": utc_now(),
-        "skills": [
-            {key: row.get(key) for key in ("name", "version", "source", "sha256", "availability", "manual_only")}
-            for row in inventory.get("skills", [])
-        ] + ignored_upstream,
+        "skills": deduped,
     }
     atomic_write_json(path, payload)
