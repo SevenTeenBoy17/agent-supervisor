@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import stat
 import subprocess
 import sys
 
@@ -22,6 +23,7 @@ from supervisor_core.rollout import (
     promote,
     rollback_active_version,
 )
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.storage import StateContext
 
 
@@ -33,11 +35,16 @@ def isolated_attestation_key(tmp_path, monkeypatch):
     )
 
 
-def _write_release_root(path: Path) -> None:
+def _write_release_root(path: Path, version: str = "3.1.0") -> dict[str, str]:
     core = path / "supervisor_core"
     core.mkdir(parents=True)
-    (core / "__init__.py").write_text("", encoding="utf-8")
-    (core / "cli.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("VERSION = 'fixture'\n", encoding="utf-8")
+    (core / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    bundle = build_runtime_bundle(path, version)
+    bundle_path = path / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
+    return release_identity(path, version, "runtime/supervisor-runtime.zip", bundle)
 
 
 def test_launcher_rejects_invalid_contract_and_untrusted_active_path(tmp_path):
@@ -72,11 +79,15 @@ def test_launcher_safely_falls_back_when_active_path_resolve_reports_a_loop(
     tmp_path, monkeypatch, capsys
 ):
     launcher = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
+    valid_release = tmp_path / "valid-release"
+    active = _write_release_root(valid_release, "3.1.0")
     loop_candidate = tmp_path / "looped-release"
+    active["path"] = str(loop_candidate)
     pointer = tmp_path / "active-version.json"
     pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v3",
-        "active": {"version": "loop", "path": str(loop_candidate)},
+        "contract": "ActiveVersionPointer/v4",
+        "active": active,
+        "previous": None,
     }), encoding="utf-8")
     monkeypatch.setenv("AGENT_SUPERVISOR_ACTIVE_POINTER", str(pointer))
     original_resolve = Path.resolve
@@ -95,9 +106,84 @@ def test_launcher_safely_falls_back_when_active_path_resolve_reports_a_loop(
     assert capsys.readouterr().out.strip().startswith("3.")
 
 
+@pytest.mark.parametrize("link_position", ["candidate", "ancestor"])
+def test_launcher_rejects_symlinked_release_directory(tmp_path, link_position):
+    launcher = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
+    releases = tmp_path / "releases"
+    if link_position == "candidate":
+        real_release = releases / "real-release"
+        link_target = real_release
+        linked_component = releases / "linked-release"
+        candidate = linked_component
+    else:
+        link_target = releases / "real-parent"
+        real_release = link_target / "release"
+        linked_component = releases / "linked-parent"
+        candidate = linked_component / "release"
+    active = _write_release_root(real_release, "3.1.0")
+    (real_release / "supervisor_core" / "cli.py").write_text(
+        "def main():\n"
+        "    print('SYMLINKED_RELEASE_EXECUTED')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    try:
+        linked_component.symlink_to(link_target, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(
+                f"directory symlink creation unavailable: {type(exc).__name__}"
+            )
+        junction = subprocess.run(
+            [
+                "cmd.exe", "/d", "/c", "mklink", "/J",
+                str(linked_component), str(link_target),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        attributes = (
+            getattr(os.lstat(linked_component), "st_file_attributes", 0)
+            if linked_component.exists()
+            else 0
+        )
+        if junction.returncode or not reparse_flag or not attributes & reparse_flag:
+            pytest.skip(
+                "directory symlink/reparse creation unavailable: "
+                f"{type(exc).__name__}/junction-exit-{junction.returncode}"
+            )
+
+    active["path"] = str(candidate)
+    pointer = tmp_path / "active-version.json"
+    pointer.write_text(json.dumps({
+        "contract": "ActiveVersionPointer/v4",
+        "active": active,
+        "previous": None,
+    }), encoding="utf-8")
+    env = os.environ.copy()
+    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
+    env["AGENT_SUPERVISOR_RELEASE_ROOT"] = str(releases)
+    completed = subprocess.run(
+        [sys.executable, str(launcher), "--version"],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "SYMLINKED_RELEASE_EXECUTED" not in completed.stdout
+    assert completed.stdout.strip().startswith("3.")
+
+
 def observation(identifier: str, kind: str, **values):
     if kind == "global_gate" and "active_version" not in values:
-        values["active_version"] = {"version": "3.1.0", "path": "C:/agent-supervisor/3.1.0"}
+        values["active_version"] = None
     record = {
         "contract": "RolloutObservation/v3",
         "observation_id": identifier,
@@ -295,17 +381,17 @@ def test_builtin_registered_gate_does_not_require_external_command(tmp_path, mon
         ctx,
         {
             "event_type": "gate_run",
-            "actor": "supervisor-core",
             "record": {
                 "gate_id": "config.intent-coverage",
                 "criterion_id": criterion_id,
-                "collector_responsibility_group": "trusted-runtime",
             },
         },
     )
 
     assert code == 2
     assert evidence["exit_code"] == 2
+    assert evidence["collector"] == "supervisor-core"
+    assert evidence["collector_identity_assurance"] == "core-executed-gate"
     assert execution["command"]["args"] == []
     assert execution["resolved_executable"] is None
 
@@ -377,29 +463,29 @@ def test_finalize_marks_rollout_refreshed_after_project_persistence(
 def test_two_global_gate_failures_atomically_switch_active_pointer(tmp_path, monkeypatch):
     current = tmp_path / "current"
     previous = tmp_path / "previous"
-    _write_release_root(current)
-    _write_release_root(previous)
+    active = _write_release_root(current, "3.1.0")
+    prior = _write_release_root(previous, "3.0.0")
     pointer = tmp_path / "active-version.json"
     pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v3",
-        "active": {"version": "3.1.0", "path": str(current)},
-        "previous": {"version": "3.0.0", "path": str(previous)},
+        "contract": "ActiveVersionPointer/v4",
+        "active": active,
+        "previous": prior,
     }), encoding="utf-8")
     monkeypatch.setenv("AGENT_SUPERVISOR_ACTIVE_POINTER", str(pointer))
     state = initial_rollout({}, "warn")
-    apply_observation(state, observation("failure-1", "global_gate", result="failed"))
+    apply_observation(state, observation("failure-1", "global_gate", result="failed", active_version=active))
     assert state["rollback"]["required"] is False
-    apply_observation(state, observation("failure-2", "global_gate", result="failed"))
+    apply_observation(state, observation("failure-2", "global_gate", result="failed", active_version=active))
     assert state["rollback"]["required"] is True
     expected_active = json.loads(pointer.read_text(encoding="utf-8"))["active"]
     result = rollback_active_version(expected_active=expected_active)
     assert result["performed"] is True
     assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "3.0.0"
     repeated = rollback_active_version(expected_active=expected_active)
-    assert repeated["performed"] is True
-    assert repeated["idempotent"] is True
+    assert repeated["performed"] is False
+    assert repeated["reason"] == "active-version-cas-mismatch"
     assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "3.0.0"
-    unrelated = {"version": "4.0.0", "path": str(tmp_path / "unrelated")}
+    unrelated = dict(active, version="4.0.0")
     mismatch = rollback_active_version(expected_active=unrelated)
     assert mismatch["performed"] is False
     assert mismatch["reason"] == "active-version-cas-mismatch"
@@ -414,12 +500,12 @@ def test_absent_snapshot_cannot_rollback_pointer_that_appears_later(tmp_path, mo
 
     new_release = tmp_path / "new-release"
     old_release = tmp_path / "old-release"
-    (new_release / "supervisor_core").mkdir(parents=True)
-    (old_release / "supervisor_core").mkdir(parents=True)
+    active = _write_release_root(new_release, "4.0.0")
+    previous = _write_release_root(old_release, "3.0.1")
     pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v3",
-        "active": {"version": "4.0.0", "path": str(new_release)},
-        "previous": {"version": "3.0.1", "path": str(old_release)},
+        "contract": "ActiveVersionPointer/v4",
+        "active": active,
+        "previous": previous,
     }), encoding="utf-8")
 
     result = rollback_active_version(expected_active=expected_active)
@@ -427,7 +513,7 @@ def test_absent_snapshot_cannot_rollback_pointer_that_appears_later(tmp_path, mo
     assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "4.0.0"
 
 
-def test_global_gate_failure_streak_is_bound_to_active_identity():
+def test_global_gate_failure_streak_is_bound_to_active_identity(tmp_path):
     state = initial_rollout({}, "warn")
     apply_observation(state, observation("unbound-1", "global_gate", result="failed", active_version=None))
     apply_observation(state, observation("unbound-2", "global_gate", result="failed", active_version=None))
@@ -435,8 +521,8 @@ def test_global_gate_failure_streak_is_bound_to_active_identity():
     assert state["metrics"]["consecutive_global_gate_failures"] == 0
     assert state["rollback"]["required"] is False
 
-    release_a = {"version": "4.0.0", "path": "C:/agent-supervisor/4.0.0"}
-    release_b = {"version": "4.1.0", "path": "C:/agent-supervisor/4.1.0"}
+    release_a = _write_release_root(tmp_path / "release-a", "4.0.0")
+    release_b = _write_release_root(tmp_path / "release-b", "4.1.0")
     apply_observation(state, observation("release-a-1", "global_gate", result="failed", active_version=release_a))
     assert state["metrics"]["consecutive_global_gate_failures"] == 1
     assert state["rollback"]["required"] is False

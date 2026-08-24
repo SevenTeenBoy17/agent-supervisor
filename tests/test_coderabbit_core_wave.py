@@ -90,7 +90,7 @@ def test_safe_hash_bound_authorization_survives_persistence_unchanged(tmp_path: 
 def test_sensitive_hash_bound_authorization_is_rejected_without_persistence(tmp_path: Path) -> None:
     source = "SUPERVISOR-WAIVE criterion-1 token=DO-NOT-PERSIST"
     destination = tmp_path / "unsafe.json"
-    with pytest.raises(ValueError, match="hash-bound field"):
+    with pytest.raises(ValueError, match="sensitive-integrity-bound-record"):
         atomic_write_json(destination, {
             "source_authorization": source,
             "source_authorization_sha256": sha256_text(source),
@@ -111,7 +111,7 @@ def test_sensitive_goal_cannot_be_redacted_after_request_manifest_binding(valid_
     manifest["goal_sha256"] = canonical_sha256(state["goal"])
     manifest["attestation"] = sign_record(manifest)
     ctx = _context(tmp_path)
-    with pytest.raises(ValueError, match="request-manifest-bound field"):
+    with pytest.raises(ValueError, match="sensitive-integrity-bound-record"):
         ctx.save(state)
     assert not ctx.state_file.exists()
 
@@ -120,12 +120,18 @@ def test_partial_self_created_lock_is_removed_and_next_attempt_succeeds(tmp_path
     lock_path = tmp_path / "partial.lock"
     real_open = storage_module.os.open
     real_write = storage_module.os.write
+    real_close = storage_module.os.close
     target_fds: set[int] = set()
     faulted = False
 
     def track_lock_fd(path, *args, **kwargs) -> int:
         fd = real_open(path, *args, **kwargs)
-        if Path(path) == lock_path:
+        candidate = Path(path)
+        if (
+            candidate.parent == lock_path.parent
+            and candidate.name.startswith(f".{lock_path.name}.")
+            and candidate.name.endswith(".owner.tmp")
+        ):
             target_fds.add(fd)
         return fd
 
@@ -137,8 +143,15 @@ def test_partial_self_created_lock_is_removed_and_next_attempt_succeeds(tmp_path
             raise OSError("simulated partial lock write")
         return real_write(fd, payload)
 
+    def track_close(fd: int) -> None:
+        try:
+            real_close(fd)
+        finally:
+            target_fds.discard(fd)
+
     monkeypatch.setattr(storage_module.os, "open", track_lock_fd)
     monkeypatch.setattr(storage_module.os, "write", fail_once)
+    monkeypatch.setattr(storage_module.os, "close", track_close)
     read_fd, write_fd = os.pipe()
     try:
         unrelated = b"unrelated-descriptor-write"
@@ -149,20 +162,28 @@ def test_partial_self_created_lock_is_removed_and_next_attempt_succeeds(tmp_path
     with pytest.raises(OSError, match="simulated partial"):
         with exclusive_lock(lock_path, timeout=0.2):
             pass
+    assert not target_fds
     assert not lock_path.exists()
     with exclusive_lock(lock_path, timeout=0.5):
         assert lock_path.exists()
+    assert not target_fds
 
 
 def test_short_lock_write_is_completed_before_acquisition(tmp_path: Path, monkeypatch) -> None:
     lock_path = tmp_path / "short-write.lock"
     real_open = storage_module.os.open
     real_write = storage_module.os.write
+    real_close = storage_module.os.close
     target_fds: set[int] = set()
 
     def track_lock_fd(path, *args, **kwargs) -> int:
         fd = real_open(path, *args, **kwargs)
-        if Path(path) == lock_path:
+        candidate = Path(path)
+        if (
+            candidate.parent == lock_path.parent
+            and candidate.name.startswith(f".{lock_path.name}.")
+            and candidate.name.endswith(".owner.tmp")
+        ):
             target_fds.add(fd)
         return fd
 
@@ -171,8 +192,15 @@ def test_short_lock_write_is_completed_before_acquisition(tmp_path: Path, monkey
             return real_write(fd, payload[: max(1, len(payload) // 3)])
         return real_write(fd, payload)
 
+    def track_close(fd: int) -> None:
+        try:
+            real_close(fd)
+        finally:
+            target_fds.discard(fd)
+
     monkeypatch.setattr(storage_module.os, "open", track_lock_fd)
     monkeypatch.setattr(storage_module.os, "write", short_write)
+    monkeypatch.setattr(storage_module.os, "close", track_close)
     read_fd, write_fd = os.pipe()
     try:
         unrelated = b"unrelated-descriptor-write"
@@ -183,6 +211,22 @@ def test_short_lock_write_is_completed_before_acquisition(tmp_path: Path, monkey
     with exclusive_lock(lock_path, timeout=0.5):
         owner = json.loads(lock_path.read_text(encoding="utf-8"))
         assert owner["owner_nonce"]
+    assert not target_fds
+
+    # A later unrelated descriptor may reuse the same integer. Closed owner
+    # descriptors must not remain marked as short-write targets.
+    unrelated_path = tmp_path / "fd-reuse-counterexample.bin"
+    unrelated_fd = real_open(
+        unrelated_path,
+        os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        unrelated = b"full-unrelated-write"
+        assert storage_module.os.write(unrelated_fd, unrelated) == len(unrelated)
+    finally:
+        storage_module.os.close(unrelated_fd)
+    assert unrelated_path.read_bytes() == b"full-unrelated-write"
 
 
 def test_self_created_lock_cleanup_preserves_replacement_owner(tmp_path: Path) -> None:
@@ -430,14 +474,14 @@ def test_json_load_returns_default_for_read_oserror(tmp_path: Path) -> None:
 
 
 def test_evidence_validity_is_scoped_to_each_record_not_id_prefix(valid_bundle) -> None:
-    state, _ = copy.deepcopy(valid_bundle)
+    state, events = copy.deepcopy(valid_bundle)
     bad = copy.deepcopy(state["evidence"][0])
     bad["evidence_id"] = "evidence-10"
     bad["exit_code"] = 7
     state["evidence"] = [bad, copy.deepcopy(state["evidence"][0])]
     errors: list[str] = []
 
-    _, _, satisfied = _validate_evidence(state, {"criterion-1"}, [], errors)
+    _, _, satisfied = _validate_evidence(state, {"criterion-1"}, events, errors)
 
     assert "evidence evidence-10 command failed" in errors
     assert satisfied["criterion-1"] == {"lint"}
@@ -596,3 +640,56 @@ def test_selftest_invocation_flag_is_independent_of_test_success(monkeypatch) ->
     assert code == 2
     assert emitted[0]["all_child_suites_invoked"] is True
     assert emitted[0]["collection_exit_code"] == 0
+
+
+def test_installed_selftest_uses_bound_tests_and_never_writes_release(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_root = tmp_path / "data" / ".agent-supervisor"
+    data_root.mkdir(parents=True)
+    trusted = tmp_path / "trusted" / "python.exe"
+    trusted.parent.mkdir()
+    trusted.write_bytes(b"trusted-python\n")
+    release = tmp_path / "releases" / "v3.1.1"
+    release.mkdir(parents=True)
+    sentinel = release / "immutable.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    resources = {
+        "supervisor_core/__init__.py": b"BOUND = True\n",
+        "tests/test_bound_canary.py": b"def test_bound_canary():\n    assert True\n",
+    }
+    registry = {
+        "registry_path": str(data_root / "trusted-executables.json"),
+        "registry_sha256": "a" * 64,
+        "entries": {
+            "python": {
+                "kind": "local",
+                "path": str(trusted.resolve()),
+                "sha256": "b" * 64,
+            }
+        },
+    }
+    observed: dict[str, object] = {}
+
+    def fake_execute(root: Path, base_temp: Path, *, environment=None) -> int:
+        observed["root"] = root
+        observed["base_temp"] = base_temp
+        assert root != Path(cli_module.__file__).resolve().parents[1]
+        assert root.is_relative_to(data_root / ".selftest-tmp")
+        assert (root / "tests" / "test_bound_canary.py").read_bytes() == resources[
+            "tests/test_bound_canary.py"
+        ]
+        assert base_temp.is_relative_to(data_root / ".selftest-tmp")
+        assert environment["PYTHONPATH"] == str(root)
+        assert environment["TEMP"] == str(base_temp)
+        assert not any(path.is_relative_to(release) for path in (root, base_temp))
+        return 0
+
+    monkeypatch.setattr(cli_module, "load_trusted_executable_registry", lambda: registry)
+    monkeypatch.setattr(cli_module, "bound_resource_map", lambda: resources)
+    monkeypatch.setattr(cli_module, "_execute_selftest", fake_execute)
+
+    assert cli_module.command_selftest(Namespace()) == 0
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not Path(observed["root"]).exists()
+    assert not Path(observed["base_temp"]).exists()

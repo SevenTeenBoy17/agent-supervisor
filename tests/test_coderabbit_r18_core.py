@@ -163,7 +163,7 @@ def test_blank_workspace_degrades_without_resolving_process_cwd(
         resolve_handoff_output_path("", "session", "handoff.json")
 
 
-def test_corrupt_changes_collection_fails_closed_in_goal_finalize_builtin() -> None:
+def test_corrupt_changes_collection_is_treated_as_no_file_change_by_goal_finalize_builtin() -> None:
     exit_code, artifact = _evaluate_builtin_gate(
         {"changes": None, "round": "round-1"},
         [],

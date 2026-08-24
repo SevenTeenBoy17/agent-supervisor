@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -13,7 +12,12 @@ import supervisor_core.lifecycle as lifecycle_module
 import supervisor_core.rollout as rollout_module
 from supervisor_core.attestation import sign_record, verify_record
 from supervisor_core.discovery import baseline_report, write_baseline
+from supervisor_core.executable_trust import (
+    load_trusted_executable_registry,
+    registry_public_record,
+)
 from supervisor_core.lifecycle import read_project_config, read_quality_profile, start_round
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.storage import StateContext
 
 
@@ -32,6 +36,8 @@ def _context(tmp_path: Path, round_id: str = "round-1") -> StateContext:
 
 def _gate_context(tmp_path: Path) -> StateContext:
     ctx = _context(tmp_path)
+    registry = load_trusted_executable_registry()
+    trusted_python = registry["entries"]["python"]["path"]
     start_round(
         ctx,
         message="run one registered gate",
@@ -41,21 +47,24 @@ def _gate_context(tmp_path: Path) -> StateContext:
             "common_gates": [
                 {
                     "id": "gate.atomic",
-                    "command": [sys.executable, "-c", "raise SystemExit(0)"],
+                    "command": [trusted_python, "-c", "raise SystemExit(0)"],
                 }
             ]
         },
+    )
+    ctx.update(
+        lambda current: current.update({
+            "trusted_executable_registry": registry_public_record(registry)
+        })
     )
     return ctx
 
 
 def _gate_payload() -> dict[str, object]:
     return {
-        "actor": "quality-runner",
         "record": {
             "gate_id": "gate.atomic",
             "criterion_id": "criterion-1",
-            "collector_responsibility_group": "quality",
         },
     }
 
@@ -66,11 +75,17 @@ def test_gate_evidence_and_execution_use_one_state_event_transaction(
 ) -> None:
     ctx = _gate_context(tmp_path)
     original_transact = StateContext.transact
+    original_append_event = StateContext.append_event
     transaction_calls: list[str] = []
+    append_calls: list[str] = []
 
     def tracked_transact(self, mutator, event):
         transaction_calls.append(str(event.get("event_type")))
         return original_transact(self, mutator, event)
+
+    def tracked_append_event(self, event):
+        append_calls.append(str(event.get("event_type")))
+        return original_append_event(self, event)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("gate persistence must not split state and event writes")
@@ -78,12 +93,17 @@ def test_gate_evidence_and_execution_use_one_state_event_transaction(
     monkeypatch.setattr(cli_module, "_verify_current_source_snapshot", lambda *_args: "source-hash")
     monkeypatch.setattr(StateContext, "transact", tracked_transact)
     monkeypatch.setattr(StateContext, "update", forbidden)
-    monkeypatch.setattr(StateContext, "append_event", forbidden)
+    monkeypatch.setattr(StateContext, "append_event", tracked_append_event)
 
     evidence, execution, code = cli_module._run_registered_gate(ctx, _gate_payload())
 
     assert code == 0
+    assert append_calls == ["invocation_attempt", "gate_grant", "invocation_result"]
     assert transaction_calls == ["gate_execution"]
+    assert evidence["collector"] == "supervisor-core"
+    assert evidence["collector_responsibility_group"] == "trusted-core-gate-execution"
+    assert evidence["collector_identity_assurance"] == "core-executed-gate"
+    assert evidence["collector_completion_eligible"] is True
     assert any(row.get("evidence_id") == evidence["evidence_id"] for row in ctx.load()["evidence"])
     assert execution["execution_id"] in {
         row.get("execution_id") for row in ctx.events() if row.get("event_type") == "gate_execution"
@@ -96,7 +116,7 @@ def test_gate_event_failure_cannot_commit_unaudited_evidence(
 ) -> None:
     ctx = _gate_context(tmp_path)
     before_state = ctx.state_file.read_bytes()
-    before_events = ctx.events_file.read_bytes()
+    before_events = ctx.events()
     original_append = StateContext._append_event_locked
 
     def fail_gate_event(self, event):
@@ -111,7 +131,17 @@ def test_gate_event_failure_cannot_commit_unaudited_evidence(
         cli_module._run_registered_gate(ctx, _gate_payload())
 
     assert ctx.state_file.read_bytes() == before_state
-    assert ctx.events_file.read_bytes() == before_events
+    after_events = ctx.events()
+    assert after_events[:len(before_events)] == before_events
+    core_events = after_events[len(before_events):]
+    assert [event["event_type"] for event in core_events] == [
+        "invocation_attempt",
+        "gate_grant",
+        "invocation_result",
+    ]
+    assert all(verify_record(event) for event in core_events)
+    assert core_events[-1]["result"] == "failed"
+    assert not any(event.get("event_type") == "gate_execution" for event in after_events)
 
 
 def test_start_round_does_not_advance_rollout_before_predecessor_transition(
@@ -204,12 +234,21 @@ def test_discovery_baseline_identity_is_relocatable_but_still_content_bound(
     assert len(source_drift["added"]) == 1
 
 
-def _release_root(path: Path) -> Path:
+def _release_root(path: Path, version: str = "4.0.0") -> Path:
     core = path / "supervisor_core"
     core.mkdir(parents=True)
-    (core / "__init__.py").write_text("", encoding="utf-8")
-    (core / "cli.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("VERSION = 'fixture'\n", encoding="utf-8")
+    (core / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    bundle = build_runtime_bundle(path, version)
+    bundle_path = path / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
     return path
+
+
+def _release_identity(path: Path, version: str = "4.0.0") -> dict[str, str]:
+    bundle = (path / "runtime" / "supervisor-runtime.zip").read_bytes()
+    return release_identity(path, version, "runtime/supervisor-runtime.zip", bundle)
 
 
 def test_resolve_active_root_reads_under_lock_and_rejects_non_release_directory(
@@ -218,9 +257,14 @@ def test_resolve_active_root_reads_under_lock_and_rejects_non_release_directory(
 ) -> None:
     fallback = _release_root(tmp_path / "fallback")
     active = _release_root(tmp_path / "active")
+    active_identity = _release_identity(active)
     pointer = tmp_path / "active-version.json"
     pointer.write_text(
-        json.dumps({"active": {"version": "4.0.0", "path": str(active)}}),
+        json.dumps({
+            "contract": "ActiveVersionPointer/v4",
+            "active": active_identity,
+            "previous": None,
+        }),
         encoding="utf-8",
     )
     monkeypatch.setenv("AGENT_SUPERVISOR_ACTIVE_POINTER", str(pointer))
@@ -252,8 +296,13 @@ def test_resolve_active_root_reads_under_lock_and_rejects_non_release_directory(
 
     arbitrary = tmp_path / "arbitrary"
     arbitrary.mkdir()
+    invalid_identity = dict(active_identity, version="4.0.1", path=str(arbitrary))
     pointer.write_text(
-        json.dumps({"active": {"version": "4.0.1", "path": str(arbitrary)}}),
+        json.dumps({
+            "contract": "ActiveVersionPointer/v4",
+            "active": invalid_identity,
+            "previous": None,
+        }),
         encoding="utf-8",
     )
     assert rollout_module.resolve_active_root(fallback) == fallback.resolve()

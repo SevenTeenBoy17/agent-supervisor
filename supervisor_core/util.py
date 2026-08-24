@@ -10,22 +10,86 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+class SensitivePersistenceError(ValueError):
+    """Stable fail-closed error for integrity-bound sensitive mutations."""
+
+    error_code = "sensitive-integrity-bound-record"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(self.error_code)
+
+_SECRET_OPTION_NAME = (
+    r"(?:(?:[a-z0-9]+[-_])*(?:api[-_]?key|x[-_]?api[-_]?key|"
+    r"access[-_]?(?:key|key[-_]?id|token)|secret[-_]?access[-_]?key|account[-_]?key|"
+    r"subscription[-_]?key|client[-_]?(?:id|secret)|database[-_]?url|db[-_]?url|"
+    r"connection[-_]?string|dsn|private[-_]?key)|"
+    r"auth(?:orization)?|proxy[-_]?authorization|bearer|"
+    r"password|passwd|secret|token|cookie|set[-_]?cookie)"
+)
 _SECRET_FLAG = re.compile(
-    r"(?i)^(?:--?(?:api[-_]?key|access[-_]?token|auth(?:orization)?|bearer|client[-_]?secret|password|passwd|secret|token)|/(?:password|token))$"
+    rf"(?i)^(?:--?{_SECRET_OPTION_NAME}|/(?:password|token|secret))$"
 )
 
 
 def _sensitive_key(key: str) -> bool:
     normalized = key.strip().casefold().replace("-", "_")
-    if normalized in {"authorization", "authorization_header", "cookie", "set_cookie", "credential", "credentials"}:
+    # These are integrity/waiver metadata, not HTTP credential fields.  Their
+    # string values still pass through value-level credential detection.
+    if normalized in {
+        "waiver_authorizations",
+        "t3_action_authorizations",
+        "source_authorization",
+        "source_authorization_sha256",
+        "granting_request_sha256",
+    }:
+        return False
+    if normalized in {
+        "authorization",
+        "authorization_header",
+        "proxy_authorization",
+        "http_authorization",
+        "auth_header",
+        "cookie",
+        "cookie_header",
+        "request_cookie",
+        "response_cookie",
+        "set_cookie",
+        "credential",
+        "credentials",
+        "database_url",
+        "db_url",
+        "connection_string",
+        "connection_uri",
+        "dsn",
+        "client_id",
+        "client_secret",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "secret_access_key",
+        "account_key",
+        "subscription_key",
+        "private_key",
+        "private_key_data",
+    }:
         return True
     return bool(re.search(
-        r"(?:^|_)(?:secret|token|password|passwd|api_key|access_key|private_key|client_secret|credential|cookie)s?$",
+        r"(?:^|_)(?:secret|token|password|passwd|api_key|access_key|access_key_id|"
+        r"account_key|subscription_key|private_key|client_id|client_secret|credential|cookie|"
+        r"database_url|db_url|connection_string|connection_uri|dsn)s?$",
         normalized,
     ))
 
 
-_SECRET_FIELD_NAME = r"(?:api[_-]?key|token|password|passwd|secret|authorization)"
+_SECRET_FIELD_NAME = (
+    r"(?:(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|x[_-]?api[_-]?key|"
+    r"access[_-]?(?:key|key[_-]?id|token)|secret[_-]?access[_-]?key|account[_-]?key|"
+    r"subscription[_-]?key|client[_-]?(?:id|secret)|database[_-]?url|db[_-]?url|"
+    r"connection[_-]?(?:string|uri)|dsn|private[_-]?key)|"
+    r"token|password|passwd|secret|authorization|proxy[_-]?authorization|"
+    r"cookie|set[_-]?cookie)"
+)
 _QUOTED_TEXT_SECRET_PATTERNS = (
     (
         re.compile(
@@ -39,16 +103,61 @@ _QUOTED_TEXT_SECRET_PATTERNS = (
         ),
         "'",
     ),
+    (
+        re.compile(
+            rf'''(?i)(?P<prefix>(?<!\S)(?:--?{_SECRET_OPTION_NAME}|/(?:password|token|secret))\s*(?:=\s*|\s+))"(?:\\.|[^"\\])*"'''
+        ),
+        '"',
+    ),
+    (
+        re.compile(
+            rf"""(?i)(?P<prefix>(?<!\S)(?:--?{_SECRET_OPTION_NAME}|/(?:password|token|secret))\s*(?:=\s*|\s+))'(?:\\.|[^'\\])*'"""
+        ),
+        "'",
+    ),
 )
 _TEXT_SECRET_PATTERNS = (
     re.compile(
-        r'''(?i)(authorization\s*:\s*)(?!\[REDACTED\])(?:(?:bearer|basic)\s+)?[^\s,;}\]"']+'''
+        r'''(?i)((?:authorization|proxy-authorization|x-api-key|x-auth-token)\s*:\s*)(?!\s*\[REDACTED\])(?:(?:bearer|basic)\s+)?[^\s,;}\]"']+'''
+    ),
+    re.compile(
+        r'''(?i)((?:cookie|set-cookie)\s*:\s*)(?!\s*\[REDACTED\])[^\r\n,}\]"']+'''
     ),
     re.compile(r"(?i)(bearer\s+)[a-z0-9._~+\-/=]+"),
     re.compile(
-        rf'''(?i)((?<![A-Za-z0-9_])(?:"{_SECRET_FIELD_NAME}"|'{_SECRET_FIELD_NAME}'|{_SECRET_FIELD_NAME})\s*[=:]\s*)(?!\[REDACTED\])[^\s,;}}\]"']+'''
+        rf'''(?i)((?<![A-Za-z0-9_])(?:"{_SECRET_FIELD_NAME}"|'{_SECRET_FIELD_NAME}'|{_SECRET_FIELD_NAME})\s*[=:]\s*)(?!\s*\[REDACTED\])[^\s,;}}\]"']+'''
     ),
-    re.compile(r"(?<![A-Za-z0-9_])(?:sk-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})(?![A-Za-z0-9_])"),
+    re.compile(
+        rf'''(?i)((?<!\S)(?:--?{_SECRET_OPTION_NAME}|/(?:password|token|secret))\s*(?:=\s*|\s+))(?!\s*\[REDACTED\])[^\s,;}}\]"']+'''
+    ),
+)
+
+_URI_USERINFO = re.compile(
+    r"(?i)\b(?P<scheme>https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqps?)://(?P<userinfo>[^/@\s]+)@"
+)
+_JWT = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
+_COMMON_CREDENTIAL_VALUES = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"sk-[A-Za-z0-9_-]{8,}|"
+    r"github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"AIza[0-9A-Za-z_-]{35}|"
+    r"(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{12,}|whsec_[0-9A-Za-z]{12,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{10,}|ya29\.[0-9A-Za-z_-]{10,}|"
+    r"glpat-[0-9A-Za-z_-]{12,}|npm_[0-9A-Za-z]{12,}|"
+    r"(?:sq0atp|sq0csp)-[0-9A-Za-z_-]{12,}|shp(?:at|ca|pa|ss)_[0-9A-Za-z]{12,}|"
+    r"GOCSPX-[0-9A-Za-z_-]{12,}|SG\.[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}|"
+    r"hf_[0-9A-Za-z_-]{12,}|lin_api_[0-9A-Za-z_-]{12,}|sntrys_[0-9A-Za-z_-]{12,}"
+    r")(?![A-Za-z0-9_])"
+)
+_SIGNED_URL_QUERY_VALUE = re.compile(
+    r"(?i)(?P<prefix>(?:[?&]|&amp;)(?:"
+    r"sig|(?:x-[a-z0-9-]+-)?signature|"
+    r"(?:x-[a-z0-9-]+-)?credential|"
+    r"sas(?:[-_]?token)?|sharedaccesssignature"
+    r")=)(?!\[REDACTED\])[^&#\s\"'<>]+"
 )
 
 
@@ -141,6 +250,16 @@ def redact(value: Any, key: str = "") -> Any:
                 clean = pattern.sub(lambda match: match.group(1) + "[REDACTED]", clean)
             else:
                 clean = pattern.sub("[REDACTED]", clean)
+        clean = _SIGNED_URL_QUERY_VALUE.sub(
+            lambda match: f"{match.group('prefix')}[REDACTED]",
+            clean,
+        )
+        clean = _URI_USERINFO.sub(
+            lambda match: f"{match.group('scheme')}://[REDACTED]@",
+            clean,
+        )
+        clean = _JWT.sub("[REDACTED]", clean)
+        clean = _COMMON_CREDENTIAL_VALUES.sub("[REDACTED]", clean)
         return clean
     return value
 
@@ -159,15 +278,15 @@ def redact_for_persistence(value: Any) -> Any:
     def reject_changed_bindings(original: Any, sanitized: Any) -> None:
         if isinstance(original, dict) and isinstance(sanitized, dict):
             if "attestation" in original and original != sanitized:
-                raise ValueError("redaction would mutate an attested record")
+                raise SensitivePersistenceError("attested-record-mutation")
             for key, original_hash in original.items():
                 if not isinstance(key, str) or not key.endswith("_sha256"):
                     continue
                 bound_key = key[:-7]
                 if bound_key in original and sanitized.get(bound_key) != original.get(bound_key):
-                    raise ValueError(f"redaction would mutate hash-bound field: {bound_key}")
+                    raise SensitivePersistenceError("hash-bound-field-mutation")
                 if sanitized.get(key) != original_hash:
-                    raise ValueError(f"redaction would mutate integrity hash: {key}")
+                    raise SensitivePersistenceError("integrity-hash-mutation")
             for key, child in original.items():
                 reject_changed_bindings(child, sanitized.get(str(key)))
         elif isinstance(original, (list, tuple)) and isinstance(sanitized, list):
@@ -181,7 +300,7 @@ def redact_for_persistence(value: Any) -> Any:
         # manifest after it has been constructed.
         for field in ("goal", "intents", "intent_manifest", "request_manifest"):
             if field in value and clean.get(field) != value.get(field):
-                raise ValueError(f"redaction would mutate request-manifest-bound field: {field}")
+                raise SensitivePersistenceError("request-manifest-bound-mutation")
     return clean
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from supervisor_core.cli import _evaluate_builtin_gate
-from supervisor_core.contracts import build_goal
-from supervisor_core.util import sha256_text, utc_now
+from supervisor_core.contracts import build_goal, invocation_event
+from supervisor_core.util import canonical_sha256, sha256_text, utc_now
 from supervisor_core.validation import _registered_gate_commands, _registered_gate_definitions
 
 
@@ -20,8 +22,14 @@ def _research_state() -> tuple[dict, list[dict]]:
         "domain": "research",
     }
     state = {
+        "runtime": "codex",
+        "project": "research-project",
+        "workspace": str(Path(".").resolve()),
+        "session": "research-session",
         "round": "round-research",
         "started_at": now,
+        "goal": {"goal_id": "goal-research", "version": 1},
+        "request_manifest": {},
         "intents": [intent],
         "intent_manifest": [{
             "intent_id": intent["intent_id"],
@@ -38,10 +46,27 @@ def _research_state() -> tuple[dict, list[dict]]:
         }],
         "changes": {"files": []},
     }
-    events = [
-        {"event_type": "invocation_attempt", "invocation_id": "inv-1", "capability": "researcher", "actor": "worker"},
-        {"event_type": "invocation_result", "invocation_id": "inv-1", "capability": "researcher", "actor": "worker", "result": "success"},
-    ]
+    binding = {
+        "runtime": state["runtime"],
+        "project": state["project"],
+        "workspace": state["workspace"],
+        "session": state["session"],
+        "round": state["round"],
+        "goal_id": state["goal"]["goal_id"],
+        "goal_version": state["goal"]["version"],
+        "request_manifest_sha256": canonical_sha256(state["request_manifest"]),
+        "phase": 1,
+    }
+    events = [invocation_event(
+        invocation_id="inv-1",
+        capability="researcher",
+        stage=stage,
+        result="success" if stage == "result" else None,
+        actor="worker",
+        responsibility_group="research",
+        identity_assurance="codex-explicit-audit",
+        details=binding,
+    ) for stage in ("attempt", "result")]
     return state, events
 
 

@@ -41,27 +41,278 @@
     },
     "InvocationEvent": {
       "type": "object",
-      "required": ["invocation_id", "capability", "stage", "actor", "identity_assurance", "timestamp"],
+      "required": ["invocation_id", "capability", "stage", "actor", "responsibility_group", "identity_assurance", "timestamp"],
       "properties": {
         "stage": {"enum": ["attempt", "result"]},
         "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", null]},
-        "identity_assurance": {"enum": ["host-hook-observed", "declared-runtime"]}
+        "responsibility_group": {"type": ["string", "null"], "minLength": 1},
+        "identity_assurance": {"enum": ["host-hook-observed", "codex-explicit-audit", "declared-runtime", "core-executed-gate", "core-trusted-finalize"]}
       }
     },
     "EvidenceRecord": {
       "type": "object",
-      "required": ["evidence_id", "execution_id", "criterion_id", "goal_id", "goal_version", "command", "resolved_executable", "resolved_executable_sha256", "cwd", "collected_at", "exit_code", "output_summary", "artifact_hash", "output_sha256", "base", "head", "diff_hash", "collector", "collector_responsibility_group", "gate_id", "relevant"],
+      "required": ["evidence_id", "execution_id", "criterion_id", "goal_id", "goal_version", "command", "resolved_executable", "resolved_executable_sha256", "cwd", "collected_at", "exit_code", "output_summary", "artifact_hash", "output_sha256", "base", "head", "git_object_format", "git_binding_status", "git_binding_source", "git_repository_root", "review_artifact_sha256", "git_diff_sha256", "workspace_base_sha256", "workspace_head_sha256", "diff_hash", "collector", "collector_responsibility_group", "collector_invocation_id", "collector_identity_assurance", "gate_grant_id", "gate_id", "relevant"],
       "properties": {
         "resolved_executable": {"type": ["string", "null"]},
-        "resolved_executable_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
-      }
+        "resolved_executable_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "base": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "head": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "git_object_format": {"enum": ["sha1", "sha256", null]},
+        "git_binding_status": {"enum": ["verified", "unavailable", "degraded"]},
+        "git_binding_source": {"enum": ["workspace", "review-artifact", null]},
+        "git_repository_root": {"type": ["string", "null"]},
+        "review_artifact_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "git_diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "workspace_base_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_head_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "collector_invocation_id": {"type": "string", "minLength": 1},
+        "collector_identity_assurance": {"type": "string", "minLength": 1},
+        "gate_grant_id": {"type": "string", "minLength": 1},
+        "review_binding_input_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "review_output_artifact": {
+          "oneOf": [
+            {"$ref": "#/$defs/ReviewOutputArtifact"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"git_binding_status": {"const": "verified"}}},
+          "then": {"properties": {"base": {"type": "string"}, "head": {"type": "string"}, "git_binding_source": {"enum": ["workspace", "review-artifact"]}}},
+          "else": {"properties": {"base": {"type": "null"}, "head": {"type": "null"}, "git_binding_source": {"type": "null"}}}
+        },
+        {
+          "if": {
+            "required": ["gate_id"],
+            "properties": {
+              "gate_id": {
+                "anyOf": [
+                  {"const": "review.coderabbit"},
+                  {"const": "review.coderabbit.test-integrity"},
+                  {"pattern": "^review\\.code-review-graph\\."}
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": ["review_binding_input_sha256", "review_output_artifact"],
+            "properties": {
+              "review_binding_input_sha256": {"type": "string"},
+              "review_output_artifact": {"$ref": "#/$defs/ReviewOutputArtifact"}
+            }
+          },
+          "else": {
+            "properties": {
+              "review_binding_input_sha256": {"type": "null"},
+              "review_output_artifact": {"type": "null"}
+            }
+          }
+        }
+      ]
     },
     "ReviewRecord": {
       "type": "object",
-      "required": ["review_id", "goal_id", "goal_version", "reviewer", "responsibility_group", "implementer", "base", "head", "diff_hash", "rerun_evidence_ids", "verdict", "implementer_invocation_id", "reviewer_invocation_id", "actor_identity_assurance"],
+      "required": ["review_id", "goal_id", "goal_version", "reviewer", "reviewer_responsibility_group", "implementer", "implementer_responsibility_group", "gate_collector", "gate_collector_responsibility_group", "gate_runner_invocation_id", "base", "head", "git_object_format", "git_binding_status", "git_binding_source", "git_repository_root", "review_artifact_sha256", "git_diff_sha256", "workspace_base_sha256", "workspace_head_sha256", "diff_hash", "rerun_evidence_ids", "evidence_verification", "verdict", "implementer_invocation_id", "reviewer_invocation_id", "actor_identity_assurance", "issued_by", "issued_at", "attestation"],
       "properties": {
         "verdict": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"]},
-        "actor_identity_assurance": {"const": "host-hook-observed"}
+        "actor_identity_assurance": {"enum": ["host-hook-observed", "codex-explicit-audit", "core-attested-external-review"]},
+        "issued_by": {"enum": ["supervisor-core-review-finalize", "supervisor-core-automated-external-review"]},
+        "review_mode": {"enum": ["automated-external"]},
+        "review_category": {"enum": ["independent", "test-integrity"]},
+        "trust_domains": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["producer", "reviewer", "gate_execution"],
+          "properties": {
+            "producer": {"const": "core-observed-codex-local-workspace"},
+            "reviewer": {"const": "authenticated-external-coderabbit"},
+            "gate_execution": {"const": "core-executed-registered-gate"}
+          }
+        },
+        "external_review_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "findings": {"type": "array", "items": {"$ref": "#/$defs/CodeRabbitReviewIssue"}},
+        "unresolved_p0_p1": {"const": 0},
+        "base": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "head": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "git_object_format": {"enum": ["sha1", "sha256", null]},
+        "git_binding_status": {"enum": ["verified", "unavailable", "degraded"]},
+        "git_binding_source": {"enum": ["workspace", "review-artifact", null]},
+        "git_repository_root": {"type": ["string", "null"]},
+        "review_artifact_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "git_diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "workspace_base_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_head_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "rerun_evidence_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "evidence_verification": {
+          "type": "object",
+          "required": ["status", "reviewer", "evidence_ids"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {"const": "VERIFIED"},
+            "reviewer": {"type": "string", "minLength": 1},
+            "evidence_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+          }
+        },
+        "attestation": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"git_binding_status": {"const": "verified"}}},
+          "then": {"properties": {"base": {"type": "string"}, "head": {"type": "string"}, "git_binding_source": {"enum": ["workspace", "review-artifact"]}}},
+          "else": {"properties": {"base": {"type": "null"}, "head": {"type": "null"}, "git_binding_source": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"issued_by": {"const": "supervisor-core-automated-external-review"}}, "required": ["issued_by"]},
+          "then": {
+            "required": ["review_mode", "review_category", "trust_domains", "external_review_artifact_sha256", "findings", "unresolved_p0_p1"],
+            "properties": {
+              "review_mode": {"const": "automated-external"},
+              "actor_identity_assurance": {"const": "core-attested-external-review"},
+              "verdict": {"const": "APPROVE"}
+            }
+          }
+        }
+      ]
+    },
+    "ReviewArtifactBindingInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "workspace_base_sha256", "workspace_head_sha256", "diff_hash", "workspace_delta_manifest"],
+      "properties": {
+        "contract": {"const": "ReviewArtifactBindingInput/v1"},
+        "workspace_base_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_head_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_delta_manifest": {"type": "object"}
+      }
+    },
+    "CodeRabbitReviewIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "severity", "path", "line", "title", "message"],
+      "properties": {
+        "kind": {"const": "finding"},
+        "severity": {"enum": ["p0", "critical", "error", "p1", "major", "high", "p2", "p3", "minor", "medium", "low", "info", "warning", "suggestion", "nitpick"]},
+        "path": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?!\\s)(?!.*\\s$)(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*:)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))[^\\u0000-\\u001F]+$"
+            }
+          ]
+        },
+        "line": {"type": ["integer", "null"], "minimum": 1},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "message": {"type": "string", "maxLength": 500}
+      }
+    },
+    "CodeRabbitReviewSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "authenticated", "status", "exit_code", "structured_events", "terminal_outcome", "finding_count", "complete_reported_findings", "blocking_findings", "severity_counts", "protocol_blockers", "context_bound", "issues", "stdout_sha256", "stderr_sha256"],
+      "properties": {
+        "engine": {"const": "coderabbit"},
+        "authenticated": {"const": true},
+        "status": {"const": "pass"},
+        "exit_code": {"const": 0},
+        "structured_events": {"type": "integer", "minimum": 1},
+        "terminal_outcome": {"const": "success"},
+        "finding_count": {"type": "integer", "minimum": 0},
+        "complete_reported_findings": {"type": "integer", "minimum": 0},
+        "blocking_findings": {"const": 0},
+        "severity_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical", "major", "minor"],
+          "properties": {
+            "critical": {"type": "integer", "minimum": 0},
+            "major": {"type": "integer", "minimum": 0},
+            "minor": {"type": "integer", "minimum": 0}
+          }
+        },
+        "protocol_blockers": {"type": "array", "maxItems": 0},
+        "context_bound": {"const": true},
+        "issues": {"type": "array", "items": {"$ref": "#/$defs/CodeRabbitReviewIssue"}},
+        "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "CodeReviewGraphReviewSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "check", "status", "exit_code", "output_sha256"],
+      "properties": {
+        "engine": {"const": "code-review-graph"},
+        "check": {"enum": ["build", "impact"]},
+        "status": {"const": "pass"},
+        "exit_code": {"const": 0},
+        "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "ReviewSummary": {
+      "oneOf": [
+        {"$ref": "#/$defs/CodeRabbitReviewSummary"},
+        {"$ref": "#/$defs/CodeReviewGraphReviewSummary"}
+      ]
+    },
+    "ReviewOutputArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "review_category", "review_artifact", "review_summary", "base", "head", "git_object_format", "git_diff_sha256", "workspace_base_sha256", "workspace_head_sha256", "diff_hash"],
+      "properties": {
+        "contract": {"const": "ReviewOutputArtifact/v1"},
+        "review_category": {"enum": ["independent", "test-integrity"]},
+        "review_artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "bundle_path", "bundle_sha256", "manifest_path", "manifest_sha256"],
+          "properties": {
+            "kind": {"const": "git-bundle-v1"},
+            "bundle_path": {"type": "string", "minLength": 1},
+            "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "manifest_path": {"type": "string", "minLength": 1},
+            "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "review_summary": {"$ref": "#/$defs/ReviewSummary"},
+        "base": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "head": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "git_object_format": {"enum": ["sha1", "sha256"]},
+        "git_diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_base_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_head_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "ReviewArtifactManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "git_binding_source", "review_mode", "bundle_sha256", "git_object_format", "base", "head", "diff_hash", "git_diff_sha256", "workspace_base_sha256", "workspace_head_sha256", "files", "workspace_delta_manifest", "source_review_manifest", "source_review_manifest_sha256"],
+      "properties": {
+        "contract": {"const": "ReviewArtifactManifest/v1"},
+        "git_binding_source": {"const": "review-artifact"},
+        "review_mode": {"const": "full-snapshot"},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "git_object_format": {"enum": ["sha1", "sha256"]},
+        "base": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "head": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "diff_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "git_diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_base_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "workspace_head_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "files": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "workspace_delta_manifest": {"type": "object"},
+        "source_review_manifest": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "source_review_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "AttestationAuthority": {

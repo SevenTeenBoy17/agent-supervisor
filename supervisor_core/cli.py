@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 from datetime import timedelta
 import json
@@ -11,14 +12,29 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .constants import EXIT_COMPLETE, EXIT_DEGRADED, EXIT_INCOMPLETE, EXIT_INVALID
-from .attestation import sign_record
-from .contracts import invocation_event
-from .discovery import baseline_report, parse_roots, scan_skills, write_baseline
+from .attestation import sign_record, verify_record
+from .contracts import invocation_event, normalize_intents
+from .discovery import (
+    baseline_report,
+    parse_roots,
+    scan_skills,
+    verify_project_agent_record,
+    write_baseline,
+)
+from .executable_trust import (
+    ExecutableTrustError,
+    load_trusted_executable_registry,
+    registry_public_record,
+    resolve_trusted_executable,
+    trusted_path,
+    verify_registry_record,
+)
 from .finalize import finalize_round
 from .lifecycle import (
     _reject_reparse_path,
@@ -28,6 +44,14 @@ from .lifecycle import (
     start_round,
 )
 from .routing import route_intents, split_intents
+from .runtime_bundle import (
+    RuntimeBundleError,
+    bound_release_identity,
+    bound_resource_bytes,
+    bound_resource_map,
+    build_runtime_bundle,
+    inspect_runtime_bundle,
+)
 from .rollout import (
     RolloutReplayIntegrityError,
     active_version_snapshot,
@@ -38,12 +62,25 @@ from .rollout import (
 )
 from .storage import StateContext, atomic_write_bytes, atomic_write_json, default_round, default_session, prune_old_state
 from .util import canonical_sha256, json_load, parse_time, redact, redact_for_persistence, sha256_bytes, sha256_file, sha256_text, stable_id, utc_now
-from .validation import _project_policy_scope, validate_state
+from .validation import (
+    _BINDING_FIELDS,
+    _completion_trusted_invocations,
+    _project_policy_scope,
+    _runtime_assurance_accepted,
+    _trusted_invocation_for_runtime,
+    _validate_evidence,
+    _validate_live_or_artifact_binding,
+    successful_invocations,
+    validate_state,
+)
 from .workspace import (
     canonical_workspace_path,
+    capture_workspace_snapshot,
     path_matches_lease,
     resolve_handoff_output_path,
+    validate_review_output_artifact,
     validated_supervisor_source_snapshot_hash,
+    workspace_delta,
 )
 
 
@@ -55,6 +92,53 @@ class SupervisorSourceSnapshotMismatch(RuntimeError):
     pass
 
 
+class _FrozenGateCommand(list[str]):
+    """Command argv carrying immutable stdin that is never persisted in evidence."""
+
+    def __init__(
+        self,
+        values: list[str],
+        input_bytes: bytes,
+        *,
+        review_resources: dict[str, bytes] | None = None,
+        review_profile_root: str | None = None,
+        review_core_manifest_sha256: str | None = None,
+        review_adapter_manifest: dict[str, str] | None = None,
+        review_adapter_manifest_sha256: str | None = None,
+    ) -> None:
+        super().__init__(values)
+        self.input_bytes = input_bytes
+        self.review_resources = dict(review_resources or {})
+        self.review_profile_root = review_profile_root
+        self.review_core_manifest_sha256 = review_core_manifest_sha256
+        self.review_adapter_manifest = dict(review_adapter_manifest or {})
+        self.review_adapter_manifest_sha256 = review_adapter_manifest_sha256
+
+    def execution_input_bytes(self) -> bytes:
+        if not self.review_resources:
+            return self.input_bytes
+        payload = {
+            "contract": "SupervisorReviewSourceFrame/v1",
+            "core_manifest_sha256": self.review_core_manifest_sha256,
+            "profile_root": self.review_profile_root,
+            "adapter_manifest": self.review_adapter_manifest,
+            "adapter_manifest_sha256": self.review_adapter_manifest_sha256,
+            "resources": {
+                name: base64.b64encode(content).decode("ascii")
+                for name, content in sorted(self.review_resources.items())
+            },
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if len(encoded) > _MAX_GATE_STDIN_BYTES:
+            raise InvalidState("frozen review source exceeds its bounded transport")
+        return encoded
+
+
 _DEFAULT_GATE_TIMEOUT_SECONDS = 1200
 _MIN_GATE_TIMEOUT_SECONDS = 1
 _MAX_GATE_TIMEOUT_SECONDS = 1800
@@ -63,6 +147,7 @@ _MIN_ROLLBACK_CLAIM_LEASE_SECONDS = 1
 _MAX_ROLLBACK_CLAIM_LEASE_SECONDS = 3600
 _MAX_GATE_CAPTURE_BYTES = 64 * 1024
 _GATE_CAPTURE_CHUNK_BYTES = 16 * 1024
+_MAX_GATE_STDIN_BYTES = 4 * 1024 * 1024
 
 
 def _run_gate_subprocess_bounded(
@@ -70,18 +155,32 @@ def _run_gate_subprocess_bounded(
     *,
     cwd: str,
     timeout_seconds: float,
+    extra_env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+    replace_env: bool = False,
 ) -> dict[str, Any]:
     """Drain both pipes concurrently while retaining only a bounded byte tail."""
+    if input_bytes is not None and (
+        not isinstance(input_bytes, bytes) or len(input_bytes) > _MAX_GATE_STDIN_BYTES
+    ):
+        raise ValueError("gate subprocess stdin exceeds its bounded contract")
+    process_environment = None
+    if extra_env is not None:
+        process_environment = {} if replace_env else os.environ.copy()
+        process_environment.update(extra_env)
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=False,
         bufsize=0,
+        env=process_environment,
     )
-    if process.stdout is None or process.stderr is None:
+    if process.stdout is None or process.stderr is None or (
+        input_bytes is not None and process.stdin is None
+    ):
         process.kill()
         process.wait()
         raise OSError("gate subprocess pipes unavailable")
@@ -114,6 +213,30 @@ def _run_gate_subprocess_bounded(
     for reader in readers:
         reader.start()
 
+    input_state = {"complete": input_bytes is None, "error": False}
+
+    def write_input() -> None:
+        assert process.stdin is not None
+        try:
+            written = process.stdin.write(input_bytes or b"")
+            process.stdin.flush()
+            input_state["complete"] = written == len(input_bytes or b"")
+        except (BrokenPipeError, OSError, ValueError):
+            input_state["error"] = True
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    writer = (
+        threading.Thread(target=write_input, daemon=True)
+        if input_bytes is not None
+        else None
+    )
+    if writer is not None:
+        writer.start()
+
     timed_out = False
     try:
         return_code = process.wait(timeout=timeout_seconds)
@@ -126,6 +249,13 @@ def _run_gate_subprocess_bounded(
             pass
         return_code = 124
     finally:
+        if writer is not None:
+            try:
+                writer.join(timeout=2)
+                if writer.is_alive():
+                    input_state["error"] = True
+            except (RuntimeError, ValueError):
+                input_state["error"] = True
         for reader in readers:
             try:
                 reader.join(timeout=2)
@@ -142,9 +272,25 @@ def _run_gate_subprocess_bounded(
             except (RuntimeError, ValueError):
                 pass
 
+    reader_incomplete: list[bool] = []
+    for reader in readers:
+        try:
+            reader_incomplete.append(bool(reader.is_alive()))
+        except (AttributeError, RuntimeError, ValueError):
+            # A reader whose terminal state cannot be established is not safe
+            # evidence of a complete capture. Preserve the process result, but
+            # make downstream evidence fail closed on truncation.
+            reader_incomplete.append(True)
+
+    captured_buffers = {
+        name: bytes(value)
+        for name, value in buffers.items()
+    }
+    captured_totals = dict(totals)
+
     def decoded_tail(name: str) -> str:
-        data = bytes(buffers[name])
-        if totals[name] > len(data):
+        data = captured_buffers[name]
+        if captured_totals[name] > len(data):
             boundary = data.find(b"\n")
             data = data[boundary + 1 :] if boundary >= 0 else b""
         return data.decode("utf-8", errors="replace")
@@ -154,8 +300,15 @@ def _run_gate_subprocess_bounded(
         "timed_out": timed_out,
         "stdout": decoded_tail("stdout"),
         "stderr": decoded_tail("stderr"),
-        "stdout_truncated": totals["stdout"] > len(buffers["stdout"]),
-        "stderr_truncated": totals["stderr"] > len(buffers["stderr"]),
+        "stdout_truncated": (
+            captured_totals["stdout"] > len(captured_buffers["stdout"])
+            or reader_incomplete[0]
+        ),
+        "stderr_truncated": (
+            captured_totals["stderr"] > len(captured_buffers["stderr"])
+            or reader_incomplete[1]
+        ),
+        "stdin_complete": bool(input_state["complete"] and not input_state["error"]),
     }
 
 
@@ -207,6 +360,26 @@ def _reject_sensitive_contract_input(value: Any, label: str) -> None:
 
 def _emit(value: Any) -> None:
     print(json.dumps(redact(value), ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _command_audit_record(category: str, args: list[str]) -> dict[str, Any]:
+    """Represent a credential-free command with a stable structural digest."""
+    structure: list[str] = []
+    for index, raw in enumerate(args):
+        token = str(raw)
+        if index == 0:
+            structure.append("executable")
+        elif os.path.isabs(token):
+            structure.append("absolute-path")
+        elif token.startswith(("-", "/")):
+            structure.append(f"option:{token.partition('=')[0].casefold()}")
+        else:
+            structure.append("value")
+    return {
+        "category": category,
+        "args": list(args),
+        "args_structure_sha256": canonical_sha256(structure),
+    }
 
 
 def _project_identity(project_file: str | None, workspace: str) -> tuple[dict[str, Any], str]:
@@ -266,6 +439,98 @@ def _initialize_cli_source_snapshot(ctx: StateContext, state: dict[str, Any], *,
     return ctx.update(persist)
 
 
+def _initialize_executable_registry(
+    ctx: StateContext,
+    state: dict[str, Any],
+    *,
+    shadow: bool,
+) -> tuple[dict[str, Any], bool]:
+    try:
+        record = registry_public_record(load_trusted_executable_registry())
+        degraded = False
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError) as exc:
+        record = {
+            "contract": "TrustedExecutableRegistry/v1",
+            "status": "unavailable",
+            "reason": type(exc).__name__,
+        }
+        degraded = True
+    if shadow:
+        state["trusted_executable_registry"] = copy.deepcopy(record)
+        if degraded:
+            state["health"] = "degraded"
+        return state, degraded
+
+    def persist(current: dict[str, Any]) -> None:
+        current["trusted_executable_registry"] = copy.deepcopy(record)
+        if degraded:
+            current["health"] = "degraded"
+        current["updated_at"] = utc_now()
+
+    return ctx.update(persist), degraded
+
+
+def _verified_executable_registry(
+    ctx: StateContext, state: dict[str, Any]
+) -> dict[str, Any]:
+    record = state.get("trusted_executable_registry")
+    try:
+        return verify_registry_record(record)
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError) as exc:
+        reason = f"trusted-executable-registry:{type(exc).__name__}"
+        ctx.update(lambda current: current.update({
+            "health": "degraded",
+            "source_snapshot_integrity": {
+                "status": "mismatch",
+                "reason": reason,
+                "checked_at": utc_now(),
+            },
+            "updated_at": utc_now(),
+        }))
+        ctx.append_event({
+            "event_type": "trusted_executable_registry_mismatch",
+            "status": "degraded",
+            "reason": reason,
+        })
+        raise SupervisorSourceSnapshotMismatch(
+            reason
+        ) from exc
+
+
+def _execution_release_identity() -> dict[str, Any] | None:
+    """Use the stage-0 identity frozen for this process, never a later pointer."""
+    bound = bound_release_identity()
+    return copy.deepcopy(bound) if isinstance(bound, dict) else active_version_snapshot()
+
+
+def _isolated_review_environment(
+    registry: dict[str, Any],
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a credential-minimal environment for the external review boundary."""
+    allowed = {
+        "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+        "OS", "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP",
+        "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+    }
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in allowed and isinstance(value, str)
+    }
+    environment.update({
+        "AGENT_SUPERVISOR_TRUST_REGISTRY_SHA256": str(
+            registry.get("registry_sha256") or ""
+        ),
+        "NoDefaultCurrentDirectoryInExePath": "1",
+        "PATH": trusted_path(registry),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    })
+    environment.update(extra or {})
+    return environment
+
+
 def _verify_current_source_snapshot(ctx: StateContext, state: dict[str, Any] | None = None) -> str:
     state = state if isinstance(state, dict) else ctx.load()
     expected = state.get("supervisor_source_snapshot")
@@ -303,6 +568,139 @@ def _verify_current_source_snapshot(ctx: StateContext, state: dict[str, Any] | N
     raise SupervisorSourceSnapshotMismatch(reason)
 
 
+def _capability_discovery_summary(
+    inventory: dict[str, Any], *, root_count: int
+) -> dict[str, Any]:
+    """Bind a concise discovery result to stable inventory content."""
+    skills = [
+        copy.deepcopy(row)
+        for row in inventory.get("skills", [])
+        if isinstance(row, dict)
+    ]
+    ignored = [
+        copy.deepcopy(row)
+        for row in inventory.get("ignored", [])
+        if isinstance(row, dict)
+    ]
+    agents = [
+        copy.deepcopy(row)
+        for row in inventory.get("agents", [])
+        if isinstance(row, dict)
+    ]
+    identity_collisions = [
+        copy.deepcopy(row)
+        for row in inventory.get("identity_collisions", [])
+        if isinstance(row, dict)
+    ]
+    stable_payload = {
+        "skills": sorted(skills, key=canonical_sha256),
+        "agents": sorted(agents, key=canonical_sha256),
+        "ignored": sorted(ignored, key=canonical_sha256),
+        "identity_collisions": sorted(identity_collisions, key=canonical_sha256),
+        "counts": copy.deepcopy(
+            inventory.get("counts")
+            if isinstance(inventory.get("counts"), dict)
+            else {}
+        ),
+    }
+    return {
+        "contract": "CapabilityDiscoverySummary/v3",
+        "status": (
+            "degraded" if stable_payload["identity_collisions"] else "healthy"
+        ),
+        "scanned_at": str(inventory.get("generated_at") or utc_now()),
+        "root_count": int(root_count),
+        "counts": copy.deepcopy(stable_payload["counts"]),
+        "inventory_sha256": canonical_sha256(stable_payload),
+    }
+
+
+def _trusted_capability_discovery(
+    project_config: dict[str, Any],
+    workspace: str,
+    runtime: str,
+    root_values: list[str] | None = None,
+) -> tuple[list[Any], dict[str, Any], dict[str, Any]]:
+    """Run the one trusted Skill + project-Agent discovery pipeline."""
+    roots = parse_roots(list(root_values or []), runtime)
+    inventory = scan_skills(
+        roots,
+        project_config=project_config,
+        workspace=workspace,
+    )
+    project_agents = inventory.get("agents")
+    if not isinstance(project_agents, list):
+        raise InvalidState("capability inventory agents must be an array")
+    counts = inventory.setdefault("counts", {})
+    if not isinstance(counts, dict):
+        raise InvalidState("capability inventory counts must be an object")
+    counts.update(
+        {
+            "agents_discovered": len(project_agents),
+            "agents_active": sum(1 for row in project_agents if row.get("active")),
+            "agents_unavailable": sum(
+                1
+                for row in project_agents
+                if row.get("availability") == "unavailable"
+            ),
+            "agent_fallbacks": sum(
+                1 for row in project_agents if row.get("fallback_only")
+            ),
+        }
+    )
+    discovery = _capability_discovery_summary(inventory, root_count=len(roots))
+    return roots, inventory, discovery
+
+
+def _capability_start_degraded(
+    ctx: StateContext,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    error: BaseException,
+    inventory: dict[str, Any] | None = None,
+    discovery: dict[str, Any] | None = None,
+) -> int:
+    """Persist and emit only a stable failure code plus exception type."""
+    degradation = {
+        "contract": "CapabilityBootstrapDegradation/v3",
+        "stage": stage,
+        "reason_code": f"capability-{stage}-failed",
+        "error_type": type(error).__name__,
+        "recorded_at": utc_now(),
+    }
+    if not bool(args.shadow):
+        def persist(current: dict[str, Any]) -> None:
+            current["health"] = "degraded"
+            current["capability_bootstrap_degradation"] = copy.deepcopy(
+                degradation
+            )
+            if isinstance(inventory, dict):
+                current["capability_inventory"] = copy.deepcopy(inventory)
+            if isinstance(discovery, dict):
+                current["discovery"] = copy.deepcopy(discovery)
+            current["updated_at"] = utc_now()
+
+        state = ctx.update(persist)
+    else:
+        state["health"] = "degraded"
+    _emit(
+        {
+            "ok": False,
+            "shadow": bool(args.shadow),
+            "persisted": not bool(args.shadow),
+            "state_file": None if args.shadow else str(ctx.state_file),
+            "health": "degraded",
+            "terminal_state": "incomplete",
+            "discovery": copy.deepcopy(discovery),
+            "capability_route": None,
+            "degradation": degradation,
+        }
+    )
+    return EXIT_DEGRADED
+
+
 def command_start(args: argparse.Namespace) -> int:
     ctx = _context(args)
     config, _ = _project_identity(args.project_file, ctx.workspace)
@@ -313,8 +711,29 @@ def command_start(args: argparse.Namespace) -> int:
     if args.criteria_json:
         supplied["acceptance_criteria"] = _json_arg(args.criteria_json, [])
     intents = _json_arg(args.intents_json, None)
+    raw_atomic_intents = (
+        normalize_intents(intents, args.message)
+        if intents is not None
+        else normalize_intents(split_intents(args.message), args.message)
+    )
+    if not raw_atomic_intents:
+        raw_atomic_intents = normalize_intents(
+            [{"text": args.message, "domain": "general"}], args.message
+        )
+    safe_goal, safe_intents, raw_prompt_withheld = _privacy_safe_prompt_contract(
+        args.message, config, raw_atomic_intents
+    )
+    if raw_prompt_withheld:
+        supplied = safe_goal
+        intents = safe_intents
     _reject_sensitive_contract_input(
-        {"message": args.message, "goal": supplied, "intents": intents},
+        {
+            "message": args.message,
+            "goal": supplied,
+            "intents": intents,
+            "project_config": config,
+            "quality_profile": quality,
+        },
         "start request",
     )
     state = start_round(
@@ -329,18 +748,84 @@ def command_start(args: argparse.Namespace) -> int:
         trusted_authorizations=None,
         shadow=args.shadow,
     )
+    state, executable_registry_degraded = _initialize_executable_registry(
+        ctx, state, shadow=bool(args.shadow)
+    )
     state = _initialize_cli_source_snapshot(ctx, state, shadow=bool(args.shadow))
+    try:
+        roots, inventory, discovery = _trusted_capability_discovery(
+            config,
+            ctx.workspace,
+            args.runtime,
+            list(getattr(args, "roots", None) or []),
+        )
+    except Exception as exc:
+        return _capability_start_degraded(
+            ctx, state, args, stage="discovery", error=exc
+        )
+    supplied_intents = _routing_intents_for_start(state, raw_atomic_intents)
+    try:
+        routed = route_intents(
+            message=args.message,
+            inventory=inventory,
+            supplied_intents=supplied_intents,
+            phase_budget=int(getattr(args, "phase_budget", 3)),
+            zero_skill_reviewed=bool(
+                getattr(args, "zero_skill_reviewed", False)
+            ),
+        )
+        capability_route = (
+            _privacy_safe_capability_route(routed, state, args.message)
+            if raw_prompt_withheld
+            else routed
+        )
+        capability_route["inventory_sha256"] = discovery["inventory_sha256"]
+    except Exception as exc:
+        return _capability_start_degraded(
+            ctx,
+            state,
+            args,
+            stage="routing",
+            error=exc,
+            inventory=inventory,
+            discovery=discovery,
+        )
+    if not bool(args.shadow):
+        def persist_capabilities(current: dict[str, Any]) -> None:
+            current["capability_inventory"] = copy.deepcopy(inventory)
+            current["discovery"] = copy.deepcopy(discovery)
+            current["capability_route"] = copy.deepcopy(capability_route)
+            current["intents"] = copy.deepcopy(
+                capability_route.get("coverage", [])
+            )
+            if raw_prompt_withheld:
+                current["prompt_privacy"] = {
+                    "raw_prompt_persisted": False,
+                    "request_sha256": sha256_text(args.message),
+                }
+            current["updated_at"] = utc_now()
+
+        state = ctx.update(persist_capabilities)
     _emit({
-        "ok": True,
+        "ok": bool(capability_route.get("valid")),
         "shadow": bool(args.shadow),
         "persisted": not bool(args.shadow),
         "state_file": None if args.shadow else str(ctx.state_file),
         "goal": state["goal"],
-        "intents": state.get("intents", []),
+        "intents": capability_route.get("coverage", []),
         "execution_mode": state.get("execution_mode"),
+        "discovery": discovery,
+        "capability_route": capability_route,
+        "terminal_state": (
+            "active"
+            if capability_route.get("valid") and not executable_registry_degraded
+            else "incomplete"
+        ),
         "namespace": {"runtime": ctx.runtime, "project": ctx.project, "workspace": ctx.workspace, "session": ctx.session, "round": ctx.round},
     })
-    return EXIT_COMPLETE
+    if executable_registry_degraded:
+        return EXIT_DEGRADED
+    return EXIT_COMPLETE if capability_route.get("valid") else EXIT_INCOMPLETE
 
 
 def _clean_event_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -355,6 +840,7 @@ def _clean_event_payload(args: argparse.Namespace) -> dict[str, Any]:
         "command_category": args.command_category,
         "summary": args.summary,
         "actor": args.actor,
+        "responsibility_group": args.responsibility_group,
         "invocation_id": args.invocation_id,
         "result": args.result,
     }.items():
@@ -372,9 +858,26 @@ def _record_from_payload(payload: dict[str, Any], event_type: str) -> dict[str, 
     if not isinstance(record, dict) or not record:
         raise InvalidState(f"{event_type} requires a non-empty record object in --data-json")
     try:
-        return redact_for_persistence(record)
+        clean = redact_for_persistence(record)
     except ValueError as exc:
         raise InvalidState(f"{event_type} contains sensitive data in an integrity-bound field") from exc
+    if event_type == "evidence_record":
+        command = clean.get("command") if isinstance(clean, dict) else None
+        raw_args = command.get("args") if isinstance(command, dict) else None
+        if isinstance(raw_args, list) and all(isinstance(item, str) for item in raw_args):
+            command["args_structure_sha256"] = canonical_sha256(
+                [
+                    "executable"
+                    if index == 0
+                    else "absolute-path"
+                    if os.path.isabs(item)
+                    else f"option:{item.partition('=')[0].casefold()}"
+                    if item.startswith(("-", "/"))
+                    else "value"
+                    for index, item in enumerate(raw_args)
+                ]
+            )
+    return clean
 
 
 def _upsert_record(rows: list[dict[str, Any]], record: dict[str, Any], identity: str) -> None:
@@ -388,9 +891,185 @@ def _upsert_record(rows: list[dict[str, Any]], record: dict[str, Any], identity:
     rows.append(record)
 
 
+def _trusted_current_agent_liveness(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    inventory_sha256: str,
+) -> dict[str, Any] | None:
+    """Return one trusted, current-session Agent liveness success or fail closed.
+
+    Codex does not expose a complete host Agent lifecycle to this core.  It may
+    audit explicit capability contributions, but must never turn a caller claim
+    into host liveness.  Other runtimes may populate this core-owned collection
+    only through a future trusted host integration.
+    """
+    if str(state.get("runtime") or "").strip().casefold() == "codex":
+        return None
+    if record.get("host_liveness_status") != "verified":
+        return None
+    evidence_rows = state.get("trusted_agent_liveness")
+    if not isinstance(evidence_rows, list):
+        return None
+    capability_id = str(record.get("id") or "").strip()
+    config_sha256 = str(record.get("sha256") or "").strip().casefold()
+    if not capability_id or not re.fullmatch(r"[0-9a-f]{64}", config_sha256):
+        return None
+    matches: list[dict[str, Any]] = []
+    for raw in evidence_rows:
+        if not isinstance(raw, dict):
+            continue
+        observed_at = str(raw.get("observed_at") or "")
+        try:
+            parse_time(observed_at)
+        except (TypeError, ValueError):
+            continue
+        if (
+            raw.get("contract") == "TrustedAgentLiveness/v1"
+            and raw.get("status") == "success"
+            and raw.get("trusted_host_event") is True
+            and str(raw.get("runtime") or "") == str(state.get("runtime") or "")
+            and str(raw.get("project") or "") == str(state.get("project") or "")
+            and str(raw.get("workspace") or "") == str(state.get("workspace") or "")
+            and str(raw.get("session") or "") == str(state.get("session") or "")
+            and str(raw.get("round") or "") == str(state.get("round") or "")
+            and str(raw.get("capability_id") or "").strip().casefold()
+            == capability_id.casefold()
+            and str(raw.get("config_sha256") or "").casefold() == config_sha256
+            and str(raw.get("inventory_sha256") or "").casefold()
+            == inventory_sha256
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(raw.get("host_capability_identity_sha256") or "").casefold(),
+            )
+            and str(raw.get("probe_actor") or "").strip()
+            and str(raw.get("evidence_id") or "").strip()
+        ):
+            matches.append(raw)
+    return copy.deepcopy(matches[0]) if len(matches) == 1 else None
+
+
+def _trusted_fallback_binding(
+    state: dict[str, Any], capability: str
+) -> dict[str, Any] | None:
+    """Return a current inventory-bound Agent fallback or fail closed."""
+    inventory = state.get("capability_inventory")
+    discovery = state.get("discovery")
+    route = state.get("capability_route")
+    if not all(isinstance(value, dict) for value in (inventory, discovery, route)):
+        return None
+    expected_inventory_sha256 = str(
+        discovery.get("inventory_sha256") or ""
+    ).casefold()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_inventory_sha256)
+        or route.get("inventory_sha256") != expected_inventory_sha256
+        or discovery.get("status") != "healthy"
+        or route.get("valid") is not True
+    ):
+        return None
+    try:
+        observed = _capability_discovery_summary(
+            inventory,
+            root_count=int(discovery.get("root_count")),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        observed.get("inventory_sha256") != expected_inventory_sha256
+        or observed.get("status") != "healthy"
+    ):
+        return None
+
+    configured = state.get("capability_fallbacks")
+    fallback_id = (
+        str(configured.get(capability) or "").strip()
+        if isinstance(configured, dict)
+        else ""
+    )
+    agents = inventory.get("agents")
+    if not fallback_id or not isinstance(agents, list):
+        return None
+    primaries = [
+        row
+        for row in agents
+        if isinstance(row, dict)
+        and row.get("id") == capability
+        and row.get("fallback_only") is False
+        and row.get("active") is True
+        and row.get("automatic") is True
+        and row.get("availability") == "enabled"
+        and row.get("health") == "healthy"
+        and row.get("host_liveness_status") == "verified"
+        and row.get("fallback_id") == fallback_id
+    ]
+    fallbacks = [
+        row
+        for row in agents
+        if isinstance(row, dict)
+        and row.get("id") == fallback_id
+        and row.get("fallback_only") is True
+        and row.get("primary_id") == capability
+        and row.get("active") is False
+        and row.get("automatic") is False
+        and row.get("availability") == "fallback-only"
+        and row.get("health") == "healthy"
+        and row.get("host_liveness_status") == "verified"
+    ]
+    if len(primaries) != 1 or len(fallbacks) != 1:
+        return None
+    primary, fallback = primaries[0], fallbacks[0]
+    group = str(primary.get("responsibility_group") or "").strip()
+    primary_liveness = _trusted_current_agent_liveness(
+        state, primary, expected_inventory_sha256
+    )
+    fallback_liveness = _trusted_current_agent_liveness(
+        state, fallback, expected_inventory_sha256
+    )
+    if (
+        not group
+        or fallback.get("responsibility_group") != group
+        or primary_liveness is None
+        or fallback_liveness is None
+        or not verify_project_agent_record(primary, str(state.get("workspace") or ""))
+        or not verify_project_agent_record(fallback, str(state.get("workspace") or ""))
+    ):
+        return None
+    return {
+        "contract": "TrustedFallbackBinding/v3",
+        "primary_id": capability,
+        "fallback_id": fallback_id,
+        "responsibility_group": group,
+        "primary_sha256": primary.get("sha256"),
+        "fallback_sha256": fallback.get("sha256"),
+        "inventory_sha256": expected_inventory_sha256,
+        "primary_liveness_evidence_id": primary_liveness.get("evidence_id"),
+        "fallback_liveness_evidence_id": fallback_liveness.get("evidence_id"),
+    }
+
+
+def _breaker_fallback_id(
+    state: dict[str, Any], capability: str, breaker: Any
+) -> str:
+    if not isinstance(breaker, dict) or breaker.get("fallback_status") != "required":
+        return ""
+    binding = breaker.get("fallback_binding")
+    fallback_id = str(breaker.get("fallback_id") or "").strip()
+    current_binding = _trusted_fallback_binding(state, capability)
+    return fallback_id if (
+        isinstance(binding, dict)
+        and binding.get("contract") == "TrustedFallbackBinding/v3"
+        and binding.get("fallback_id") == fallback_id
+        and current_binding is not None
+        and binding == current_binding
+    ) else ""
+
+
 def _record_breaker_result(state: dict[str, Any], capability: str, result: str) -> None:
     breakers = state.setdefault("capability_breakers", {})
-    configured_fallback = state.get("capability_fallbacks", {}).get(capability)
+    fallback_map = state.get("capability_fallbacks")
+    configured_fallback = (
+        fallback_map.get(capability) if isinstance(fallback_map, dict) else None
+    )
     row = breakers.setdefault(capability, {"consecutive_failures": 0, "open": False, "fallback_id": configured_fallback})
     if not row.get("fallback_id") and configured_fallback:
         row["fallback_id"] = configured_fallback
@@ -399,13 +1078,28 @@ def _record_breaker_result(state: dict[str, Any], capability: str, result: str) 
         row["open"] = False
         row.pop("active_capability", None)
         row.pop("fallback_status", None)
+        row.pop("fallback_binding", None)
+        row.pop("fallback_unavailable_reason", None)
     else:
         row["consecutive_failures"] = int(row.get("consecutive_failures", 0)) + 1
         if row["consecutive_failures"] >= 2:
             row["open"] = True
             row["opened_at"] = utc_now()
-            row["active_capability"] = row.get("fallback_id")
-            row["fallback_status"] = "required" if row.get("fallback_id") else "unavailable"
+            binding = _trusted_fallback_binding(state, capability)
+            if binding is not None:
+                row["fallback_id"] = binding["fallback_id"]
+                row["active_capability"] = binding["fallback_id"]
+                row["fallback_status"] = "required"
+                row["fallback_binding"] = binding
+                row.pop("fallback_unavailable_reason", None)
+            else:
+                row.pop("active_capability", None)
+                row.pop("fallback_binding", None)
+                row["fallback_status"] = "unavailable"
+                row["fallback_unavailable_reason"] = (
+                    "trusted-inventory-fallback-unavailable"
+                )
+                state["health"] = "degraded"
     state["updated_at"] = utc_now()
 
 
@@ -414,7 +1108,6 @@ def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_ty
         "task_record": ("tasks", "task_id"),
         "task_upsert": ("tasks", "task_id"),
         "evidence_record": ("evidence", "evidence_id"),
-        "review_record": ("reviews", "review_id"),
         "waiver_record": ("waivers", "waiver_id"),
         "claim_record": ("claims", "claim_id"),
     }
@@ -450,7 +1143,7 @@ def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_ty
         record = _record_from_payload(payload, event_type)
         apply_observation(state.setdefault("rollout", {}), record)
         if state["rollout"].get("rollback", {}).get("required") and not state["rollout"].get("rollback", {}).get("performed"):
-            rollback = rollback_active_version(expected_active=active_version_snapshot())
+            rollback = rollback_active_version(expected_active=_execution_release_identity())
             state["rollout"]["rollback"].update(rollback)
             if not rollback.get("performed"):
                 state["health"] = "degraded"
@@ -495,6 +1188,416 @@ def _invocation_state_binding(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _hook_identity_assurance(runtime: str) -> str:
+    # Codex passes hook payloads through a caller-accessible local adapter; no
+    # external host signature authenticates actor/responsibility-group fields.
+    return (
+        "codex-hook-observation"
+        if str(runtime).strip().casefold() == "codex"
+        else "host-hook-observed"
+    )
+
+
+def _bound_audit_invocation_attempt(
+    state: dict[str, Any],
+    events: list[dict[str, Any]],
+    invocation_id: str,
+    actor: str,
+    responsibility_group: str,
+) -> dict[str, Any] | None:
+    """Accept a locally attested observation for execution, never identity."""
+    matches = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("event_type") == "invocation_attempt"
+        and event.get("invocation_id") == invocation_id
+    ]
+    if len(matches) != 1:
+        return None
+    attempt = matches[0]
+    details = attempt.get("details") if isinstance(attempt.get("details"), dict) else {}
+    assurance = attempt.get("identity_assurance")
+    return attempt if (
+        attempt.get("actor") == actor
+        and attempt.get("responsibility_group") == responsibility_group
+        and assurance in {
+            "host-hook-observed",
+            "codex-explicit-audit",
+            "codex-hook-observation",
+            "core-executed-gate",
+            "core-trusted-finalize",
+        }
+        and verify_record(attempt)
+        and all(
+            details.get(key) == value
+            for key, value in _invocation_state_binding(state).items()
+        )
+    ) else None
+
+
+def _trusted_invocation_attempt(
+    state: dict[str, Any], events: list[dict[str, Any]], invocation_id: str, actor: str,
+    responsibility_group: str,
+) -> dict[str, Any] | None:
+    attempt = _bound_audit_invocation_attempt(
+        state, events, invocation_id, actor, responsibility_group
+    )
+    if attempt is None:
+        return None
+    details = attempt.get("details") if isinstance(attempt.get("details"), dict) else {}
+    assurance = attempt.get("identity_assurance")
+    core_finalize_identity_valid = bool(
+        assurance != "core-trusted-finalize"
+        or (
+            actor == "supervisor-core"
+            and responsibility_group == "trusted-runtime"
+            and bool(str(details.get("gate_id") or "").strip())
+            and bool(str(details.get("criterion_id") or "").strip())
+            and attempt.get("capability")
+            == f"supervisor-core-builtin:{details.get('gate_id')}"
+            and details.get("phase") == "builtin-finalize"
+        )
+    )
+    core_gate_identity_valid = bool(
+        assurance != "core-executed-gate"
+        or (
+            actor == "supervisor-core"
+            and responsibility_group == "trusted-core-gate-execution"
+            and bool(str(details.get("gate_id") or "").strip())
+            and bool(str(details.get("criterion_id") or "").strip())
+            and attempt.get("capability")
+            == f"supervisor-core-gate:{details.get('gate_id')}"
+            and details.get("phase") == "registered-gate-execution"
+            and attempt.get("identity_provenance")
+            == "core-minted-single-use-gate-execution"
+            and attempt.get("completion_eligible") is True
+        )
+    )
+    return attempt if (
+        core_finalize_identity_valid
+        and core_gate_identity_valid
+        and _runtime_assurance_accepted(state, assurance)
+    ) else None
+
+
+def _unique_finalize_invocation_id(events: list[dict[str, Any]]) -> str:
+    existing = {
+        str(event.get("invocation_id"))
+        for event in events
+        if isinstance(event, dict) and event.get("invocation_id")
+    }
+    for _ in range(8):
+        candidate = stable_id("invocation")
+        if candidate not in existing:
+            return candidate
+    raise InvalidState("could not allocate a unique trusted finalize invocation id")
+
+
+def _core_gate_invocation_event(
+    state: dict[str, Any], *, invocation_id: str, gate_id: str,
+    criterion_id: str, stage: str, result: str | None,
+) -> dict[str, Any]:
+    return invocation_event(
+        invocation_id=invocation_id,
+        capability=f"supervisor-core-gate:{gate_id}",
+        stage=stage,
+        result=result,
+        actor="supervisor-core",
+        responsibility_group="trusted-core-gate-execution",
+        identity_assurance="core-executed-gate",
+        details={
+            "phase": "registered-gate-execution",
+            "gate_id": gate_id,
+            "criterion_id": criterion_id,
+            **_invocation_state_binding(state),
+        },
+    )
+
+
+def _finalize_invocation_event(
+    state: dict[str, Any], *, invocation_id: str, gate_id: str,
+    criterion_id: str, stage: str, result: str | None,
+) -> dict[str, Any]:
+    return invocation_event(
+        invocation_id=invocation_id,
+        capability=f"supervisor-core-builtin:{gate_id}",
+        stage=stage,
+        result=result,
+        actor="supervisor-core",
+        responsibility_group="trusted-runtime",
+        identity_assurance="core-trusted-finalize",
+        details={
+            "phase": "builtin-finalize",
+            "gate_id": gate_id,
+            "criterion_id": criterion_id,
+            **_invocation_state_binding(state),
+        },
+    )
+
+
+def _run_finalize_builtin_gate(
+    ctx: StateContext, state: dict[str, Any], *, gate_id: str,
+    criterion_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Run one builtin under a signed, single-attempt finalize identity."""
+    invocation_id = _unique_finalize_invocation_id(ctx.events())
+    attempt = _finalize_invocation_event(
+        state,
+        invocation_id=invocation_id,
+        gate_id=gate_id,
+        criterion_id=criterion_id,
+        stage="attempt",
+        result=None,
+    )
+    ctx.append_event(attempt)
+    try:
+        outcome = _run_registered_gate(
+            ctx,
+            {
+                "event_type": "gate_run",
+                "actor": "supervisor-core",
+                "record": {
+                    "gate_id": gate_id,
+                    "criterion_id": criterion_id,
+                    "collector": "supervisor-core",
+                    "collector_responsibility_group": "trusted-runtime",
+                    "collector_invocation_id": invocation_id,
+                },
+            },
+            finalize_internal=True,
+        )
+        gate_result = "success" if int(outcome[2]) == 0 else "failed"
+    except BaseException:
+        ctx.append_event(_finalize_invocation_event(
+            state,
+            invocation_id=invocation_id,
+            gate_id=gate_id,
+            criterion_id=criterion_id,
+            stage="result",
+            result="failed",
+        ))
+        raise
+    ctx.append_event(_finalize_invocation_event(
+        state,
+        invocation_id=invocation_id,
+        gate_id=gate_id,
+        criterion_id=criterion_id,
+        stage="result",
+        result=gate_result,
+    ))
+    return outcome
+
+
+def _gate_binding(state: dict[str, Any]) -> dict[str, Any]:
+    changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
+    if changes.get("diff_hash"):
+        return changes
+    baseline = state.get("workspace_baseline") if isinstance(state.get("workspace_baseline"), dict) else {}
+    current = capture_workspace_snapshot(
+        str(state.get("workspace") or ""),
+        [value for value in baseline.get("extra_globs", []) if isinstance(value, str)],
+    )
+    return workspace_delta(baseline, current)
+
+
+def _core_codex_changes_record(
+    state: dict[str, Any], request: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace caller identity/binding claims with a core-observed workspace record."""
+    caller_forbidden = {
+        "implementer",
+        "implementer_responsibility_group",
+        "implementer_invocation_id",
+        "producer_identity_assurance",
+        "issued_by",
+        "issued_at",
+        "attestation",
+    }
+    if caller_forbidden.intersection(request):
+        raise InvalidState("Codex changes_record caller cannot declare producer identity")
+    baseline = state.get("workspace_baseline")
+    if not isinstance(baseline, dict):
+        raise InvalidState("Codex changes_record requires a workspace baseline")
+    current = capture_workspace_snapshot(
+        str(state.get("workspace") or ""),
+        [
+            value
+            for value in baseline.get("extra_globs", [])
+            if isinstance(value, str)
+        ],
+    )
+    observed = workspace_delta(baseline, current)
+    domains = request.get("domains")
+    safe_domains = sorted({
+        value.strip()
+        for value in domains
+        if isinstance(value, str) and value.strip()
+    }) if isinstance(domains, list) else []
+    record = {
+        "contract": "ChangesRecord/v3",
+        "goal_id": state.get("goal", {}).get("goal_id"),
+        "goal_version": state.get("goal", {}).get("version"),
+        "request_manifest_sha256": canonical_sha256(
+            state.get("request_manifest", {})
+        ),
+        "files": copy.deepcopy(observed.get("files", [])),
+        "manifest": copy.deepcopy(observed.get("manifest", {})),
+        "domains": safe_domains,
+        "test_changes": {},
+        **{field: observed.get(field) for field in _BINDING_FIELDS},
+        "implementer": "codex-local-workspace",
+        "implementer_responsibility_group": "local-workspace-producer",
+        "implementer_invocation_id": f"core-workspace-{str(observed.get('diff_hash') or '')[:24]}",
+        "producer_identity_assurance": "core-observed-local-workspace",
+        "issued_by": "supervisor-core-workspace-observer",
+        "issued_at": utc_now(),
+    }
+    record["attestation"] = sign_record(record)
+    return record
+
+
+def _requires_review_binding_file(gate_id: str) -> bool:
+    # QualityProfile gate IDs are case- and whitespace-sensitive schema values.
+    if gate_id[:1].isspace() or gate_id[-1:].isspace():
+        return False
+    return gate_id in {"review.coderabbit", "review.coderabbit.test-integrity"} or gate_id.startswith(
+        "review.code-review-graph."
+    )
+
+
+def _review_binding_input(
+    state: dict[str, Any],
+    *,
+    supervisor_source_snapshot_sha256: str | None = None,
+    review_core_manifest_sha256: str | None = None,
+    review_adapter_manifest: dict[str, str] | None = None,
+    review_adapter_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build a core-observed, signed input for immutable review artifact producers."""
+    baseline = (
+        state.get("workspace_baseline")
+        if isinstance(state.get("workspace_baseline"), dict)
+        else None
+    )
+    changes = state.get("changes") if isinstance(state.get("changes"), dict) else None
+    if not isinstance(baseline, dict) or not isinstance(changes, dict):
+        raise InvalidState("review gate requires workspace baseline and changes record")
+    workspace = str(state.get("workspace") or "")
+    current = capture_workspace_snapshot(
+        workspace,
+        [
+            value for value in baseline.get("extra_globs", [])
+            if isinstance(value, str)
+        ],
+    )
+    observed = workspace_delta(baseline, current)
+    errors: list[str] = []
+    if observed.get("git_binding_status") != "verified":
+        errors.append("active workspace Git binding is not verified")
+    if set(map(str, changes.get("files", []))) != set(map(str, observed.get("files", []))):
+        errors.append("changes files do not match active workspace delta")
+    for field in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
+        if changes.get(field) != observed.get(field):
+            errors.append(f"changes {field} does not match active workspace delta")
+    _validate_live_or_artifact_binding(
+        state, changes, "review gate changes", errors, observed=observed
+    )
+    if changes.get("git_binding_status") != "verified" or errors:
+        raise InvalidState("review gate binding input failed core verification")
+    binding = {
+        "contract": "ReviewArtifactBindingInput/v1",
+        "workspace_base_sha256": observed.get("workspace_base_sha256"),
+        "workspace_head_sha256": observed.get("workspace_head_sha256"),
+        "diff_hash": observed.get("diff_hash"),
+        "workspace_delta_manifest": copy.deepcopy(observed.get("manifest", {})),
+    }
+    source_binding_values = (
+        supervisor_source_snapshot_sha256,
+        review_core_manifest_sha256,
+        review_adapter_manifest,
+        review_adapter_manifest_sha256,
+    )
+    if any(value is not None for value in source_binding_values):
+        if not (
+            isinstance(supervisor_source_snapshot_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", supervisor_source_snapshot_sha256)
+            and isinstance(review_core_manifest_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", review_core_manifest_sha256)
+            and isinstance(review_adapter_manifest, dict)
+            and bool(review_adapter_manifest)
+            and isinstance(review_adapter_manifest_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", review_adapter_manifest_sha256)
+        ):
+            raise InvalidState("review source binding fields are incomplete")
+        assert isinstance(review_adapter_manifest, dict)
+        normalized_adapter_manifest: dict[str, str] = {}
+        for logical, digest in review_adapter_manifest.items():
+            if not (
+                isinstance(logical, str)
+                and logical.startswith(("global-codex/", "global-claude/"))
+                and "\\" not in logical
+                and "//" not in logical
+                and not any(part in {"", ".", ".."} for part in logical.split("/"))
+                and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                raise InvalidState("review adapter source manifest is invalid")
+            normalized_adapter_manifest[logical] = digest
+        normalized_adapter_manifest = dict(sorted(normalized_adapter_manifest.items()))
+        if canonical_sha256(normalized_adapter_manifest) != review_adapter_manifest_sha256:
+            raise InvalidState("review adapter source manifest hash mismatch")
+        binding.update({
+            "supervisor_source_snapshot_sha256": supervisor_source_snapshot_sha256,
+            "review_core_manifest_sha256": review_core_manifest_sha256,
+            "review_adapter_manifest": normalized_adapter_manifest,
+            "review_adapter_manifest_sha256": review_adapter_manifest_sha256,
+        })
+    return binding
+
+
+def _parse_review_gate_output(
+    stdout: str,
+    stderr: str,
+    binding_input: dict[str, Any],
+    *,
+    stdout_truncated: bool = False,
+    stderr_truncated: bool = False,
+) -> tuple[dict[str, Any] | None, str]:
+    """Accept one unambiguous JSON object and fully revalidate its artifact."""
+    if stdout_truncated or stderr_truncated:
+        return None, "review-output-truncated"
+    if stderr.strip():
+        return None, "review-output-stderr-not-empty"
+    lines = stdout.strip().splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        return None, "review-output-must-be-one-json-line"
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON value: {value}")
+
+    try:
+        parsed = json.loads(
+            lines[0],
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "review-output-json-invalid-or-ambiguous"
+    valid, reason, normalized = validate_review_output_artifact(parsed, binding_input)
+    if not valid or not isinstance(normalized, dict):
+        return None, reason
+    return copy.deepcopy(normalized), "verified"
+
+
 def _windows_executable_candidates(path: Path, pathext: str) -> list[Path]:
     extensions: list[str] = []
     for raw in (pathext or ".COM;.EXE;.BAT;.CMD").split(";"):
@@ -512,60 +1615,332 @@ def _windows_executable_candidates(path: Path, pathext: str) -> list[Path]:
 
 
 def _resolve_gate_command(
-    command: list[str], *, cwd: str, environ: dict[str, str] | None = None
+    command: list[str],
+    *,
+    cwd: str,
+    trusted_registry: dict[str, Any],
 ) -> tuple[list[str], str, str]:
-    """Resolve argv[0] without Windows' implicit current-directory search."""
+    """Resolve argv[0] only through the round-bound machine trust registry."""
     if not command or not str(command[0]).strip():
         raise FileNotFoundError("registered gate command is empty")
-    environment = os.environ if environ is None else environ
     token = str(command[0])
-    lookup_token = token[1:-1] if len(token) >= 2 and token[0] == token[-1] == '"' else token
-    explicit = os.path.isabs(lookup_token) or bool(os.path.dirname(lookup_token))
-    if os.name == "nt" and re.match(r"^[A-Za-z]:", lookup_token):
-        explicit = True
+    try:
+        resolved, executable_hash = resolve_trusted_executable(
+            token, trusted_registry, cwd=cwd
+        )
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError) as exc:
+        raise FileNotFoundError(
+            "registered gate executable is not in the round-bound trust registry"
+        ) from exc
+    return [resolved, *command[1:]], resolved, executable_hash
 
-    bases: list[Path] = []
-    if explicit:
-        base = Path(os.path.expandvars(os.path.expanduser(lookup_token)))
-        if not base.is_absolute():
-            base = Path(cwd) / base
-        bases.append(base)
-    else:
-        for raw_entry in str(environment.get("PATH") or "").split(os.pathsep):
-            entry = raw_entry.strip().strip('"')
-            if not entry:
-                continue
-            expanded = os.path.expandvars(os.path.expanduser(entry))
-            if not os.path.isabs(expanded):
-                continue
-            bases.append(Path(expanded) / lookup_token)
 
+def _path_contains_link_or_reparse(path: Path) -> bool:
+    current = Path(os.path.abspath(os.fspath(path)))
+    while True:
+        details = os.lstat(current)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        attributes = getattr(details, "st_file_attributes", 0)
+        if stat.S_ISLNK(details.st_mode) or bool(
+            reparse_flag and attributes & reparse_flag
+        ):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _review_profile_root(snapshot_roots: Any) -> str:
+    if not isinstance(snapshot_roots, dict):
+        raise InvalidState("trusted review source roots are unavailable")
     candidates: list[Path] = []
-    for base in bases:
-        if os.name == "nt":
-            candidates.extend(_windows_executable_candidates(base, str(environment.get("PATHEXT") or "")))
-        else:
-            candidates.append(base)
-    for candidate in candidates:
+    for key, expected_segments in (
+        ("codex-adapter", (".codex", "skills", "dev-supervisor", "scripts")),
+        ("claude-adapter", (".claude", "skills", "supervisor", "scripts")),
+    ):
+        raw = snapshot_roots.get(key)
+        if not isinstance(raw, str) or not raw:
+            raise InvalidState("trusted review adapter root is unavailable")
+        path = Path(os.path.abspath(os.fspath(Path(raw))))
+        if tuple(part.casefold() for part in path.parts[-4:]) != tuple(
+            part.casefold() for part in expected_segments
+        ):
+            raise InvalidState("trusted review adapter layout is invalid")
+        candidates.append(path.parents[3])
+    if os.path.normcase(str(candidates[0])) != os.path.normcase(str(candidates[1])):
+        raise InvalidState("trusted review adapters do not share one profile root")
+    return str(candidates[0])
+
+
+def _review_adapter_manifest(snapshot_roots: dict[str, Any]) -> dict[str, str]:
+    """Freeze every adapter file selected by the independent review runner."""
+    codex_scripts = Path(str(snapshot_roots["codex-adapter"]))
+    claude_scripts = Path(str(snapshot_roots["claude-adapter"]))
+    codex_root = codex_scripts.parent
+    claude_root = claude_scripts.parent
+    excluded_directories = {
+        ".git", "__pycache__", ".pytest_cache", ".codex-supervisor",
+        "state", "logs", "cache", "handoffs", "review-artifacts",
+        "test-results", ".next", "node_modules",
+    }
+
+    def excluded(path: Path) -> bool:
+        lowered = [part.casefold() for part in path.parts]
+        name = path.name.casefold()
+        return (
+            any(part in excluded_directories for part in lowered)
+            or any(part.startswith(".pytest-tmp") for part in lowered)
+            or name == "settings.local.json"
+            or name.startswith("settings.local.")
+            or name.endswith((".key", ".pem", ".pfx", ".log"))
+            or name.startswith(".env")
+        )
+
+    codex_candidates: list[Path] = []
+    for current, directories, files in os.walk(codex_root):
+        current_path = Path(current)
+        directories[:] = [
+            name
+            for name in directories
+            if not excluded((current_path / name).relative_to(codex_root))
+        ]
+        codex_candidates.extend(
+            current_path / name
+            for name in files
+            if not excluded((current_path / name).relative_to(codex_root))
+        )
+    claude_candidates = [
+        claude_root / "SKILL.md",
+        *(claude_scripts / name for name in (
+            "sup-v3-hook.py", "sup-selftest.py", "sup-discover.py", "sup-log.py",
+            "sup-plan.py", "configure-v3-hooks.py",
+        )),
+        *(claude_root / "tests" / name for name in (
+            "test_dispatch_ledger.py", "test_precision.py", "test_retrieval.py",
+            "test_v3_adapter.py", "test_verifier.py",
+        )),
+    ]
+    manifest: dict[str, str] = {}
+    for label, root, candidates in (
+        ("global-codex", codex_root, codex_candidates),
+        ("global-claude", claude_root, claude_candidates),
+    ):
+        absolute_root = Path(os.path.abspath(os.fspath(root)))
+        for candidate in sorted(set(candidates)):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            absolute = Path(os.path.abspath(os.fspath(candidate)))
+            try:
+                relative = absolute.relative_to(absolute_root)
+                if excluded(relative) or _path_contains_link_or_reparse(absolute):
+                    raise InvalidState("review adapter source contains indirection")
+                before = absolute.stat(follow_symlinks=False)
+                content = absolute.read_bytes()
+                after = absolute.stat(follow_symlinks=False)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise InvalidState("review adapter source could not be frozen") from exc
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or not stat.S_ISREG(after.st_mode)
+                or len(content) != after.st_size
+            ):
+                raise InvalidState("review adapter source changed while freezing")
+            manifest[f"{label}/{relative.as_posix()}"] = sha256_bytes(content)
+    if not manifest:
+        raise InvalidState("review adapter source manifest is empty")
+    return dict(sorted(manifest.items()))
+
+
+def _frozen_review_resources(
+    core_root: Path,
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, bytes], str, str, dict[str, str], str] | None:
+    """Freeze the exact core/test payload that the independent reviewer will see."""
+    roots = snapshot.get("roots") if isinstance(snapshot, dict) else None
+    if not isinstance(roots, dict) or not {
+        "shared-core", "codex-adapter", "claude-adapter"
+    } <= set(roots):
+        return None
+    try:
+        resources = bound_resource_map()
+    except RuntimeBundleError as exc:
+        raise InvalidState("bound review resources are unavailable") from exc
+    if resources is None:
         try:
-            resolved = candidate.resolve(strict=True)
-        except (OSError, RuntimeError):
+            version = (core_root / "VERSION").read_text(encoding="utf-8").strip()
+            inspected = inspect_runtime_bundle(build_runtime_bundle(core_root, version))
+            resources = dict(inspected["members"])
+        except (OSError, RuntimeError, ValueError, RuntimeBundleError) as exc:
+            raise InvalidState("review source could not be frozen") from exc
+    # Small synthetic tests may bind only the runner. They still exercise the
+    # immutable runner transport, but are not a publishable full review source.
+    if "supervisor_core/__init__.py" not in resources:
+        return None
+    snapshot_files = snapshot.get("files") if isinstance(snapshot, dict) else None
+    if not isinstance(snapshot_files, dict):
+        raise InvalidState("trusted review source snapshot is unavailable")
+    for logical, record in snapshot_files.items():
+        if not isinstance(logical, str) or not logical.startswith("shared-core/"):
             continue
-        if resolved.is_file() and (os.name == "nt" or os.access(resolved, os.X_OK)):
-            executable_hash = sha256_file(resolved)
-            return [str(resolved), *command[1:]], str(resolved), executable_hash
-    raise FileNotFoundError(f"registered gate executable was not found in trusted PATH entries: {token}")
+        relative = logical.removeprefix("shared-core/")
+        content = resources.get(relative)
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != "hashed"
+            or not isinstance(content, bytes)
+            or record.get("sha256") != sha256_bytes(content)
+            or record.get("size") != len(content)
+        ):
+            raise InvalidState("frozen review source does not match the round snapshot")
+    core_manifest = {
+        f"global-core/{name}": sha256_bytes(content)
+        for name, content in sorted(resources.items())
+    }
+    profile_root = _review_profile_root(roots)
+    adapter_manifest = _review_adapter_manifest(roots)
+    return (
+        resources,
+        profile_root,
+        canonical_sha256(core_manifest),
+        adapter_manifest,
+        canonical_sha256(adapter_manifest),
+    )
+
+
+def _trusted_core_runner_command(
+    state: dict[str, Any], gate_id: str, gate: dict[str, Any]
+) -> list[str]:
+    """Resolve and freeze the source-snapshotted core review runner, fail closed."""
+    if gate.get("trusted_core_runner") is not True:
+        raise InvalidState(f"quality gate {gate_id} is not an immutable trusted-core runner")
+    marker = list(gate.get("command") or [])
+    expected_category = {
+        "review.coderabbit": "independent",
+        "review.coderabbit.test-integrity": "test-integrity",
+    }.get(gate_id)
+    expected_marker = [
+        "supervisor-trusted-core-runner",
+        "bin/run-coderabbit-review.py",
+        "--review-category",
+        expected_category,
+    ]
+    if expected_category is None or marker != expected_marker:
+        raise InvalidState("trusted-core runner declaration is not exact")
+    bound_identity = bound_release_identity()
+    core_root = Path(os.path.abspath(os.fspath(
+        Path(str(bound_identity["path"]))
+        if isinstance(bound_identity, dict)
+        else Path(__file__).parent.parent
+    )))
+    runner = core_root / "bin" / "run-coderabbit-review.py"
+    bundled_content = bound_resource_bytes("bin/run-coderabbit-review.py")
+    if bundled_content is not None:
+        content = bundled_content
+    else:
+        try:
+            if _path_contains_link_or_reparse(core_root) or _path_contains_link_or_reparse(runner):
+                raise InvalidState("trusted-core runner path contains indirection")
+            before = os.stat(runner, follow_symlinks=False)
+            content = runner.read_bytes()
+            after = os.stat(runner, follow_symlinks=False)
+        except OSError as exc:
+            raise InvalidState("trusted-core runner is unavailable") from exc
+        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if (
+            identity_before != identity_after
+            or not stat.S_ISREG(after.st_mode)
+            or len(content) != after.st_size
+        ):
+            raise InvalidState("trusted-core runner changed during verification")
+    snapshot = state.get("supervisor_source_snapshot")
+    snapshot_files = snapshot.get("files") if isinstance(snapshot, dict) else None
+    snapshot_roots = snapshot.get("roots") if isinstance(snapshot, dict) else None
+    logical = "shared-core/bin/run-coderabbit-review.py"
+    source_record = snapshot_files.get(logical) if isinstance(snapshot_files, dict) else None
+    if (
+        not isinstance(snapshot_roots, dict)
+        or os.path.normcase(str(snapshot_roots.get("shared-core") or ""))
+        != os.path.normcase(str(core_root))
+        or not isinstance(source_record, dict)
+        or source_record.get("status") != "hashed"
+        or source_record.get("sha256") != sha256_bytes(content)
+        or source_record.get("size") != len(content)
+    ):
+        raise InvalidState("trusted-core runner does not match the active source snapshot")
+    executable = Path(sys.executable)
+    if not executable.is_absolute() or not executable.is_file():
+        raise InvalidState("trusted Python executable is unavailable")
+    frozen = _frozen_review_resources(core_root, snapshot)
+    if frozen is None:
+        resources: dict[str, bytes] = {}
+        profile_root = None
+        core_manifest_sha256 = None
+        adapter_manifest: dict[str, str] = {}
+        adapter_manifest_sha256 = None
+        bootstrap = (
+            "import sys;"
+            "logical=sys.argv.pop(1);"
+            "source=sys.stdin.buffer.read();"
+            "sys.argv[0]=logical;"
+            "scope={'__name__':'__main__','__file__':logical,'__package__':None,'__spec__':None};"
+            "exec(compile(source,logical,'exec'),scope,scope)"
+        )
+    else:
+        (
+            resources,
+            profile_root,
+            core_manifest_sha256,
+            adapter_manifest,
+            adapter_manifest_sha256,
+        ) = frozen
+        bootstrap = (
+            "import base64,json,sys,types\n"
+            "logical=sys.argv.pop(1)\n"
+            "raw=sys.stdin.buffer.read()\n"
+            "frame=json.loads(raw.decode('ascii'))\n"
+            "assert frame.get('contract')=='SupervisorReviewSourceFrame/v1'\n"
+            "encoded=frame.get('resources')\n"
+            "assert isinstance(encoded,dict) and encoded\n"
+            "resources={k:base64.b64decode(v,validate=True) for k,v in encoded.items()}\n"
+            "source=resources['bin/run-coderabbit-review.py']\n"
+            "runtime=types.ModuleType('_agent_supervisor_review_source')\n"
+            "runtime.contract='SupervisorReviewSource/v1'\n"
+            "runtime.resources=resources\n"
+            "runtime.profile_root=frame.get('profile_root')\n"
+            "runtime.core_manifest_sha256=frame.get('core_manifest_sha256')\n"
+            "sys.modules[runtime.__name__]=runtime\n"
+            "sys.argv[0]=logical\n"
+            "scope={'__name__':'__main__','__file__':logical,'__package__':None,'__spec__':None}\n"
+            "exec(compile(source,logical,'exec'),scope,scope)"
+        )
+    return _FrozenGateCommand([
+        str(executable),
+        "-I",
+        "-S",
+        "-X",
+        "utf8",
+        "-c",
+        bootstrap,
+        logical,
+        "--review-category",
+        str(expected_category),
+    ], content, review_resources=resources, review_profile_root=profile_root,
+        review_core_manifest_sha256=core_manifest_sha256,
+        review_adapter_manifest=adapter_manifest,
+        review_adapter_manifest_sha256=adapter_manifest_sha256)
 
 
 def _evaluate_builtin_gate(
     state: dict[str, Any], events: list[dict[str, Any]], builtin: str, *, finalize_internal: bool
 ) -> tuple[int, dict[str, Any]]:
-    from .validation import successful_invocations
-
     if builtin == "intent-coverage":
         intents = state.get("intents", [])
         manifest = state.get("intent_manifest", [])
-        success_caps, _, invocation_errors = successful_invocations(events)
+        success_caps, _, invocation_errors = _completion_trusted_invocations(
+            state, events
+        )
         failures = list(invocation_errors)
         expected_manifest: list[dict[str, str]] = []
         if not isinstance(intents, list) or not intents:
@@ -589,7 +1964,9 @@ def _evaluate_builtin_gate(
             if status == "covered":
                 capabilities = {str(value) for value in intent.get("capability_ids", []) if isinstance(value, str)}
                 if not capabilities.intersection(success_caps):
-                    failures.append(f"{intent.get('intent_id')}: no successful correlated invocation")
+                    failures.append(
+                        f"{intent.get('intent_id')}: no completion-trusted correlated invocation and no locally-audited correlated capability invocation"
+                    )
         if manifest != expected_manifest:
             failures.append("intent manifest does not match the immutable request split")
         artifact = {"builtin": builtin, "intent_count": len(intents), "failures": failures}
@@ -638,28 +2015,243 @@ def _evaluate_builtin_gate(
 
 
 def _run_registered_gate(
-    ctx: StateContext, payload: dict[str, Any], *, finalize_internal: bool = False
+    ctx: StateContext, payload: dict[str, Any], *, finalize_internal: bool = False,
+    codex_core_internal: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     request = _record_from_payload(payload, "gate_run")
     gate_id = str(request.get("gate_id") or "").strip()
     criterion_id = str(request.get("criterion_id") or "").strip()
+    if (
+        str(ctx.runtime).strip().casefold() == "codex"
+        and not finalize_internal
+        and not codex_core_internal
+    ):
+        allowed_request_fields = {"gate_id", "criterion_id", "evidence_id"}
+        if set(request) - allowed_request_fields or str(payload.get("actor") or "").strip():
+            raise InvalidState(
+                "Codex gate_run caller may request only gate_id, criterion_id, and evidence_id"
+            )
+        if not gate_id or not criterion_id:
+            raise InvalidState("gate_run requires gate_id and criterion_id")
+        state = ctx.load()
+        if _registered_gate(state, gate_id) is None:
+            raise InvalidState(f"gate is not registered in QualityProfile: {gate_id}")
+        invocation_id = _unique_finalize_invocation_id(ctx.events())
+        ctx.append_event(_core_gate_invocation_event(
+            state,
+            invocation_id=invocation_id,
+            gate_id=gate_id,
+            criterion_id=criterion_id,
+            stage="attempt",
+            result=None,
+        ))
+        internal_record = {
+            "gate_id": gate_id,
+            "criterion_id": criterion_id,
+            "collector": "supervisor-core",
+            "collector_responsibility_group": "trusted-core-gate-execution",
+            "collector_invocation_id": invocation_id,
+        }
+        if request.get("evidence_id") is not None:
+            internal_record["evidence_id"] = request["evidence_id"]
+        try:
+            outcome = _run_registered_gate(
+                ctx,
+                {
+                    "event_type": "gate_run",
+                    "actor": "supervisor-core",
+                    "record": internal_record,
+                },
+                codex_core_internal=True,
+            )
+            gate_result = "success" if int(outcome[2]) == EXIT_COMPLETE else "failed"
+        except BaseException:
+            ctx.append_event(_core_gate_invocation_event(
+                state,
+                invocation_id=invocation_id,
+                gate_id=gate_id,
+                criterion_id=criterion_id,
+                stage="result",
+                result="failed",
+            ))
+            raise
+        ctx.append_event(_core_gate_invocation_event(
+            state,
+            invocation_id=invocation_id,
+            gate_id=gate_id,
+            criterion_id=criterion_id,
+            stage="result",
+            result=gate_result,
+        ))
+        if (
+            gate_result == "success"
+            and outcome[0].get("gate_id")
+            in {"review.coderabbit", "review.coderabbit.test-integrity"}
+            and isinstance(outcome[0].get("review_output_artifact"), dict)
+        ):
+            _issue_automated_external_review(
+                ctx,
+                evidence=outcome[0],
+                execution=outcome[1],
+                review_output=outcome[0]["review_output_artifact"],
+            )
+        return outcome
     collector = str(payload.get("actor") or request.get("collector") or "runtime").strip()
     collector_group = str(request.get("collector_responsibility_group") or "runtime").strip()
-    if not gate_id or not criterion_id or not collector or not collector_group:
-        raise InvalidState("gate_run requires gate_id, criterion_id, actor, and collector_responsibility_group")
+    collector_invocation_id = str(request.get("collector_invocation_id") or "").strip()
+    if not gate_id or not criterion_id or not collector or not collector_group or not collector_invocation_id:
+        raise InvalidState(
+            "gate_run requires gate_id, criterion_id, actor, collector_responsibility_group, "
+            "and collector_invocation_id"
+        )
     state = ctx.load()
+    completion_trusted_attempt = _trusted_invocation_attempt(
+        state, ctx.events(), collector_invocation_id, collector, collector_group
+    )
+    attempt = completion_trusted_attempt or _bound_audit_invocation_attempt(
+        state, ctx.events(), collector_invocation_id, collector, collector_group
+    )
+    if attempt is None:
+        raise InvalidState(
+            "gate_run collector lacks a locally attested active-round invocation attempt"
+        )
+    collector_identity_assurance = str(attempt.get("identity_assurance") or "")
+    collector_completion_eligible = completion_trusted_attempt is not None
+    if finalize_internal:
+        attempt_details = (
+            attempt.get("details")
+            if isinstance(attempt.get("details"), dict)
+            else {}
+        )
+        if not (
+            collector == "supervisor-core"
+            and collector_group == "trusted-runtime"
+            and collector_identity_assurance == "core-trusted-finalize"
+            and attempt.get("capability") == f"supervisor-core-builtin:{gate_id}"
+            and attempt_details.get("phase") == "builtin-finalize"
+            and attempt_details.get("gate_id") == gate_id
+            and attempt_details.get("criterion_id") == criterion_id
+        ):
+            raise InvalidState(
+                "trusted finalize gate invocation identity/group/binding mismatch"
+            )
+    if codex_core_internal:
+        attempt_details = (
+            attempt.get("details")
+            if isinstance(attempt.get("details"), dict)
+            else {}
+        )
+        if not (
+            collector == "supervisor-core"
+            and collector_group == "trusted-core-gate-execution"
+            and collector_identity_assurance == "core-executed-gate"
+            and attempt.get("capability") == f"supervisor-core-gate:{gate_id}"
+            and attempt_details.get("phase") == "registered-gate-execution"
+            and attempt_details.get("gate_id") == gate_id
+            and attempt_details.get("criterion_id") == criterion_id
+        ):
+            raise InvalidState(
+                "core-executed gate invocation identity/group/binding mismatch"
+            )
     source_snapshot_hash = _verify_current_source_snapshot(ctx, state)
     gate = _registered_gate(state, gate_id)
     if not gate:
         raise InvalidState(f"gate is not registered in QualityProfile: {gate_id}")
+    executable_registry = (
+        {}
+        if gate.get("builtin")
+        else _verified_executable_registry(ctx, state)
+    )
     global_gates_at_start = _global_gate_ids(state)
-    gate_active_identity = active_version_snapshot() if gate_id in global_gates_at_start else None
+    gate_active_identity = _execution_release_identity() if gate_id in global_gates_at_start else None
     command = list(gate.get("command") or [])
     if not command and not gate.get("builtin"):
         raise InvalidState(f"registered gate has no executable command or builtin: {gate_id}")
+    runtime_input_bytes: bytes | None = None
+    if gate.get("trusted_core_runner") is True:
+        frozen_runtime_command = _trusted_core_runner_command(
+            state, gate_id, gate
+        )
+        runtime_command = list(frozen_runtime_command)
+        runtime_input_bytes = (
+            frozen_runtime_command.execution_input_bytes()
+            if isinstance(frozen_runtime_command, _FrozenGateCommand)
+            else getattr(frozen_runtime_command, "input_bytes", None)
+        )
+        review_core_manifest_sha256 = getattr(
+            frozen_runtime_command, "review_core_manifest_sha256", None
+        )
+        review_adapter_manifest = getattr(
+            frozen_runtime_command, "review_adapter_manifest", None
+        )
+        review_adapter_manifest_sha256 = getattr(
+            frozen_runtime_command, "review_adapter_manifest_sha256", None
+        )
+    else:
+        runtime_command = command
+        review_core_manifest_sha256 = None
+        review_adapter_manifest = None
+        review_adapter_manifest_sha256 = None
+    review_binding = (
+        _review_binding_input(
+            state,
+            supervisor_source_snapshot_sha256=(
+                source_snapshot_hash if review_core_manifest_sha256 else None
+            ),
+            review_core_manifest_sha256=review_core_manifest_sha256,
+            review_adapter_manifest=review_adapter_manifest,
+            review_adapter_manifest_sha256=review_adapter_manifest_sha256,
+        )
+        if _requires_review_binding_file(gate_id) and not gate.get("builtin")
+        else None
+    )
+    review_binding_input_sha256 = (
+        canonical_sha256(review_binding) if isinstance(review_binding, dict) else None
+    )
     precondition_command = list(gate["precondition"]) if gate.get("precondition") else None
+    if redact(command) != command or (
+        precondition_command is not None
+        and redact(precondition_command) != precondition_command
+    ):
+        raise InvalidState(
+            "registered gate command contains inline sensitive data; use a credential-free wrapper or environment indirection"
+        )
     execution_id = stable_id("execution")
     evidence_id = str(request.get("evidence_id") or stable_id("evidence"))
+    if any(
+        isinstance(event, dict)
+        and event.get("event_type") == "gate_grant"
+        and event.get("collector_invocation_id") == collector_invocation_id
+        and event.get("gate_id") == gate_id
+        and event.get("criterion_id") == criterion_id
+        for event in ctx.events()
+    ):
+        raise InvalidState("gate_run grant for this runner/gate/criterion was already consumed")
+    if any(
+        isinstance(record, dict) and record.get("evidence_id") == evidence_id
+        for record in state.get("evidence", [])
+    ):
+        raise InvalidState("gate_run evidence_id already exists")
+    gate_grant_id = stable_id("gate-grant")
+    gate_grant = {
+        "contract": "GateGrant/v3",
+        "event_type": "gate_grant",
+        "grant_id": gate_grant_id,
+        "execution_id": execution_id,
+        "evidence_id": evidence_id,
+        "gate_id": gate_id,
+        "criterion_id": criterion_id,
+        "collector": collector,
+        "collector_responsibility_group": collector_group,
+        "collector_invocation_id": collector_invocation_id,
+        "collector_identity_assurance": collector_identity_assurance,
+        "collector_completion_eligible": collector_completion_eligible,
+        "review_binding_input_sha256": review_binding_input_sha256,
+        "issued_at": utc_now(),
+        **_invocation_state_binding(state),
+    }
+    gate_grant["attestation"] = sign_record(gate_grant)
+    ctx.append_event(gate_grant)
     started_at = utc_now()
     resolved_executable: str | None = None
     resolved_executable_sha256: str | None = None
@@ -667,30 +2259,73 @@ def _run_registered_gate(
     command_executed = True
     infrastructure_degraded = False
     gate_timeout = _gate_timeout_seconds(request.get("timeout_seconds"))
+    review_binding_temp: tempfile.TemporaryDirectory[str] | None = None
+    gate_extra_env: dict[str, str] | None = None
+    if isinstance(review_binding, dict):
+        review_binding_temp = tempfile.TemporaryDirectory(
+            prefix="agent-supervisor-review-binding-"
+        )
+        review_binding_file = Path(review_binding_temp.name) / "binding.json"
+        atomic_write_json(review_binding_file, review_binding)
+        gate_extra_env = {
+            "AGENT_SUPERVISOR_REVIEW_BINDING_FILE": str(review_binding_file.resolve()),
+        }
 
-    def run_external_step(step_command: list[str], category: str) -> dict[str, Any]:
+    def run_external_step(
+        step_command: list[str],
+        category: str,
+        *,
+        input_bytes: bytes | None = None,
+        isolated_environment: bool = False,
+    ) -> dict[str, Any]:
         step_started = utc_now()
         step_resolved: str | None = None
         step_resolved_sha256: str | None = None
         failure_kind: str | None = None
+        step_stdout = ""
+        step_stderr = ""
+        stdout_truncated = False
+        stderr_truncated = False
         try:
             resolved_command, step_resolved, step_resolved_sha256 = _resolve_gate_command(
-                step_command, cwd=str(state.get("workspace") or ctx.workspace)
+                step_command,
+                cwd=str(state.get("workspace") or ctx.workspace),
+                trusted_registry=executable_registry,
+            )
+            execution_env = (
+                _isolated_review_environment(executable_registry, gate_extra_env)
+                if isolated_environment
+                else {
+                    **dict(gate_extra_env or {}),
+                    "PATH": trusted_path(executable_registry),
+                    "NoDefaultCurrentDirectoryInExePath": "1",
+                }
             )
             completed = _run_gate_subprocess_bounded(
                 resolved_command,
                 cwd=str(state.get("workspace") or ctx.workspace),
                 timeout_seconds=gate_timeout,
+                extra_env=execution_env,
+                input_bytes=input_bytes,
+                replace_env=isolated_environment,
             )
             step_exit = int(completed["exit_code"])
+            step_stdout = str(completed["stdout"] or "")
+            step_stderr = str(completed["stderr"] or "")
+            stdout_truncated = bool(completed["stdout_truncated"])
+            stderr_truncated = bool(completed["stderr_truncated"])
             raw_output = (
-                (completed["stdout"] or "")
-                + ("\n" if completed["stdout"] and completed["stderr"] else "")
-                + (completed["stderr"] or "")
+                step_stdout
+                + ("\n" if step_stdout and step_stderr else "")
+                + step_stderr
             )
-            if completed["stdout_truncated"] or completed["stderr_truncated"]:
+            if stdout_truncated or stderr_truncated:
                 raw_output = "[bounded gate output truncated]\n" + raw_output
             failure_kind = "timeout" if completed["timed_out"] else None
+            if not completed.get("stdin_complete", True):
+                step_exit = 127
+                raw_output = "trusted gate input delivery failed"
+                failure_kind = "unavailable"
         except OSError as exc:
             step_exit = 127
             raw_output = type(exc).__name__
@@ -698,7 +2333,7 @@ def _run_registered_gate(
         clean_step_output = str(redact(raw_output))
         step_summary = clean_step_output[-4000:].strip() or f"{category} produced no output"
         return {
-            "command": {"category": category, "args": list(step_command)},
+            "command": _command_audit_record(category, step_command),
             "resolved_executable": step_resolved,
             "resolved_executable_sha256": step_resolved_sha256,
             "started_at": step_started,
@@ -708,38 +2343,78 @@ def _run_registered_gate(
             "output_sha256": sha256_text(clean_step_output),
             "failure_kind": failure_kind,
             "raw_output": clean_step_output,
+            "raw_stdout": step_stdout,
+            "raw_stderr": step_stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }
 
-    if gate.get("builtin"):
-        exit_code, artifact = _evaluate_builtin_gate(
-            state, ctx.events(), str(gate["builtin"]), finalize_internal=finalize_internal
-        )
-        combined = json.dumps(artifact, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    else:
-        if precondition_command:
-            precondition = run_external_step(precondition_command, "quality-gate-precondition")
-            infrastructure_degraded = precondition["failure_kind"] is not None
-        if precondition is not None and precondition["exit_code"] != 0:
-            command_executed = False
-            exit_code = int(precondition["exit_code"])
-            combined = f"precondition failed\n{precondition['raw_output']}"
+    review_output_artifact: dict[str, Any] | None = None
+    main_step: dict[str, Any] | None = None
+    try:
+        if gate.get("builtin"):
+            exit_code, artifact = _evaluate_builtin_gate(
+                state, ctx.events(), str(gate["builtin"]), finalize_internal=finalize_internal
+            )
+            combined = json.dumps(artifact, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         else:
-            main_step = run_external_step(command, "quality-gate")
-            resolved_executable = main_step["resolved_executable"]
-            resolved_executable_sha256 = main_step["resolved_executable_sha256"]
-            exit_code = int(main_step["exit_code"])
-            combined = str(main_step["raw_output"])
-            infrastructure_degraded = infrastructure_degraded or main_step["failure_kind"] is not None
-    if precondition is not None:
-        precondition.pop("raw_output", None)
+            if precondition_command:
+                precondition = run_external_step(precondition_command, "quality-gate-precondition")
+                infrastructure_degraded = precondition["failure_kind"] is not None
+            if precondition is not None and precondition["exit_code"] != 0:
+                command_executed = False
+                exit_code = int(precondition["exit_code"])
+                combined = f"precondition failed\n{precondition['raw_output']}"
+            else:
+                main_step = run_external_step(
+                    runtime_command,
+                    "quality-gate",
+                    input_bytes=runtime_input_bytes,
+                    isolated_environment=gate.get("trusted_core_runner") is True,
+                )
+                resolved_executable = main_step["resolved_executable"]
+                resolved_executable_sha256 = main_step["resolved_executable_sha256"]
+                exit_code = int(main_step["exit_code"])
+                combined = str(main_step["raw_output"])
+                infrastructure_degraded = infrastructure_degraded or main_step["failure_kind"] is not None
+                if isinstance(review_binding, dict) and exit_code == 0:
+                    review_output_artifact, artifact_reason = _parse_review_gate_output(
+                        str(main_step.get("raw_stdout") or ""),
+                        str(main_step.get("raw_stderr") or ""),
+                        review_binding,
+                        stdout_truncated=bool(main_step.get("stdout_truncated")),
+                        stderr_truncated=bool(main_step.get("stderr_truncated")),
+                    )
+                    if review_output_artifact is None:
+                        exit_code = 2
+                        combined = (
+                            f"review gate artifact output rejected: {artifact_reason}\n"
+                            f"{main_step['raw_output']}"
+                        )
+    finally:
+        if review_binding_temp is not None:
+            review_binding_temp.cleanup()
+    try:
+        post_source_snapshot_hash = _verify_current_source_snapshot(ctx)
+        if post_source_snapshot_hash != source_snapshot_hash:
+            raise SupervisorSourceSnapshotMismatch("source-changed-during-gate")
+    except SupervisorSourceSnapshotMismatch as exc:
+        exit_code = 4
+        infrastructure_degraded = True
+        combined = f"trusted source changed during gate: {type(exc).__name__}"
+    # Raw streams are transient parsing inputs only.  In particular, review
+    # gates need their exact stdout long enough to validate the immutable
+    # artifact, but no raw stdout/stderr may enter state or the event ledger.
+    for step in (precondition, main_step):
+        if isinstance(step, dict):
+            for field in ("raw_output", "raw_stdout", "raw_stderr"):
+                step.pop(field, None)
     clean_output = str(redact(combined))
     summary = clean_output[-4000:].strip() or f"gate {gate_id} produced no output"
     finished_at = utc_now()
     changes = state.get("changes", {}) if isinstance(state.get("changes"), dict) else {}
     baseline = state.get("workspace_baseline", {}) if isinstance(state.get("workspace_baseline"), dict) else {}
-    bound_base = str(changes.get("base") or baseline.get("snapshot_hash") or sha256_text("no-change-base"))
-    bound_head = str(changes.get("head") or baseline.get("snapshot_hash") or sha256_text("no-change-head"))
-    bound_diff = str(changes.get("diff_hash") or sha256_text("no-change"))
+    binding = _gate_binding(state)
     goal = state.get("goal", {}) if isinstance(state.get("goal"), dict) else {}
     execution = {
         "contract": "GateExecution/v3",
@@ -750,7 +2425,7 @@ def _run_registered_gate(
         "criterion_id": criterion_id,
         "goal_id": goal.get("goal_id"),
         "goal_version": goal.get("version"),
-        "command": {"category": "quality-gate", "args": command},
+        "command": _command_audit_record("quality-gate", command),
         "precondition": precondition,
         "command_executed": command_executed,
         "resolved_executable": resolved_executable,
@@ -765,13 +2440,27 @@ def _run_registered_gate(
         "output_summary": summary,
         "output_summary_sha256": sha256_text(summary),
         "artifact_hash": sha256_text(clean_output),
-        "base": bound_base,
-        "head": bound_head,
-        "diff_hash": bound_diff,
+        "base": binding.get("base"),
+        "head": binding.get("head"),
+        "git_object_format": binding.get("git_object_format"),
+        "git_binding_status": binding.get("git_binding_status"),
+        "git_binding_source": binding.get("git_binding_source"),
+        "git_repository_root": binding.get("git_repository_root"),
+        "review_artifact_sha256": binding.get("review_artifact_sha256"),
+        "git_diff_sha256": binding.get("git_diff_sha256"),
+        "workspace_base_sha256": binding.get("workspace_base_sha256"),
+        "workspace_head_sha256": binding.get("workspace_head_sha256"),
+        "diff_hash": binding.get("diff_hash"),
         "workspace_snapshot_hash": baseline.get("snapshot_hash"),
         "source_snapshot_hash": source_snapshot_hash,
         "collector": collector,
         "collector_responsibility_group": collector_group,
+        "collector_invocation_id": collector_invocation_id,
+        "collector_identity_assurance": collector_identity_assurance,
+        "collector_completion_eligible": collector_completion_eligible,
+        "review_binding_input_sha256": review_binding_input_sha256,
+        "review_output_artifact": copy.deepcopy(review_output_artifact),
+        "gate_grant_id": gate_grant_id,
         "status": "degraded" if infrastructure_degraded else ("success" if exit_code == 0 else "failed"),
     }
     # StateContext.transact supplies this field when absent. Bind it before
@@ -785,7 +2474,7 @@ def _run_registered_gate(
         "criterion_id": criterion_id,
         "goal_id": execution["goal_id"],
         "goal_version": execution["goal_version"],
-        "command": {"category": "quality-gate", "args": command},
+        "command": _command_audit_record("quality-gate", command),
         "precondition": precondition,
         "command_executed": command_executed,
         "resolved_executable": resolved_executable,
@@ -798,10 +2487,24 @@ def _run_registered_gate(
         "output_sha256": sha256_text(clean_output),
         "base": execution["base"],
         "head": execution["head"],
+        "git_object_format": execution["git_object_format"],
+        "git_binding_status": execution["git_binding_status"],
+        "git_binding_source": execution["git_binding_source"],
+        "git_repository_root": execution["git_repository_root"],
+        "review_artifact_sha256": execution["review_artifact_sha256"],
+        "git_diff_sha256": execution["git_diff_sha256"],
+        "workspace_base_sha256": execution["workspace_base_sha256"],
+        "workspace_head_sha256": execution["workspace_head_sha256"],
         "diff_hash": execution["diff_hash"],
         "source_snapshot_hash": source_snapshot_hash,
         "collector": collector,
         "collector_responsibility_group": collector_group,
+        "collector_invocation_id": collector_invocation_id,
+        "collector_identity_assurance": collector_identity_assurance,
+        "collector_completion_eligible": collector_completion_eligible,
+        "review_binding_input_sha256": review_binding_input_sha256,
+        "review_output_artifact": copy.deepcopy(review_output_artifact),
+        "gate_grant_id": gate_grant_id,
         "gate_id": gate_id,
         "relevant": True,
     }
@@ -823,11 +2526,15 @@ def _run_registered_gate(
         global_gates = _global_gate_ids(latest)
         kind: str | None = None
         values: dict[str, Any] = {}
-        if gate_id == "review.project-supervisor":
+        if collector_completion_eligible and gate_id == "review.project-supervisor":
             kind, values = "fixture_replay", {"passed": exit_code == 0}
-        elif gate_id == "config.historical-replay":
+        elif collector_completion_eligible and gate_id == "config.historical-replay":
             kind, values = "historical_replay", {"passed": exit_code == 0}
-        elif gate_id in global_gates and not infrastructure_degraded:
+        elif (
+            collector_completion_eligible
+            and gate_id in global_gates
+            and not infrastructure_degraded
+        ):
             kind, values = "global_gate", {
                 "result": "success" if exit_code == 0 else "failed",
                 "active_version": copy.deepcopy(gate_active_identity),
@@ -949,6 +2656,442 @@ def _run_registered_gate(
     return evidence, execution, EXIT_COMPLETE if exit_code == 0 else EXIT_INCOMPLETE
 
 
+def _issue_automated_external_review(
+    ctx: StateContext, *, evidence: dict[str, Any], execution: dict[str, Any],
+    review_output: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Mint an immutable external ReviewRecord from a core-executed gate only."""
+    state = ctx.load()
+    if str(state.get("runtime") or "").strip().casefold() != "codex":
+        return None
+    gate_id = str(evidence.get("gate_id") or "")
+    expected_category = {
+        "review.coderabbit": "independent",
+        "review.coderabbit.test-integrity": "test-integrity",
+    }.get(gate_id)
+    if expected_category is None or review_output.get("review_category") != expected_category:
+        raise InvalidState("automated external review category/gate mismatch")
+    events = ctx.events()
+    execution_id = str(execution.get("execution_id") or "")
+    ledger_executions = [
+        row
+        for row in events
+        if isinstance(row, dict)
+        and row.get("event_type") == "gate_execution"
+        and row.get("execution_id") == execution_id
+    ]
+    if (
+        execution.get("contract") != "GateExecution/v3"
+        or len(ledger_executions) != 1
+        or not verify_record(execution)
+        or not verify_record(ledger_executions[0])
+        or any(
+            ledger_executions[0].get(key) != value
+            for key, value in execution.items()
+        )
+    ):
+        raise InvalidState("automated external review GateExecution provenance invalid")
+    latest_event = events[-1] if events else None
+    execution_sequence = ledger_executions[0].get("sequence")
+    result_sequence = latest_event.get("sequence") if isinstance(latest_event, dict) else None
+    if (
+        not isinstance(latest_event, dict)
+        or latest_event.get("event_type") != "invocation_result"
+        or latest_event.get("invocation_id")
+        != evidence.get("collector_invocation_id")
+        or latest_event.get("result") != "success"
+        or not isinstance(execution_sequence, int)
+        or not isinstance(result_sequence, int)
+        or result_sequence != execution_sequence + 1
+    ):
+        raise InvalidState("automated external review is not the just-completed core execution")
+    state_evidence = [
+        row
+        for row in state.get("evidence", [])
+        if isinstance(row, dict)
+        and row.get("evidence_id") == evidence.get("evidence_id")
+    ]
+    if len(state_evidence) != 1 or state_evidence[0] != evidence:
+        raise InvalidState("automated external review evidence is not the persisted gate result")
+    provenance_fields = (
+        "evidence_id",
+        "execution_id",
+        "gate_id",
+        "criterion_id",
+        "goal_id",
+        "goal_version",
+        "collector",
+        "collector_responsibility_group",
+        "collector_invocation_id",
+        "collector_identity_assurance",
+        "collector_completion_eligible",
+        "gate_grant_id",
+        "source_snapshot_hash",
+        "review_binding_input_sha256",
+        "review_output_artifact",
+        *_BINDING_FIELDS,
+    )
+    if any(evidence.get(field) != execution.get(field) for field in provenance_fields):
+        raise InvalidState("automated external review evidence/execution binding mismatch")
+    if (
+        evidence.get("collector") != "supervisor-core"
+        or evidence.get("collector_responsibility_group")
+        != "trusted-core-gate-execution"
+        or evidence.get("collector_identity_assurance") != "core-executed-gate"
+        or evidence.get("collector_completion_eligible") is not True
+        or evidence.get("exit_code") != 0
+        or execution.get("status") != "success"
+        or review_output != evidence.get("review_output_artifact")
+        or review_output != execution.get("review_output_artifact")
+    ):
+        raise InvalidState("automated external review core collector provenance invalid")
+    runner_invocation_id = str(evidence.get("collector_invocation_id") or "")
+    if not _trusted_invocation_for_runtime(
+        events,
+        runner_invocation_id,
+        actor="supervisor-core",
+        responsibility_group="trusted-core-gate-execution",
+        state=state,
+    ):
+        raise InvalidState("automated external review lacks a trusted core gate success")
+    baseline = state.get("workspace_baseline")
+    observed: dict[str, Any] | None = None
+    if isinstance(baseline, dict):
+        current = capture_workspace_snapshot(
+            str(state.get("workspace") or ""),
+            [
+                value
+                for value in baseline.get("extra_globs", [])
+                if isinstance(value, str)
+            ],
+        )
+        observed = workspace_delta(baseline, current)
+    criterion_ids = {
+        str(row.get("criterion_id"))
+        for row in state.get("goal", {}).get("acceptance_criteria", [])
+        if isinstance(row, dict) and row.get("criterion_id")
+    }
+    evidence_state = copy.deepcopy(state)
+    evidence_state["evidence"] = [copy.deepcopy(evidence)]
+    evidence_errors: list[str] = []
+    _, verified_evidence, _ = _validate_evidence(
+        evidence_state,
+        criterion_ids,
+        events,
+        evidence_errors,
+        observed,
+    )
+    if evidence_errors or evidence.get("evidence_id") not in verified_evidence:
+        raise InvalidState("automated external review evidence failed core verification")
+    summary = review_output.get("review_summary")
+    if (
+        not isinstance(summary, dict)
+        or summary.get("engine") != "coderabbit"
+        or summary.get("authenticated") is not True
+        or summary.get("context_bound") is not True
+        or summary.get("status") != "pass"
+        or summary.get("blocking_findings") != 0
+        or summary.get("severity_counts", {}).get("critical") != 0
+        or summary.get("severity_counts", {}).get("major") != 0
+    ):
+        raise InvalidState("automated external review output is not an approval")
+    changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
+    if not changes.get("files"):
+        return None
+    if not (
+        changes.get("implementer") == "codex-local-workspace"
+        and changes.get("implementer_responsibility_group")
+        == "local-workspace-producer"
+        and changes.get("producer_identity_assurance")
+        == "core-observed-local-workspace"
+        and changes.get("issued_by") == "supervisor-core-workspace-observer"
+        and verify_record(changes)
+        and all(evidence.get(field) == changes.get(field) for field in _BINDING_FIELDS)
+    ):
+        raise InvalidState("automated external review lacks a core-observed producer binding")
+    artifact_sha256 = canonical_sha256(review_output)
+    review_id = f"review-coderabbit-{expected_category}-{str(execution.get('execution_id') or '')}"
+    if any(
+        isinstance(row, dict) and row.get("review_id") == review_id
+        for row in state.get("reviews", [])
+    ):
+        raise InvalidState("automated external review id already exists")
+    reviewer = (
+        "coderabbit-test-integrity"
+        if expected_category == "test-integrity"
+        else "coderabbit"
+    )
+    reviewer_group = (
+        "external-coderabbit-test-integrity"
+        if expected_category == "test-integrity"
+        else "external-coderabbit-independent-review"
+    )
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    findings = copy.deepcopy(summary.get("issues", []))
+    review = {
+        "contract": "ReviewRecord/v3",
+        "review_id": review_id,
+        "review_mode": "automated-external",
+        "review_category": expected_category,
+        "goal_id": goal.get("goal_id"),
+        "goal_version": goal.get("version"),
+        "reviewer": reviewer,
+        "reviewer_responsibility_group": reviewer_group,
+        "implementer": "codex-local-workspace",
+        "implementer_responsibility_group": "local-workspace-producer",
+        "gate_collector": "supervisor-core",
+        "gate_collector_responsibility_group": "trusted-core-gate-execution",
+        "gate_runner_invocation_id": evidence.get("collector_invocation_id"),
+        **{field: changes.get(field) for field in _BINDING_FIELDS},
+        "rerun_evidence_ids": [evidence.get("evidence_id")],
+        "evidence_verification": {
+            "status": "VERIFIED",
+            "reviewer": "supervisor-core-external-review-validator",
+            "evidence_ids": [evidence.get("evidence_id")],
+        },
+        "verdict": "APPROVE",
+        "implementer_invocation_id": changes.get("implementer_invocation_id"),
+        "reviewer_invocation_id": f"external-artifact-{artifact_sha256[:24]}",
+        "actor_identity_assurance": "core-attested-external-review",
+        "trust_domains": {
+            "producer": "core-observed-codex-local-workspace",
+            "reviewer": "authenticated-external-coderabbit",
+            "gate_execution": "core-executed-registered-gate",
+        },
+        "external_review_artifact_sha256": artifact_sha256,
+        "findings": findings,
+        "unresolved_p0_p1": 0,
+        "request_manifest_sha256": canonical_sha256(
+            state.get("request_manifest", {})
+        ),
+        "issued_by": "supervisor-core-automated-external-review",
+        "issued_at": utc_now(),
+    }
+    review["attestation"] = sign_record(review)
+    event = {
+        "contract": "ReviewFinalization/v3",
+        "event_type": "review_finalized",
+        "review_id": review_id,
+        "review_sha256": canonical_sha256(review),
+        "reviewer": reviewer,
+        "verdict": "APPROVE",
+        "review_category": expected_category,
+        "issued_at": review["issued_at"],
+        "transaction_id": stable_id("transaction"),
+    }
+    event["attestation"] = sign_record(event)
+
+    def persist_review(state_value: dict[str, Any]) -> None:
+        rows = state_value.setdefault("reviews", [])
+        if not isinstance(rows, list):
+            raise InvalidState("state.reviews must be an array")
+        if any(
+            isinstance(row, dict) and row.get("review_id") == review_id
+            for row in rows
+        ):
+            raise InvalidState("automated external review id already exists")
+        rows.append(copy.deepcopy(review))
+        state_value["updated_at"] = utc_now()
+
+    ctx.transact(persist_review, event)
+    return review
+
+
+def _finalize_review(ctx: StateContext, payload: dict[str, Any]) -> dict[str, Any]:
+    request = _record_from_payload(payload, "review_finalize")
+    if request.get("contract") != "ReviewRecord/v3":
+        raise InvalidState("review_finalize requires ReviewRecord/v3 assertion")
+    if any(key in request for key in ("attestation", "issued_by", "issued_at")):
+        raise InvalidState("review_finalize core-issued fields are caller-forbidden")
+    state = ctx.load()
+    _verify_current_source_snapshot(ctx, state)
+    events = ctx.events()
+    reviewer = str(payload.get("actor") or "").strip()
+    reviewer_group = str(request.get("reviewer_responsibility_group") or "").strip()
+    reviewer_invocation_id = str(request.get("reviewer_invocation_id") or "").strip()
+    gate_collector = str(request.get("gate_collector") or "").strip()
+    gate_collector_group = str(request.get("gate_collector_responsibility_group") or "").strip()
+    gate_runner_invocation_id = str(request.get("gate_runner_invocation_id") or "").strip()
+    if not all((reviewer, reviewer_group, reviewer_invocation_id, gate_collector, gate_collector_group, gate_runner_invocation_id)):
+        raise InvalidState("review_finalize reviewer and gate-runner identities are incomplete")
+    if request.get("reviewer") != reviewer:
+        raise InvalidState("review_finalize actor does not match reviewer assertion")
+    _, results, invocation_errors = successful_invocations(events)
+    if invocation_errors:
+        raise InvalidState("review_finalize invocation ledger is inconsistent")
+    reviewer_result = results.get(reviewer_invocation_id)
+    runner_result = results.get(gate_runner_invocation_id)
+    if (
+        not isinstance(reviewer_result, dict)
+        or reviewer_result.get("result") != "success"
+        or reviewer_result.get("actor") != reviewer
+        or not _trusted_invocation_for_runtime(
+            events, reviewer_invocation_id, actor=reviewer,
+            responsibility_group=reviewer_group, state=state
+        )
+    ):
+        raise InvalidState("review_finalize reviewer lacks a successful trusted invocation")
+    if (
+        not isinstance(runner_result, dict)
+        or runner_result.get("result") != "success"
+        or runner_result.get("actor") != gate_collector
+        or not _trusted_invocation_for_runtime(
+            events, gate_runner_invocation_id, actor=gate_collector,
+            responsibility_group=gate_collector_group, state=state
+        )
+    ):
+        raise InvalidState("review_finalize gate runner lacks a successful trusted invocation")
+    changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
+    implementer = str(changes.get("implementer") or "")
+    implementer_group = str(changes.get("implementer_responsibility_group") or "")
+    if (
+        not implementer
+        or request.get("implementer") != implementer
+        or request.get("implementer_responsibility_group") != implementer_group
+    ):
+        raise InvalidState("review_finalize implementer binding does not match changes")
+    implementer_invocation_id = str(changes.get("implementer_invocation_id") or "")
+    implementer_result = results.get(implementer_invocation_id)
+    if (
+        not isinstance(implementer_result, dict)
+        or implementer_result.get("result") != "success"
+        or implementer_result.get("actor") != implementer
+        or not _trusted_invocation_for_runtime(
+            events, implementer_invocation_id, actor=implementer,
+            responsibility_group=implementer_group, state=state
+        )
+    ):
+        raise InvalidState("review_finalize implementer lacks a successful trusted invocation")
+    if (
+        reviewer in {implementer, gate_collector}
+        or gate_collector == implementer
+        or reviewer_group in {implementer_group, gate_collector_group}
+        or gate_collector_group == implementer_group
+    ):
+        raise InvalidState("review_finalize requires three independent identities and responsibility groups")
+    if request.get("implementer_invocation_id") != implementer_invocation_id:
+        raise InvalidState("review_finalize implementer invocation does not match changes")
+    if any(request.get(field) != changes.get(field) for field in _BINDING_FIELDS):
+        raise InvalidState("review_finalize assertion is not bound to the active changes")
+    binding_errors: list[str] = []
+    observed: dict[str, Any] | None = None
+    baseline = (
+        state.get("workspace_baseline")
+        if isinstance(state.get("workspace_baseline"), dict)
+        else None
+    )
+    workspace_path = Path(str(state.get("workspace") or ""))
+    if isinstance(baseline, dict) and workspace_path.exists():
+        current = capture_workspace_snapshot(
+            str(workspace_path),
+            [
+                value for value in baseline.get("extra_globs", [])
+                if isinstance(value, str)
+            ],
+        )
+        observed = workspace_delta(baseline, current)
+        if set(map(str, changes.get("files", []))) != set(map(str, observed.get("files", []))):
+            binding_errors.append("changes files do not match the active workspace delta")
+        for field in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
+            if changes.get(field) != observed.get(field):
+                binding_errors.append(f"changes {field} does not match the active workspace delta")
+        if changes.get("git_binding_source") == "workspace":
+            for field in (
+                "base", "head", "git_object_format", "git_binding_status",
+                "git_binding_source", "git_repository_root",
+            ):
+                if changes.get(field) != observed.get(field):
+                    binding_errors.append(f"changes {field} does not match the active Git workspace")
+    _validate_live_or_artifact_binding(
+        state, changes, "review_finalize changes", binding_errors, observed=observed
+    )
+    if changes.get("git_binding_status") != "verified" or binding_errors:
+        raise InvalidState("review_finalize changes binding failed core verification")
+    rerun_ids = request.get("rerun_evidence_ids")
+    if (
+        not isinstance(rerun_ids, list)
+        or not rerun_ids
+        or not all(isinstance(value, str) and value.strip() for value in rerun_ids)
+        or len(set(rerun_ids)) != len(rerun_ids)
+    ):
+        raise InvalidState("review_finalize rerun_evidence_ids invalid")
+    evidence = {
+        str(record.get("evidence_id")): record
+        for record in state.get("evidence", [])
+        if isinstance(record, dict) and record.get("evidence_id")
+    }
+    if not set(rerun_ids).issubset(evidence):
+        raise InvalidState("review_finalize evidence is missing")
+    criterion_ids = {
+        str(row.get("criterion_id"))
+        for row in state.get("goal", {}).get("acceptance_criteria", [])
+        if isinstance(row, dict) and row.get("criterion_id")
+    }
+    evidence_state = copy.deepcopy(state)
+    evidence_state["evidence"] = [copy.deepcopy(evidence[value]) for value in rerun_ids]
+    evidence_errors: list[str] = []
+    _, verified_evidence, _ = _validate_evidence(
+        evidence_state, criterion_ids, events, evidence_errors, observed
+    )
+    if evidence_errors or not set(rerun_ids).issubset(verified_evidence):
+        raise InvalidState("review_finalize rerun evidence failed core verification")
+    for evidence_id in rerun_ids:
+        record = evidence[evidence_id]
+        if (
+            record.get("collector") != gate_collector
+            or record.get("collector_responsibility_group") != gate_collector_group
+            or record.get("collector_invocation_id") != gate_runner_invocation_id
+            or any(record.get(field) != changes.get(field) for field in _BINDING_FIELDS)
+        ):
+            raise InvalidState("review_finalize evidence is not bound to the declared independent gate runner")
+    verification = request.get("evidence_verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("status") != "VERIFIED"
+        or verification.get("reviewer") != reviewer
+        or verification.get("evidence_ids") != rerun_ids
+    ):
+        raise InvalidState("review_finalize evidence verification assertion invalid")
+    if request.get("verdict") not in {"APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION"}:
+        raise InvalidState("review_finalize verdict invalid")
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    if request.get("goal_id") != goal.get("goal_id") or request.get("goal_version") != goal.get("version"):
+        raise InvalidState("review_finalize goal binding invalid")
+    review_id = str(request.get("review_id") or "").strip()
+    if not review_id or any(
+        isinstance(record, dict) and record.get("review_id") == review_id
+        for record in state.get("reviews", [])
+    ):
+        raise InvalidState("review_finalize review_id missing or already used")
+    review = copy.deepcopy(request)
+    review["actor_identity_assurance"] = reviewer_result.get("identity_assurance")
+    review["request_manifest_sha256"] = canonical_sha256(state.get("request_manifest", {}))
+    review["issued_by"] = "supervisor-core-review-finalize"
+    review["issued_at"] = utc_now()
+    review["attestation"] = sign_record(review)
+    event = {
+        "contract": "ReviewFinalization/v3",
+        "event_type": "review_finalized",
+        "review_id": review_id,
+        "review_sha256": canonical_sha256(review),
+        "reviewer": reviewer,
+        "verdict": review.get("verdict"),
+        "issued_at": review["issued_at"],
+        "transaction_id": stable_id("transaction"),
+    }
+    event["attestation"] = sign_record(event)
+
+    def persist(state_value: dict[str, Any]) -> None:
+        rows = state_value.setdefault("reviews", [])
+        if not isinstance(rows, list):
+            raise InvalidState("state.reviews must be an array")
+        rows.append(copy.deepcopy(review))
+        state_value["updated_at"] = utc_now()
+
+    ctx.transact(persist, event)
+    return review
+
+
 def command_event(args: argparse.Namespace) -> int:
     ctx = _context(args, require_existing=True)
     payload = _clean_event_payload(args)
@@ -957,6 +3100,8 @@ def command_event(args: argparse.Namespace) -> int:
         raise InvalidState("gate_execution is reserved for the trusted core runner")
     if event_type == "rollout_observation":
         raise InvalidState("rollout_observation is reserved for trusted core executions/finalization")
+    if event_type == "review_record":
+        raise InvalidState("review_record is forbidden; use core-issued review_finalize")
     if event_type == "gate_run":
         try:
             evidence, execution, code = _run_registered_gate(ctx, payload)
@@ -980,6 +3125,16 @@ def command_event(args: argparse.Namespace) -> int:
             "state_file": str(ctx.state_file),
         })
         return code
+    if event_type == "review_finalize":
+        review = _finalize_review(ctx, payload)
+        _emit({
+            "ok": True,
+            "review_id": review["review_id"],
+            "verdict": review["verdict"],
+            "issued_by": review["issued_by"],
+            "state_file": str(ctx.state_file),
+        })
+        return EXIT_COMPLETE
     if event_type == "rollout_promote":
         record = _record_from_payload(payload, event_type)
         if record.get("contract") != "RolloutPromotion/v3":
@@ -1023,6 +3178,13 @@ def command_event(args: argparse.Namespace) -> int:
         recorded = ctx.append_event(payload)
         _emit({"ok": True, "event": recorded, "state_file": str(ctx.state_file), "active_mode": requested_mode})
         return EXIT_COMPLETE
+    if event_type == "changes_record" and str(ctx.runtime).strip().casefold() == "codex":
+        state_for_changes = ctx.load()
+        _verify_current_source_snapshot(ctx, state_for_changes)
+        caller_request = _record_from_payload(payload, event_type)
+        payload["record"] = _core_codex_changes_record(
+            state_for_changes, caller_request
+        )
     invocation_id = str(payload.get("invocation_id") or "")
     capability = str(payload.get("capability") or "")
     is_result = event_type in {"invocation_result", "skill_result"}
@@ -1036,9 +3198,12 @@ def command_event(args: argparse.Namespace) -> int:
     if event_type in {"invocation_attempt", "skill_attempt"}:
         if not invocation_id or not capability:
             raise InvalidState("invocation attempt requires --invocation-id and --capability")
-        breaker = ctx.load().get("capability_breakers", {}).get(capability, {})
+        breaker_state = ctx.load()
+        breaker = breaker_state.get("capability_breakers", {}).get(capability, {})
         if isinstance(breaker, dict) and breaker.get("open") is True:
-            fallback_id = str(breaker.get("fallback_id") or "").strip()
+            fallback_id = _breaker_fallback_id(
+                breaker_state, capability, breaker
+            )
             recorded = ctx.append_event({
                 "event_type": "invocation_fallback_required",
                 "invocation_id": invocation_id,
@@ -1058,6 +3223,9 @@ def command_event(args: argparse.Namespace) -> int:
             actor=str(payload.get("actor") or ctx.runtime),
             details=invocation_details,
             identity_assurance=invocation_assurance,
+            responsibility_group=(
+                str(payload.get("responsibility_group") or "").strip() or None
+            ),
         )
     elif is_result:
         if not invocation_id or not capability or args.result not in {"success", "failed", "refused", "cancelled", "manual-specialized"}:
@@ -1070,10 +3238,13 @@ def command_event(args: argparse.Namespace) -> int:
             actor=str(payload.get("actor") or ctx.runtime),
             details=invocation_details,
             identity_assurance=invocation_assurance,
+            responsibility_group=(
+                str(payload.get("responsibility_group") or "").strip() or None
+            ),
         )
     record_id: str | None = None
     needs_state_update = is_result or event_type in {
-        "task_record", "task_upsert", "evidence_record", "review_record", "claim_record",
+        "task_record", "task_upsert", "evidence_record", "claim_record",
         "waiver_record", "intent_disposition", "changes_record", "spec_record",
         "rollout_observation", "rollout_promote",
     } or payload.get("status") == "degraded" or payload.get("degraded_prior") is True
@@ -1184,7 +3355,7 @@ def command_finalize(args: argparse.Namespace) -> int:
             return state if isinstance(state, dict) else {}, False
 
     try:
-        from .validation import _profile_gates, _registered_gate_definitions
+        from .validation import _profile_gates, _registered_gate_definitions, _test_paths_changed
 
         state = ctx.load()
         _verify_current_source_snapshot(ctx, state)
@@ -1200,6 +3371,8 @@ def command_finalize(args: argparse.Namespace) -> int:
             if isinstance(row, dict) and row.get("domain")
         )
         required = _profile_gates(profile, domains)
+        if _test_paths_changed(changes):
+            required.add("review.coderabbit.test-integrity")
         definitions = _registered_gate_definitions(profile)
         passed = {
             str(row.get("gate_id")) for row in state.get("evidence", [])
@@ -1219,19 +3392,11 @@ def command_finalize(args: argparse.Namespace) -> int:
             )
             if criterion is None:
                 raise InvalidState(f"builtin gate has no acceptance criterion binding: {gate_id}")
-            _run_registered_gate(
+            _run_finalize_builtin_gate(
                 ctx,
-                {
-                    "event_type": "gate_run",
-                    "actor": "supervisor-core",
-                    "record": {
-                        "gate_id": gate_id,
-                        "criterion_id": criterion["criterion_id"],
-                        "collector": "supervisor-core",
-                        "collector_responsibility_group": "trusted-runtime",
-                    },
-                },
-                finalize_internal=True,
+                ctx.load(),
+                gate_id=gate_id,
+                criterion_id=str(criterion["criterion_id"]),
             )
     except Exception as exc:
         _, persisted = persist_degraded("builtin_finalize_degraded", exc, terminal=False)
@@ -1456,7 +3621,12 @@ def command_migrate(args: argparse.Namespace) -> int:
     return EXIT_COMPLETE
 
 
-def _execute_selftest(root: Path, base_temp: Path) -> int:
+def _execute_selftest(
+    root: Path,
+    base_temp: Path,
+    *,
+    environment: dict[str, str] | None = None,
+) -> int:
     tests_root = root / "tests"
     discovered_suites = sorted(
         path.relative_to(tests_root).as_posix()
@@ -1478,6 +3648,7 @@ def _execute_selftest(root: Path, base_temp: Path) -> int:
             errors="replace",
             timeout=300,
             check=False,
+            env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         collection_timed_out = True
@@ -1524,6 +3695,7 @@ def _execute_selftest(root: Path, base_temp: Path) -> int:
             errors="replace",
             timeout=1800,
             check=False,
+            env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         timed_out = True
@@ -1561,17 +3733,58 @@ def _execute_selftest(root: Path, base_temp: Path) -> int:
 
 
 def command_selftest(args: argparse.Namespace) -> int:
-    root = Path(__file__).resolve().parents[1]
-    temp_parent = root / ".pytest-tmp"
+    try:
+        registry = load_trusted_executable_registry()
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError) as exc:
+        _emit({"ok": False, "health": "degraded", "reason": type(exc).__name__})
+        return EXIT_DEGRADED
+    data_root = Path(str(registry["registry_path"])).parent
+    temp_parent = data_root / ".selftest-tmp"
     temp_parent.mkdir(parents=True, exist_ok=True)
     base_temp = temp_parent / f"selftest-{os.getpid()}-{sha256_text(utc_now())[:8]}"
     base_temp.mkdir(parents=False, exist_ok=False)
+    extracted: tempfile.TemporaryDirectory[str] | None = None
     try:
-        return _execute_selftest(root, base_temp)
+        resources = bound_resource_map()
+        if resources is None:
+            root = Path(__file__).resolve().parents[1]
+        else:
+            extracted = tempfile.TemporaryDirectory(
+                prefix="bound-runtime-", dir=temp_parent
+            )
+            root = Path(extracted.name)
+            for relative, content in sorted(resources.items()):
+                path = PurePosixPath(relative)
+                if (
+                    path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in path.parts)
+                    or not isinstance(content, bytes)
+                ):
+                    raise InvalidState("bound selftest resource path is invalid")
+                target = root.joinpath(*path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            if not (root / "tests").is_dir():
+                _emit({
+                    "ok": False,
+                    "health": "degraded",
+                    "reason": "bound-runtime-test-bundle-missing",
+                })
+                return EXIT_DEGRADED
+        environment = _isolated_review_environment(registry)
+        environment.update({
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(root),
+            "TEMP": str(base_temp),
+            "TMP": str(base_temp),
+        })
+        return _execute_selftest(root, base_temp, environment=environment)
     finally:
         # Collection failures, execution failures, result processing, and
         # output failures all share the same bounded cleanup guarantee.
         shutil.rmtree(base_temp, ignore_errors=True)
+        if extracted is not None:
+            extracted.cleanup()
 
 
 def _hook_context(
@@ -1635,8 +3848,70 @@ def _classify_goal_change(prompt: str, previous: dict[str, Any]) -> str:
     return "replace" if previous else "continue"
 
 
+def _routing_intents_for_start(
+    state: dict[str, Any], raw_atomic_intents: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Combine locked prior routing with raw current intents only in memory."""
+    persisted = state.get("intents")
+    if not isinstance(persisted, list) or not persisted:
+        return copy.deepcopy(raw_atomic_intents)
+    carried: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for row in persisted:
+        if not isinstance(row, dict):
+            continue
+        copied = copy.deepcopy(row)
+        if copied.get("carried_from_goal_version") is not None:
+            copied["_preserve_routing"] = True
+            carried.append(copied)
+        else:
+            current.append(copied)
+    if len(current) != len(raw_atomic_intents):
+        raise InvalidState("current atomic intent count changed before routing")
+    for persisted_row, raw_row in zip(current, raw_atomic_intents):
+        merged = copy.deepcopy(persisted_row)
+        for key in (
+            "text",
+            "domain",
+            "role",
+            "required_responsibility_groups",
+            "depends_on_intent_ids",
+        ):
+            if key in raw_row:
+                merged[key] = copy.deepcopy(raw_row[key])
+        carried.append(merged)
+    return carried
+
+
+def _privacy_safe_capability_route(
+    route: dict[str, Any], state: dict[str, Any], prompt: str
+) -> dict[str, Any]:
+    """Replace transient route prose with the state contract's opaque labels."""
+    safe = copy.deepcopy(route)
+    safe["message"] = f"sha256:{sha256_text(prompt)}"
+    safe_text_by_id = {
+        str(row.get("intent_id") or ""): str(row.get("text") or "")
+        for row in state.get("intents", [])
+        if isinstance(row, dict) and row.get("intent_id")
+    }
+    coverage = safe.get("coverage")
+    if isinstance(coverage, list):
+        for row in coverage:
+            if not isinstance(row, dict):
+                continue
+            intent_id = str(row.get("intent_id") or "")
+            persisted_text = safe_text_by_id.get(intent_id)
+            if persisted_text:
+                row["text"] = persisted_text
+            else:
+                row["text"] = f"Host intent sha256:{sha256_text(str(row.get('text') or ''))}"
+    return safe
+
+
 def _privacy_safe_prompt_contract(
-    prompt: str, project_config: dict[str, Any]
+    prompt: str,
+    project_config: dict[str, Any],
+    atomic_intents: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     """Derive a useful hash-bound contract without persisting the raw host prompt."""
     privacy = (
@@ -1644,7 +3919,10 @@ def _privacy_safe_prompt_contract(
         if isinstance(project_config.get("privacy"), dict)
         else {}
     )
-    atomic = split_intents(prompt)
+    atomic = normalize_intents(
+        atomic_intents if atomic_intents is not None else split_intents(prompt),
+        prompt,
+    )
     if privacy.get("persist_raw_prompts") is not False:
         return {}, atomic, False
 
@@ -1656,11 +3934,23 @@ def _privacy_safe_prompt_contract(
         intent_sha256 = sha256_text(str(intent.get("text") or ""))
         safe_text = f"Host intent {index} ({domain}) sha256:{intent_sha256}"
         safe_intent = {
-            key: copy.deepcopy(value)
-            for key, value in intent.items()
-            if key != "text"
+            "contract": "IntentCoverage/v3",
+            "intent_id": str(intent.get("intent_id") or f"intent-{index}"),
+            "text": safe_text,
+            "status": str(intent.get("status") or "deferred"),
+            "reason": "awaiting routing",
+            "capability_ids": copy.deepcopy(intent.get("capability_ids", [])),
+            "method": str(intent.get("method") or "capability"),
+            "phase": int(intent.get("phase") or 0),
+            "domain": domain,
+            "role": str(intent.get("role") or ""),
+            "required_responsibility_groups": copy.deepcopy(
+                intent.get("required_responsibility_groups", [])
+            ),
+            "depends_on_intent_ids": copy.deepcopy(
+                intent.get("depends_on_intent_ids", [])
+            ),
         }
-        safe_intent["text"] = safe_text
         safe_intents.append(safe_intent)
         safe_criteria.append(
             {
@@ -2029,8 +4319,15 @@ def command_hook(args: argparse.Namespace) -> int:
                 previous = json_load(Path(pointer["state_file"]), {}) if pointer.get("state_file") else {}
             change_mode = _classify_goal_change(prompt, previous)
             config, project = _project_identity(ns.project_file, ns.workspace)
+            raw_atomic_intents = normalize_intents(
+                split_intents(prompt), prompt
+            )
+            if not raw_atomic_intents:
+                raw_atomic_intents = normalize_intents(
+                    [{"text": prompt, "domain": "general"}], prompt
+                )
             safe_goal, safe_intents, raw_prompt_withheld = _privacy_safe_prompt_contract(
-                prompt, config
+                prompt, config, raw_atomic_intents
             )
             round_id = f"round-{sha256_text(session_key := (ns.session + prompt + utc_now()))[:16]}"
             ctx = StateContext.build(
@@ -2042,6 +4339,10 @@ def command_hook(args: argparse.Namespace) -> int:
                 state_root=getattr(ns, "state_root", None),
             )
             quality = read_quality_profile(config, ns.project_file, ns.workspace)
+            _reject_sensitive_contract_input(
+                {"project_config": config, "quality_profile": quality},
+                "UserPromptSubmit project contract",
+            )
             state = start_round(
                 ctx,
                 message=prompt,
@@ -2053,6 +4354,9 @@ def command_hook(args: argparse.Namespace) -> int:
                 intents_supplied=safe_intents,
                 trusted_authorizations=None,
             )
+            state, registry_degraded = _initialize_executable_registry(
+                ctx, state, shadow=False
+            )
             if raw_prompt_withheld:
                 privacy_record = {
                     "raw_prompt_persisted": False,
@@ -2063,11 +4367,65 @@ def command_hook(args: argparse.Namespace) -> int:
                     "updated_at": utc_now(),
                 }))
             state = _initialize_cli_source_snapshot(ctx, state, shadow=False)
+            route: dict[str, Any] | None = None
+            try:
+                roots, inventory, discovery = _trusted_capability_discovery(
+                    config, ctx.workspace, ns.runtime, []
+                )
+                supplied_intents = _routing_intents_for_start(
+                    state, raw_atomic_intents
+                )
+                routed = route_intents(
+                    message=prompt,
+                    inventory=inventory,
+                    supplied_intents=supplied_intents,
+                    phase_budget=3,
+                    zero_skill_reviewed=False,
+                )
+                route = (
+                    _privacy_safe_capability_route(routed, state, prompt)
+                    if raw_prompt_withheld
+                    else routed
+                )
+                route["inventory_sha256"] = discovery["inventory_sha256"]
+
+                def persist_capabilities(current: dict[str, Any]) -> None:
+                    current["capability_inventory"] = copy.deepcopy(inventory)
+                    current["discovery"] = copy.deepcopy(discovery)
+                    current["capability_route"] = copy.deepcopy(route)
+                    current["intents"] = copy.deepcopy(route.get("coverage", []))
+                    current["updated_at"] = utc_now()
+
+                state = ctx.update(persist_capabilities)
+            except Exception as exc:
+                degradation = {
+                    "contract": "CapabilityBootstrapDegradation/v3",
+                    "stage": "native-hook-bootstrap",
+                    "reason_code": "capability-native-hook-bootstrap-failed",
+                    "error_type": type(exc).__name__,
+                    "recorded_at": utc_now(),
+                }
+                state = ctx.update(lambda current: current.update({
+                    "health": "degraded",
+                    "capability_bootstrap_degradation": degradation,
+                    "updated_at": utc_now(),
+                }))
             if isinstance(adapter, dict) and adapter.get("degraded_prior") is True:
                 state = ctx.update(lambda current: current.update({"health": "degraded", "updated_at": utc_now()}))
                 ctx.append_event({"event_type": "adapter_recovered", "status": "degraded", "degraded_prior": True, "adapter_version": adapter.get("adapter_version")})
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Supervisor v3 goal {state['goal']['goal_id']} v{state['goal']['version']} started in {state['execution_mode']} mode."}}, ensure_ascii=False))
-            return EXIT_COMPLETE
+            route_phases = route.get("phases", []) if isinstance(route, dict) else []
+            route_context = json.dumps(route_phases, ensure_ascii=False, separators=(",", ":"))
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": (
+                    f"Supervisor v3 goal {state['goal']['goal_id']} v{state['goal']['version']} "
+                    f"started in {state['execution_mode']} mode. Execute the complete ordered Skill route; "
+                    f"scheduled is not success: {route_context}"
+                ),
+            }}, ensure_ascii=False))
+            if registry_degraded or route is None:
+                return EXIT_DEGRADED
+            return EXIT_COMPLETE if route.get("valid") else EXIT_INCOMPLETE
         if args.event == "SessionEnd":
             try:
                 ctx = _context(ns, require_existing=True)
@@ -2078,7 +4436,12 @@ def command_hook(args: argparse.Namespace) -> int:
                 "event_type": "session_end",
                 "status": "observed",
                 "actor": str(payload.get("actor") or args.runtime),
-                "identity_assurance": "host-hook-observed",
+                "identity_assurance": _hook_identity_assurance(args.runtime),
+                "identity_provenance": (
+                    "caller-declared-local-observation"
+                    if str(args.runtime).strip().casefold() == "codex"
+                    else "host-lifecycle-observation"
+                ),
             })
             print("{}")
             return EXIT_COMPLETE
@@ -2121,6 +4484,15 @@ def command_hook(args: argparse.Namespace) -> int:
         else:
             tool_input = {}
         host_actor = str(payload.get("agent_id") or payload.get("subagent_id") or payload.get("actor") or args.runtime)
+        raw_responsibility_group = (
+            tool_input.get("responsibility_group")
+            or payload.get("responsibility_group")
+        )
+        host_responsibility_group = (
+            str(raw_responsibility_group).strip()
+            if raw_responsibility_group is not None
+            else None
+        ) or None
         capability_name = str(
             tool_input.get("skill")
             or tool_input.get("capability")
@@ -2198,7 +4570,9 @@ def command_hook(args: argparse.Namespace) -> int:
                 }
             breaker = state.get("capability_breakers", {}).get(capability_name, {})
             if isinstance(breaker, dict) and breaker.get("open") is True:
-                fallback_id = str(breaker.get("fallback_id") or "").strip()
+                fallback_id = _breaker_fallback_id(
+                    state, capability_name, breaker
+                )
                 ctx.append_event({
                     "event_type": "invocation_fallback_required",
                     "invocation_id": invocation_id,
@@ -2211,13 +4585,13 @@ def command_hook(args: argparse.Namespace) -> int:
                 output: dict[str, Any] = {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
-                        "additionalContext": f"Supervisor circuit open for {capability_name}; use fallback {fallback_id or 'manual verified fallback'}. The original capability will not count as success.",
+                        "additionalContext": f"Supervisor circuit open for {capability_name}; {('use verified fallback ' + fallback_id) if fallback_id else 'no inventory-verified fallback is available'}. The original capability will not count as success.",
                     }
                 }
                 if execution_mode == "enforce":
                     output["hookSpecificOutput"].update({
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": f"Capability circuit open; route to {fallback_id or 'documented manual fallback'}.",
+                        "permissionDecisionReason": f"Capability circuit open; {('route to verified fallback ' + fallback_id) if fallback_id else 'no verified fallback is available'}.",
                     })
                 print(json.dumps(output, ensure_ascii=False))
                 return EXIT_COMPLETE
@@ -2225,7 +4599,8 @@ def command_hook(args: argparse.Namespace) -> int:
                 invocation_id=invocation_id, capability=capability_name, stage="attempt", result=None,
                 actor=host_actor,
                 details={"summary": f"{tool_name} attempt", **_invocation_state_binding(state)},
-                identity_assurance="host-hook-observed",
+                identity_assurance=_hook_identity_assurance(args.runtime),
+                responsibility_group=host_responsibility_group,
             ))
             print(json.dumps(advisory_output, ensure_ascii=False) if advisory_output else "{}")
             return EXIT_COMPLETE
@@ -2259,7 +4634,8 @@ def command_hook(args: argparse.Namespace) -> int:
                 invocation_id=invocation_id, capability=capability_name, stage="result", result=result_name,
                 actor=host_actor,
                 details={"summary": f"{tool_name} completed", **_invocation_state_binding(state)},
-                identity_assurance="host-hook-observed",
+                identity_assurance=_hook_identity_assurance(args.runtime),
+                responsibility_group=host_responsibility_group,
             ))
             print("{}")
             return EXIT_COMPLETE
@@ -2269,7 +4645,12 @@ def command_hook(args: argparse.Namespace) -> int:
                 "status": "observed",
                 "actor": host_actor,
                 "capability": capability_name,
-                "identity_assurance": "host-hook-observed",
+                "identity_assurance": _hook_identity_assurance(args.runtime),
+                "identity_provenance": (
+                    "caller-declared-local-observation"
+                    if str(args.runtime).strip().casefold() == "codex"
+                    else "host-lifecycle-observation"
+                ),
             })
             print("{}")
             return EXIT_COMPLETE
@@ -2283,7 +4664,12 @@ def command_hook(args: argparse.Namespace) -> int:
                     "event_type": "subagent_stop_review",
                     "status": "valid" if report["valid"] else "incomplete",
                     "actor": host_actor,
-                    "identity_assurance": "host-hook-observed",
+                    "identity_assurance": _hook_identity_assurance(args.runtime),
+                    "identity_provenance": (
+                        "caller-declared-local-observation"
+                        if str(args.runtime).strip().casefold() == "codex"
+                        else "host-lifecycle-observation"
+                    ),
                     "summary": f"read-only subagent stop review; errors={len(report['errors'])}",
                 }
             )
@@ -2321,7 +4707,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.1.0")
+    parser.add_argument("--version", action="version", version="3.1.1")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)
@@ -2331,6 +4717,9 @@ def build_parser() -> Parser:
     p.add_argument("--goal-json")
     p.add_argument("--criteria-json")
     p.add_argument("--intents-json")
+    p.add_argument("--roots", nargs="*")
+    p.add_argument("--phase-budget", type=int, choices=(2, 3), default=3)
+    p.add_argument("--zero-skill-reviewed", action="store_true")
     p.add_argument("--shadow", action="store_true")
     p.set_defaults(func=command_start)
     p = sub.add_parser("event")
@@ -2342,6 +4731,7 @@ def build_parser() -> Parser:
     p.add_argument("--command-category")
     p.add_argument("--summary")
     p.add_argument("--actor")
+    p.add_argument("--responsibility-group")
     p.add_argument("--invocation-id")
     p.add_argument("--result")
     p.add_argument("--data-json")

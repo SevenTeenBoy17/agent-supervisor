@@ -139,6 +139,43 @@
         "builtin": {"type": "string", "minLength": 1},
         "predicate": {"type": "string", "minLength": 1}
       },
+      "allOf": [
+        {
+          "if": {"properties": {"id": {"const": "review.coderabbit"}}, "required": ["id"]},
+          "then": {
+            "required": ["command"],
+            "properties": {
+              "command": {"const": ["supervisor-trusted-core-runner", "bin/run-coderabbit-review.py", "--review-category", "independent"]},
+              "precondition": false
+            }
+          }
+        },
+        {
+          "if": {"properties": {"id": {"const": "review.coderabbit.test-integrity"}}, "required": ["id"]},
+          "then": {
+            "required": ["command"],
+            "properties": {
+              "command": {"const": ["supervisor-trusted-core-runner", "bin/run-coderabbit-review.py", "--review-category", "test-integrity"]},
+              "precondition": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "id": {"not": {"enum": ["review.coderabbit", "review.coderabbit.test-integrity"]}}
+            },
+            "required": ["id"]
+          },
+          "then": {
+            "properties": {
+              "command": {
+                "not": {"contains": {"const": "supervisor-trusted-core-runner"}}
+              }
+            }
+          }
+        }
+      ],
       "additionalProperties": true
     },
     "commandGate": {

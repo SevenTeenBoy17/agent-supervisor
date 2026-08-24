@@ -11,20 +11,31 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from supervisor_core.attestation import sign_record
+from supervisor_core.contracts import invocation_event, validate_review_shape
 from supervisor_core.validation import (
     _domains_from_observed,
     _path_allowed,
     _pattern_within,
+    _trusted_invocation_for_runtime,
     _validate_changes_and_reviews,
     validate_state,
 )
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
-from supervisor_core.util import canonical_sha256
+from supervisor_core.util import canonical_sha256, redact, redact_for_persistence
 
 
 def messages(state, events):
     return "\n".join(validate_state(state, events)["errors"])
+
+
+@pytest.mark.parametrize("boolean_version", [True, False])
+def test_review_goal_version_rejects_boolean_int_subclasses(
+    valid_bundle, boolean_version: bool,
+) -> None:
+    state, _ = copy.deepcopy(valid_bundle)
+    state["reviews"][0]["goal_version"] = boolean_version
+    assert validate_review_shape(state["reviews"][0]) is False
 
 
 def reseal_request_manifest(state, events=None):
@@ -183,13 +194,13 @@ def test_non_string_round_timestamp_is_rejected_without_crashing_validator(valid
 ])
 def test_attempt_only_or_failed_skill_does_not_count(valid_bundle, events):
     state, _ = valid_bundle
-    assert "no successful correlated invocation" in messages(state, events)
+    assert "no completion-trusted correlated invocation" in messages(state, events)
 
 
 def test_pretooluse_generic_event_does_not_count(valid_bundle):
     state, _ = valid_bundle
     events = [{"event_type": "PreToolUse", "capability": "core-builder", "invocation_id": "inv-1"}]
-    assert "no successful correlated invocation" in messages(state, events)
+    assert "no completion-trusted correlated invocation" in messages(state, events)
 
 
 def test_manual_specialized_cannot_cover_without_correlated_success(valid_bundle):
@@ -199,7 +210,7 @@ def test_manual_specialized_cannot_cover_without_correlated_success(valid_bundle
         capability_ids=["manual-only-capability"],
         reason="a human could run this outside the model",
     )
-    assert "no successful correlated invocation" in messages(state, events)
+    assert "no completion-trusted correlated invocation" in messages(state, events)
 
 
 @pytest.mark.parametrize(
@@ -219,7 +230,7 @@ def test_out_of_scope_diff_fails(valid_bundle):
 
 def test_same_responsibility_group_reviewer_fails(valid_bundle):
     state, events = valid_bundle
-    state["reviews"][0]["responsibility_group"] = "implementation"
+    state["reviews"][0]["reviewer_responsibility_group"] = "implementation"
     assert "implementer responsibility group" in messages(state, events)
 
 
@@ -248,7 +259,7 @@ def test_invocation_result_cannot_change_actor_or_capability(valid_bundle):
     events[1]["capability"] = "different-capability"
     result = messages(state, events)
     assert "capability changed" in result
-    assert "no successful correlated invocation" in result
+    assert "completion-trusted correlated invocation" in result
 
 
 def test_host_observed_invocation_cannot_be_replayed_across_rounds(valid_bundle):
@@ -290,13 +301,12 @@ def test_malformed_scope_policy_entry_fails_closed(valid_bundle):
     assert "project policy out_of_scope_globs invalid" in result
 
 
-def test_reviewer_identity_and_rerun_collector_must_be_independent(valid_bundle):
+def test_reviewer_and_gate_collector_are_separately_bound(valid_bundle):
     state, events = valid_bundle
-    state["reviews"][0]["reviewer"] = "worker-a"
-    state["evidence"][0]["collector"] = "somebody-else"
+    state["reviews"][0]["gate_collector"] = "reviewer-a"
+    state["evidence"][0]["collector"] = "reviewer-a"
     result = messages(state, events)
-    assert "actor/implementer identity is not independent" in result
-    assert "did not collect its rerun evidence" in result
+    assert "gate collector is not independent" in result
 
 
 def test_project_review_policy_binds_distinct_successful_actor_invocations(valid_bundle):
@@ -321,6 +331,109 @@ def test_project_review_policy_binds_distinct_successful_actor_invocations(valid
     result = messages(state, events)
     assert "reviewer identity lacks a successful correlated invocation" in result
     assert "invocation identities are not independently bound" in result
+
+
+@pytest.mark.parametrize(
+    "forged_assurance",
+    ["codex-explicit-audit", "codex-hook-observation", "host-hook-observed"],
+)
+def test_codex_caller_forged_identity_cannot_complete_implementation_review_or_gate(
+    valid_bundle,
+    forged_assurance: str,
+) -> None:
+    state, events = copy.deepcopy(valid_bundle)
+    state["runtime"] = "codex"
+    state["request_manifest"]["runtime"] = "codex"
+    state["request_manifest"]["attestation"] = sign_record(state["request_manifest"])
+    binding = {
+        "runtime": "codex",
+        "project": state["project"],
+        "workspace": str(Path(state["workspace"]).resolve()),
+        "session": state["session"],
+        "round": state["round"],
+        "goal_id": state["goal"]["goal_id"],
+        "goal_version": state["goal"]["version"],
+        "request_manifest_sha256": canonical_sha256(state["request_manifest"]),
+    }
+    for event in events:
+        event["identity_assurance"] = forged_assurance
+        event["details"].update(binding)
+        event["attestation"] = sign_record(event)
+    state["reviews"][0]["actor_identity_assurance"] = forged_assurance
+    state["reviews"][0]["request_manifest_sha256"] = canonical_sha256(
+        state["request_manifest"]
+    )
+    state["reviews"][0]["attestation"] = sign_record(state["reviews"][0])
+    state["terminal_state"] = "complete"
+
+    report = validate_state(state, events)
+
+    assert report["valid"] is False
+    combined = "\n".join(report["errors"])
+    assert not _trusted_invocation_for_runtime(
+        events,
+        "inv-1",
+        actor="worker-a",
+        responsibility_group="implementation",
+        state=state,
+    )
+    assert not _trusted_invocation_for_runtime(
+        events,
+        "inv-review",
+        actor="reviewer-a",
+        responsibility_group="quality-review",
+        state=state,
+    )
+    assert not _trusted_invocation_for_runtime(
+        events,
+        "inv-gate-runner",
+        actor="gate-runner-a",
+        responsibility_group="independent-gate-execution",
+        state=state,
+    )
+    assert "acceptance criterion lacks valid evidence" in combined
+
+
+def test_codex_core_trusted_builtin_invocation_remains_valid(valid_bundle) -> None:
+    state, _ = copy.deepcopy(valid_bundle)
+    state["runtime"] = "codex"
+    state["request_manifest"]["runtime"] = "codex"
+    state["request_manifest"]["attestation"] = sign_record(state["request_manifest"])
+    invocation_id = "inv-core-builtin-goal-finalize"
+    binding = {
+        "runtime": "codex",
+        "project": state["project"],
+        "workspace": str(Path(state["workspace"]).resolve()),
+        "session": state["session"],
+        "round": state["round"],
+        "goal_id": state["goal"]["goal_id"],
+        "goal_version": state["goal"]["version"],
+        "request_manifest_sha256": canonical_sha256(state["request_manifest"]),
+        "phase": "builtin-finalize",
+        "gate_id": "research.goal-finalize",
+        "criterion_id": "criterion-1",
+    }
+    events = [
+        invocation_event(
+            invocation_id=invocation_id,
+            capability="supervisor-core-builtin:research.goal-finalize",
+            stage=stage,
+            result=result,
+            actor="supervisor-core",
+            responsibility_group="trusted-runtime",
+            identity_assurance="core-trusted-finalize",
+            details=binding,
+        )
+        for stage, result in (("attempt", None), ("result", "success"))
+    ]
+
+    assert _trusted_invocation_for_runtime(
+        events,
+        invocation_id,
+        actor="supervisor-core",
+        responsibility_group="trusted-runtime",
+        state=state,
+    )
 
 
 def test_local_hmac_is_declared_as_integrity_only_not_host_security(valid_bundle):
@@ -354,6 +467,98 @@ def test_invented_waiver_fails_but_original_user_authorization_is_bound(valid_bu
     report = validate_state(state, events)
     assert report["valid"], report
     assert report["waived_criteria"] == ["criterion-1"]
+
+
+def test_nested_goal_event_and_evidence_credentials_are_redacted_without_mutating_waiver_hashes():
+    uri_userinfo = (
+        "https://" + "fixture-user" + ":" + "fixture-pass" + "@" + "example.invalid" + "/resource"
+    )
+    jwt = "eyJ" + "a" * 18 + "." + "b" * 24 + "." + "c" * 24
+    database_url = (
+        "postgresql://" + "fixture-db" + ":" + "fixture-pass" + "@" + "db.invalid" + "/app"
+    )
+    connection_string = (
+        "Server=db.invalid;Database=fixture;User Id=fixture;Password=fixture-pass"
+    )
+    cloud_token = "AKIA" + "A" * 16
+    payment_token = "sk_" + "live_" + "p" * 24
+    hugging_face_token = "hf_" + "h" * 32
+    linear_token = "lin_" + "api_" + "l" * 32
+    sentry_token = "sntrys_" + "s" * 32
+    sas_url = (
+        "https://storage.invalid/object?sv=2024-01-01&sp=rl&sig=" + "q" * 32
+    )
+    gcs_url = (
+        "https://storage.invalid/object?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+        "&X-Goog-Credential=fixture%2Fscope&X-Goog-Signature=" + "g" * 64
+    )
+    waiver_hash = hashlib.sha256(b"fixture-waiver-authorization").hexdigest()
+    payload = {
+        "goal": {
+            "objective": f"inspect {uri_userinfo}",
+            "constraints": [f"bearer {jwt}"],
+            "waiver_authorizations": [
+                {"criterion_id": "criterion-1", "request_sha256": waiver_hash}
+            ],
+        },
+        "event": {
+            "details": {
+                "argv": [
+                    "runner",
+                    "--database-url",
+                    database_url,
+                    f"--connection-string={connection_string}",
+                    "--access-token",
+                    cloud_token,
+                ]
+            }
+        },
+        "evidence": {
+            "output_summary": (
+                f"provider={payment_token}; jwt={jwt}; hf={hugging_face_token}; "
+                f"linear={linear_token}; sentry={sentry_token}; sas={sas_url}; gcs={gcs_url}"
+            ),
+        },
+    }
+
+    clean = redact(payload)
+    serialized = json.dumps(clean, sort_keys=True)
+
+    for secret in (
+        uri_userinfo,
+        jwt,
+        database_url,
+        connection_string,
+        cloud_token,
+        payment_token,
+        hugging_face_token,
+        linear_token,
+        sentry_token,
+        sas_url,
+        gcs_url,
+    ):
+        assert secret not in serialized
+    assert clean["goal"]["waiver_authorizations"][0]["request_sha256"] == waiver_hash
+    assert "[REDACTED]" in serialized
+
+
+def test_hash_bound_nested_credential_is_rejected_without_echoing_value():
+    database_url = (
+        "postgresql://" + "fixture-db" + ":" + "fixture-pass" + "@" + "db.invalid" + "/app"
+    )
+    attested_event = {
+        "event": {
+            "contract": "InvocationEvent/v3",
+            "details": {"connection": database_url},
+            "attestation": "a" * 64,
+        }
+    }
+
+    with pytest.raises(ValueError) as failure:
+        redact_for_persistence(attested_event)
+
+    assert database_url not in str(failure.value)
+    assert str(failure.value) == "sensitive-integrity-bound-record"
 
 
 def test_core_observes_real_workspace_delta_not_declared_state(tmp_path, monkeypatch):
@@ -419,8 +624,9 @@ def test_zero_skill_requires_review(valid_bundle):
     state["intents"][0].update(status="skipped", reason="no domain capability", capability_ids=[])
     assert "zero-skill round lacks" in messages(state, [])
     state["reviews"][0]["category"] = "zero-skill-routing"
-    state["reviews"][0]["implementer_responsibility_group"] = "routing"
     state["reviews"][0]["request_manifest_sha256"] = canonical_sha256(state["request_manifest"])
+    state["reviews"][0]["attestation"] = sign_record(state["reviews"][0])
+    state["changes"]["files"] = []
     assert "zero-skill round lacks" not in messages(state, events)
 
 
@@ -432,7 +638,7 @@ def test_zero_skill_review_rejects_same_actor_and_responsibility_group(valid_bun
     review.update(
         category="zero-skill-routing",
         implementer=review["reviewer"],
-        implementer_responsibility_group=review["responsibility_group"],
+        implementer_responsibility_group=review["reviewer_responsibility_group"],
         implementer_invocation_id=review["reviewer_invocation_id"],
         request_manifest_sha256=canonical_sha256(state["request_manifest"]),
     )

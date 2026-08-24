@@ -4,18 +4,158 @@ import json
 import fnmatch
 import os
 import re
+import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from .util import sha256_bytes, sha256_text, utc_now
+from .executable_trust import (
+    ExecutableTrustError,
+    load_trusted_executable_registry,
+    resolve_trusted_executable,
+    trusted_path,
+)
+from .util import (
+    canonical_sha256,
+    redact,
+    sha256_bytes,
+    sha256_file,
+    sha256_text,
+    utc_now,
+)
 
 
 _GIT_TIMEOUT_SECONDS = 15
+_GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
+_GIT_REDIRECT_ENVIRONMENT = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIFF_OPTS",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_TEMPLATE_DIR",
+        "GIT_WORK_TREE",
+    }
+)
+_RAW_WORKSPACE_PATH_PREFIX = "@agent-supervisor-raw-path-v1:"
+_ESCAPED_WORKSPACE_PATH_PREFIX = "@agent-supervisor-utf8-path-v1:"
+_REVIEW_OUTPUT_ARTIFACT_FIELDS = {
+    "contract",
+    "review_category",
+    "review_artifact",
+    "review_summary",
+    "base",
+    "head",
+    "git_object_format",
+    "git_diff_sha256",
+    "workspace_base_sha256",
+    "workspace_head_sha256",
+    "diff_hash",
+}
+_CODERABBIT_REVIEW_SUMMARY_FIELDS = {
+    "engine",
+    "authenticated",
+    "status",
+    "exit_code",
+    "structured_events",
+    "terminal_outcome",
+    "finding_count",
+    "complete_reported_findings",
+    "blocking_findings",
+    "severity_counts",
+    "protocol_blockers",
+    "context_bound",
+    "issues",
+    "stdout_sha256",
+    "stderr_sha256",
+}
+_GRAPH_REVIEW_SUMMARY_FIELDS = {
+    "engine",
+    "check",
+    "status",
+    "exit_code",
+    "output_sha256",
+}
+_REVIEW_SUMMARY_ISSUE_FIELDS = {
+    "kind",
+    "severity",
+    "path",
+    "line",
+    "title",
+    "message",
+}
+_REVIEW_SEVERITY_BUCKETS = {
+    "critical": frozenset({"p0", "critical", "error"}),
+    "major": frozenset({"p1", "major", "high"}),
+    "minor": frozenset(
+        {
+            "p2",
+            "p3",
+            "minor",
+            "medium",
+            "low",
+            "info",
+            "warning",
+            "suggestion",
+            "nitpick",
+        }
+    ),
+}
+_REVIEW_SUPPORTED_SEVERITIES = frozenset().union(
+    *_REVIEW_SEVERITY_BUCKETS.values()
+)
+_REVIEW_ARTIFACT_FIELDS = {
+    "kind",
+    "bundle_path",
+    "bundle_sha256",
+    "manifest_path",
+    "manifest_sha256",
+}
+_REVIEW_ARTIFACT_MANIFEST_FIELDS = {
+    "contract",
+    "git_binding_source",
+    "review_mode",
+    "bundle_sha256",
+    "git_object_format",
+    "base",
+    "head",
+    "diff_hash",
+    "git_diff_sha256",
+    "workspace_base_sha256",
+    "workspace_head_sha256",
+    "files",
+    "workspace_delta_manifest",
+    "source_review_manifest",
+    "source_review_manifest_sha256",
+}
+_REVIEW_ARTIFACT_SOURCE_FIELDS = {
+    "supervisor_source_snapshot_sha256",
+    "review_core_manifest_sha256",
+    "review_adapter_manifest_sha256",
+}
+_REVIEW_BINDING_SOURCE_FIELDS = _REVIEW_ARTIFACT_SOURCE_FIELDS | {
+    "review_adapter_manifest",
+}
 
 _CORE_SOURCE_WHITELIST = (
     "bin/agent-supervisor.py",
+    "bin/build-core-release-manifest.py",
+    "bin/run-coderabbit-review.py",
     "supervisor_core/__init__.py",
     "supervisor_core/__main__.py",
     "supervisor_core/attestation.py",
@@ -23,10 +163,12 @@ _CORE_SOURCE_WHITELIST = (
     "supervisor_core/constants.py",
     "supervisor_core/contracts.py",
     "supervisor_core/discovery.py",
+    "supervisor_core/executable_trust.py",
     "supervisor_core/finalize.py",
     "supervisor_core/lifecycle.py",
     "supervisor_core/rollout.py",
     "supervisor_core/routing.py",
+    "supervisor_core/runtime_bundle.py",
     "supervisor_core/schemas/project-config.schema.json",
     "supervisor_core/schemas/quality-profile.schema.json",
     "supervisor_core/storage.py",
@@ -49,6 +191,8 @@ _CODEX_ADAPTER_WHITELIST = (
     "supervisor-finalize.ps1",
     "supervisor-gate.ps1",
     "supervisor-handoff.ps1",
+    "supervisor-hook.ps1",
+    "supervisor-process-job.py",
     "supervisor-record.ps1",
     "supervisor-turn-ended.ps1",
     "supervisor-validate.ps1",
@@ -76,8 +220,16 @@ def _supervisor_source_roots() -> dict[str, Path]:
     home = _absolute_path(Path(install_home)) if install_home else _absolute_path(Path.home())
     if home.name.casefold() in {".claude", ".codex"}:
         home = home.parent
+    from .runtime_bundle import bound_release_identity
+
+    bound_identity = bound_release_identity()
+    bound_root = (
+        Path(str(bound_identity["path"]))
+        if isinstance(bound_identity, dict) and isinstance(bound_identity.get("path"), str)
+        else Path(__file__).parent.parent
+    )
     return {
-        "shared-core": _absolute_path(Path(__file__).parent.parent),
+        "shared-core": _absolute_path(bound_root),
         "codex-adapter": _absolute_path(home / ".codex" / "skills" / "dev-supervisor" / "scripts"),
         "claude-adapter": _absolute_path(home / ".claude" / "skills" / "supervisor" / "scripts"),
     }
@@ -102,13 +254,160 @@ def _runtime_only_path(relative: str) -> bool:
     }
 
 
+def _path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath(
+            (os.path.normcase(str(candidate)), os.path.normcase(str(root)))
+        ) == os.path.normcase(str(root))
+    except (OSError, ValueError):
+        return False
+
+
+def _git_executable_names() -> tuple[str, ...]:
+    if os.name != "nt":
+        return ("git",)
+    raw_pathext = os.environ.get("PATHEXT")
+    if raw_pathext is None:
+        raw_pathext = ".COM;.EXE;.BAT;.CMD"
+    names: list[str] = []
+    observed: set[str] = set()
+    for raw_extension in raw_pathext.split(os.pathsep):
+        extension = raw_extension.strip()
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,16}", extension):
+            continue
+        normalized = extension.casefold()
+        if normalized in observed:
+            continue
+        observed.add(normalized)
+        names.append(f"git{normalized}")
+    return tuple(names)
+
+
+def _trusted_git_candidate(candidate: Path, workspace: Path) -> Path | None:
+    """Return a stable absolute Git executable with no linked path component."""
+    lexical = _absolute_path(candidate)
+    workspace_lexical = _absolute_path(workspace)
+    try:
+        workspace_resolved = workspace_lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        workspace_resolved = workspace_lexical
+    if _path_is_within(lexical, workspace_lexical) or _path_is_within(
+        lexical, workspace_resolved
+    ):
+        return None
+
+    current = lexical
+    candidate_stat: os.stat_result | None = None
+    observed_components: list[tuple[Path, os.stat_result]] = []
+    while True:
+        try:
+            value = current.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(value.st_mode) or bool(
+            getattr(value, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            return None
+        observed_components.append((current, value))
+        if current == lexical:
+            candidate_stat = value
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    if candidate_stat is None or not stat.S_ISREG(candidate_stat.st_mode):
+        return None
+    if os.name != "nt" and not os.access(lexical, os.X_OK):
+        return None
+    try:
+        resolved = lexical.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(lexical)):
+        return None
+    if _path_is_within(resolved, workspace_lexical) or _path_is_within(
+        resolved, workspace_resolved
+    ):
+        return None
+    for component, initial_stat in observed_components:
+        try:
+            final_stat = component.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(final_stat.st_mode) or bool(
+            getattr(final_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            return None
+        if (
+            initial_stat.st_dev,
+            initial_stat.st_ino,
+            initial_stat.st_mode,
+            initial_stat.st_size,
+            initial_stat.st_mtime_ns,
+        ) != (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_mode,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+        ):
+            return None
+    return resolved
+
+
+def _resolve_git_executable(workspace: Path) -> Path | None:
+    try:
+        registry = load_trusted_executable_registry()
+        resolved, _digest = resolve_trusted_executable(
+            "git", registry, cwd=str(workspace)
+        )
+        return _trusted_git_candidate(Path(resolved), workspace)
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError):
+        return None
+
+
+def _sanitized_git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for variable in tuple(environment):
+        normalized = variable.upper()
+        if (
+            normalized in _GIT_REDIRECT_ENVIRONMENT
+            or normalized.startswith("GIT_CONFIG_KEY_")
+            or normalized.startswith("GIT_CONFIG_VALUE_")
+            or normalized == "NODEFAULTCURRENTDIRECTORYINEXEPATH"
+        ):
+            environment.pop(variable, None)
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["NoDefaultCurrentDirectoryInExePath"] = "1"
+    try:
+        environment["PATH"] = trusted_path(load_trusted_executable_registry())
+    except (ExecutableTrustError, OSError, RuntimeError, ValueError):
+        environment["PATH"] = ""
+    return environment
+
+
 def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
-    command = ["git", "-C", str(workspace), *args]
+    executable = _resolve_git_executable(workspace)
+    unresolved_command = ["git", "-C", str(workspace), *args]
+    if executable is None:
+        return subprocess.CompletedProcess(
+            unresolved_command,
+            127,
+            b"",
+            b"agent-supervisor:git-unavailable",
+        )
+    command = [str(executable), "-C", str(workspace), *args]
     try:
         return subprocess.run(
             command,
             capture_output=True,
             check=False,
+            env=_sanitized_git_environment(),
             timeout=_GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -123,6 +422,556 @@ def _git_runtime_failure(result: subprocess.CompletedProcess[bytes]) -> str | No
     if result.returncode == 127 and b"agent-supervisor:git-unavailable" in (result.stderr or b""):
         return "git-unavailable"
     return None
+
+
+def _git_oid_shape(value: Any, object_format: Any) -> bool:
+    oid = str(value or "")
+    expected = _GIT_OID_LENGTHS.get(str(object_format or ""))
+    return bool(
+        expected
+        and len(oid) == expected
+        and oid == oid.casefold()
+        and re.fullmatch(r"[0-9a-f]+", oid)
+    )
+
+
+def _git_object_format(root: Path, head: str = "") -> tuple[str | None, str | None]:
+    result = _git(root, "rev-parse", "--show-object-format")
+    runtime_failure = _git_runtime_failure(result)
+    if runtime_failure:
+        return None, runtime_failure
+    if result.returncode == 0:
+        value = result.stdout.decode("ascii", errors="ignore").strip().casefold()
+        if value in _GIT_OID_LENGTHS:
+            return value, None
+        return None, "git-object-format-unsupported"
+    # ``--show-object-format`` was added after SHA-1 repositories. Preserve
+    # compatibility with older Git only when HEAD itself proves SHA-1 shape.
+    if re.fullmatch(r"[0-9a-f]{40}", head):
+        return "sha1", None
+    return None, "git-object-format-unavailable"
+
+
+def validate_git_commit_binding(
+    workspace: str,
+    *,
+    base: Any,
+    head: Any,
+    object_format: Any,
+) -> tuple[bool, str]:
+    """Verify an exact Git commit range against the repository object store."""
+    fmt = str(object_format or "").casefold()
+    base_oid = str(base or "")
+    head_oid = str(head or "")
+    if fmt not in _GIT_OID_LENGTHS:
+        return False, "git-object-format-invalid"
+    if not _git_oid_shape(base_oid, fmt) or not _git_oid_shape(head_oid, fmt):
+        return False, "git-oid-shape-invalid"
+    if not isinstance(workspace, str) or not workspace.strip() or "\x00" in workspace:
+        return False, "workspace-invalid"
+    root = Path(workspace).resolve()
+    inside = _git(root, "rev-parse", "--is-inside-work-tree")
+    runtime_failure = _git_runtime_failure(inside)
+    if runtime_failure:
+        return False, runtime_failure
+    if inside.returncode != 0 or inside.stdout.strip() != b"true":
+        bare = _git(root, "rev-parse", "--is-bare-repository")
+        runtime_failure = _git_runtime_failure(bare)
+        if runtime_failure:
+            return False, runtime_failure
+        if bare.returncode != 0 or bare.stdout.strip() != b"true":
+            return False, "git-workspace-unavailable"
+    observed_format, format_error = _git_object_format(root, head_oid)
+    if format_error:
+        return False, format_error
+    if observed_format != fmt:
+        return False, "git-object-format-mismatch"
+    for label, oid in (("base", base_oid), ("head", head_oid)):
+        commit = _git(root, "cat-file", "-e", f"{oid}^{{commit}}")
+        runtime_failure = _git_runtime_failure(commit)
+        if runtime_failure:
+            return False, runtime_failure
+        if commit.returncode != 0:
+            return False, f"git-{label}-commit-unresolvable"
+    ancestor = _git(root, "merge-base", "--is-ancestor", base_oid, head_oid)
+    runtime_failure = _git_runtime_failure(ancestor)
+    if runtime_failure:
+        return False, runtime_failure
+    if ancestor.returncode != 0:
+        return False, "git-base-not-ancestor-of-head"
+    return True, "verified"
+
+
+def validate_review_artifact(
+    artifact: Any,
+    *,
+    base: Any,
+    head: Any,
+    object_format: Any,
+    diff_hash: Any,
+    workspace_base_sha256: Any,
+    workspace_head_sha256: Any,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Validate an immutable full Git bundle plus its exact JSON manifest."""
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != _REVIEW_ARTIFACT_FIELDS
+        or artifact.get("kind") != "git-bundle-v1"
+    ):
+        return False, "review-artifact-contract-invalid", None
+    bundle_path = artifact.get("bundle_path")
+    manifest_path = artifact.get("manifest_path")
+    if not isinstance(bundle_path, str) or not isinstance(manifest_path, str):
+        return False, "review-artifact-path-missing", None
+
+    def trusted_regular_file(raw: str) -> Path | None:
+        if not raw.strip() or "\x00" in raw:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            return None
+        lexical = _absolute_path(candidate)
+        try:
+            resolved = lexical.resolve(strict=True)
+        except OSError:
+            return None
+        if os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+            return None
+        if _is_reparse_point(lexical) or not lexical.is_file():
+            return None
+        return lexical
+
+    bundle = trusted_regular_file(bundle_path)
+    manifest_file = trusted_regular_file(manifest_path)
+    if bundle is None or manifest_file is None:
+        return False, "review-artifact-file-unavailable-or-linked", None
+    bundle_sha256 = str(artifact.get("bundle_sha256") or "")
+    manifest_sha256 = str(artifact.get("manifest_sha256") or "")
+    try:
+        if manifest_file.stat().st_size > 8 * 1024 * 1024:
+            return False, "review-artifact-manifest-too-large", None
+        manifest_bytes = manifest_file.read_bytes()
+    except OSError:
+        return False, "review-artifact-file-unavailable-or-linked", None
+    if not re.fullmatch(r"[0-9a-f]{64}", bundle_sha256):
+        return False, "review-artifact-bundle-hash-mismatch", None
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) or sha256_bytes(manifest_bytes) != manifest_sha256:
+        return False, "review-artifact-manifest-hash-mismatch", None
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON value: {value}")
+
+    try:
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False, "review-artifact-manifest-invalid", None
+    manifest_fields = set(manifest) if isinstance(manifest, dict) else set()
+    if (
+        not isinstance(manifest, dict)
+        or (
+            manifest_fields != _REVIEW_ARTIFACT_MANIFEST_FIELDS
+            and manifest_fields
+            != _REVIEW_ARTIFACT_MANIFEST_FIELDS | _REVIEW_ARTIFACT_SOURCE_FIELDS
+        )
+        or manifest.get("contract") != "ReviewArtifactManifest/v1"
+        or manifest.get("git_binding_source") != "review-artifact"
+        or manifest.get("review_mode") != "full-snapshot"
+    ):
+        return False, "review-artifact-manifest-contract-invalid", None
+    expected = {
+        "bundle_sha256": bundle_sha256,
+        "git_object_format": object_format,
+        "base": base,
+        "head": head,
+        "diff_hash": diff_hash,
+        "workspace_base_sha256": workspace_base_sha256,
+        "workspace_head_sha256": workspace_head_sha256,
+    }
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        return False, "review-artifact-manifest-binding-mismatch", None
+    delta_manifest = manifest.get("workspace_delta_manifest")
+    if not isinstance(delta_manifest, dict) or canonical_sha256(delta_manifest) != diff_hash:
+        return False, "review-artifact-diff-manifest-mismatch", None
+    for relative_path, delta in delta_manifest.items():
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or "\x00" in relative_path
+            or any(ord(character) < 32 for character in relative_path)
+            or "\\" in relative_path
+            or relative_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or not isinstance(delta, dict)
+            or set(delta) != {"before", "after"}
+            or any(
+                value is not None
+                and (
+                    not isinstance(value, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value)
+                )
+                for value in delta.values()
+            )
+        ):
+            return False, "review-artifact-delta-entry-invalid", None
+    files = manifest.get("files")
+    if not isinstance(files, list) or files != sorted(delta_manifest):
+        return False, "review-artifact-file-manifest-mismatch", None
+    source_manifest = manifest.get("source_review_manifest")
+    if not isinstance(source_manifest, dict) or not source_manifest:
+        return False, "review-artifact-source-manifest-invalid", None
+    for relative_path, content_sha256 in source_manifest.items():
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or "\x00" in relative_path
+            or any(ord(character) < 32 for character in relative_path)
+            or "\\" in relative_path
+            or relative_path.startswith("/")
+            or re.match(r"^[A-Za-z]:", relative_path)
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or not isinstance(content_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", content_sha256)
+        ):
+            return False, "review-artifact-source-manifest-invalid", None
+    if canonical_sha256(source_manifest) != manifest.get("source_review_manifest_sha256"):
+        return False, "review-artifact-source-manifest-hash-mismatch", None
+    if _REVIEW_ARTIFACT_SOURCE_FIELDS <= manifest_fields:
+        for field in _REVIEW_ARTIFACT_SOURCE_FIELDS:
+            if not isinstance(manifest.get(field), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", manifest[field]
+            ):
+                return False, "review-artifact-source-binding-invalid", None
+        core_manifest = {
+            path: digest
+            for path, digest in source_manifest.items()
+            if path.startswith("global-core/")
+        }
+        if canonical_sha256(core_manifest) != manifest.get(
+            "review_core_manifest_sha256"
+        ):
+            return False, "review-artifact-core-manifest-mismatch", None
+        adapter_manifest = {
+            path: digest
+            for path, digest in source_manifest.items()
+            if path.startswith(("global-codex/", "global-claude/"))
+        }
+        if (
+            not adapter_manifest
+            or canonical_sha256(adapter_manifest)
+            != manifest.get("review_adapter_manifest_sha256")
+        ):
+            return False, "review-artifact-adapter-manifest-mismatch", None
+    git_diff_sha256 = str(manifest.get("git_diff_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", git_diff_sha256):
+        return False, "review-artifact-git-diff-hash-invalid", None
+
+    fmt = str(object_format or "")
+    if fmt not in _GIT_OID_LENGTHS:
+        return False, "git-object-format-invalid", None
+    init_args = ["init", "--bare", "-q"]
+    if fmt == "sha256":
+        init_args.insert(2, "--object-format=sha256")
+    with tempfile.TemporaryDirectory(prefix="agent-supervisor-review-") as temp_dir:
+        sealed_bundle = Path(temp_dir) / "review.bundle"
+        try:
+            shutil.copyfile(bundle, sealed_bundle)
+        except OSError:
+            return False, "review-artifact-bundle-copy-failed", None
+        if sha256_file(sealed_bundle) != bundle_sha256:
+            return False, "review-artifact-bundle-hash-mismatch", None
+        repo = Path(temp_dir) / "objects.git"
+        initialized = _git(Path(temp_dir), *init_args, str(repo))
+        if initialized.returncode != 0:
+            return False, "review-artifact-repository-init-failed", None
+        verified = _git(repo, "bundle", "verify", str(sealed_bundle))
+        if verified.returncode != 0:
+            return False, "review-artifact-bundle-verification-failed", None
+        heads = _git(repo, "bundle", "list-heads", "--", str(sealed_bundle))
+        if heads.returncode != 0:
+            return False, "review-artifact-head-list-failed", None
+        advertised_ref = None
+        for raw_line in heads.stdout.decode("utf-8", errors="replace").splitlines():
+            parts = raw_line.split(maxsplit=1)
+            if len(parts) == 2 and parts[0].casefold() == str(head).casefold():
+                advertised_ref = parts[1].strip()
+                break
+        if not advertised_ref:
+            return False, "review-artifact-head-not-advertised", None
+        fetched = _git(repo, "fetch", "-q", "--", str(sealed_bundle), f"{advertised_ref}:refs/review/head")
+        if fetched.returncode != 0:
+            return False, "review-artifact-fetch-failed", None
+        valid, reason = validate_git_commit_binding(
+            str(repo), base=base, head=head, object_format=object_format
+        )
+        if not valid:
+            return False, reason, None
+        base_tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", str(base))
+        if base_tree.returncode != 0 or base_tree.stdout:
+            return False, "review-artifact-base-tree-not-empty", None
+        head_tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", str(head))
+        if head_tree.returncode != 0:
+            return False, "review-artifact-head-tree-unavailable", None
+        observed_tree: dict[str, str] = {}
+        for entry in head_tree.stdout.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                metadata, raw_path = entry.split(b"\t", 1)
+                mode, object_type, _ = metadata.decode("ascii").split()
+                relative_path = raw_path.decode("utf-8")
+            except (UnicodeError, ValueError):
+                return False, "review-artifact-head-tree-invalid", None
+            if (
+                mode != "100644"
+                or object_type != "blob"
+                or relative_path in observed_tree
+            ):
+                return False, "review-artifact-head-tree-mode-invalid", None
+            blob = _git(repo, "cat-file", "blob", f"{head}:{relative_path}")
+            if blob.returncode != 0:
+                return False, "review-artifact-head-tree-blob-unavailable", None
+            observed_tree[relative_path] = sha256_bytes(blob.stdout)
+        if observed_tree != source_manifest:
+            return False, "review-artifact-head-tree-manifest-mismatch", None
+        rendered = _git(
+            repo,
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            str(base),
+            str(head),
+        )
+        if rendered.returncode != 0 or sha256_bytes(rendered.stdout) != git_diff_sha256:
+            return False, "review-artifact-git-diff-mismatch", None
+    return True, "verified", manifest
+
+
+def validate_review_output_artifact(
+    output: Any,
+    binding_input: Any,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Validate the immutable review copy emitted by a trusted review gate.
+
+    The authoritative EvidenceRecord remains bound to the live workspace.  This
+    nested artifact is an independently reproducible copy of the exact workspace
+    binding plus the optional immutable core/adapter source binding that core
+    injected into the gate process.
+    """
+    if not isinstance(output, dict) or set(output) != _REVIEW_OUTPUT_ARTIFACT_FIELDS:
+        return False, "review-output-artifact-fields-invalid", None
+    if output.get("contract") != "ReviewOutputArtifact/v1":
+        return False, "review-output-artifact-contract-invalid", None
+    if output.get("review_category") not in {"independent", "test-integrity"}:
+        return False, "review-output-artifact-category-invalid", None
+    summary_valid, summary_reason = _validate_review_summary(
+        output.get("review_summary")
+    )
+    if not summary_valid:
+        return False, summary_reason, None
+    binding_fields = set(binding_input) if isinstance(binding_input, dict) else set()
+    base_binding_fields = {
+        "contract",
+        "workspace_base_sha256",
+        "workspace_head_sha256",
+        "diff_hash",
+        "workspace_delta_manifest",
+    }
+    if not isinstance(binding_input, dict) or (
+        binding_fields != base_binding_fields
+        and binding_fields != base_binding_fields | _REVIEW_BINDING_SOURCE_FIELDS
+    ):
+        return False, "review-output-binding-input-invalid", None
+    if binding_input.get("contract") != "ReviewArtifactBindingInput/v1":
+        return False, "review-output-binding-input-contract-invalid", None
+    for field in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
+        if output.get(field) != binding_input.get(field):
+            return False, f"review-output-{field}-mismatch", None
+    valid, reason, manifest = validate_review_artifact(
+        output.get("review_artifact"),
+        base=output.get("base"),
+        head=output.get("head"),
+        object_format=output.get("git_object_format"),
+        diff_hash=output.get("diff_hash"),
+        workspace_base_sha256=output.get("workspace_base_sha256"),
+        workspace_head_sha256=output.get("workspace_head_sha256"),
+    )
+    if not valid or not isinstance(manifest, dict):
+        return False, reason, None
+    if manifest.get("workspace_delta_manifest") != binding_input.get(
+        "workspace_delta_manifest"
+    ):
+        return False, "review-output-workspace-delta-manifest-mismatch", None
+    if manifest.get("git_diff_sha256") != output.get("git_diff_sha256"):
+        return False, "review-output-git-diff-sha256-mismatch", None
+    if _REVIEW_BINDING_SOURCE_FIELDS <= binding_fields:
+        if not _REVIEW_ARTIFACT_SOURCE_FIELDS <= set(manifest):
+            return False, "review-output-source-binding-missing", None
+        for field in _REVIEW_ARTIFACT_SOURCE_FIELDS:
+            if manifest.get(field) != binding_input.get(field):
+                return False, f"review-output-{field}-mismatch", None
+        adapter_manifest = binding_input.get("review_adapter_manifest")
+        if not isinstance(adapter_manifest, dict) or not adapter_manifest:
+            return False, "review-output-adapter-manifest-invalid", None
+        observed_adapter_manifest = {
+            path: digest
+            for path, digest in manifest.get("source_review_manifest", {}).items()
+            if path.startswith(("global-codex/", "global-claude/"))
+        }
+        if (
+            observed_adapter_manifest != adapter_manifest
+            or canonical_sha256(adapter_manifest)
+            != binding_input.get("review_adapter_manifest_sha256")
+        ):
+            return False, "review-output-adapter-manifest-mismatch", None
+    return True, "verified", output
+
+
+def _review_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _review_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_review_issue_path(value: Any) -> bool:
+    if value is None:
+        return True
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith(("/", "//"))
+        or re.match(r"^[A-Za-z]:", value)
+        or ":" in value
+        or any(ord(character) < 32 for character in value)
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        return False
+    return redact(value) == value
+
+
+def _validate_review_summary(summary: Any) -> tuple[bool, str]:
+    """Validate a fail-closed, redaction-safe independent review summary."""
+    if not isinstance(summary, dict):
+        return False, "review-summary-fields-invalid"
+    # Never include the offending value in an error.  A summary is an
+    # integrity-bound record, so silently redacting it would create a different
+    # result than the reviewer actually emitted.
+    if redact(summary) != summary:
+        return False, "review-summary-sensitive-content"
+    engine = summary.get("engine")
+    if engine == "code-review-graph":
+        if set(summary) != _GRAPH_REVIEW_SUMMARY_FIELDS:
+            return False, "review-summary-fields-invalid"
+        if (
+            summary.get("check") not in {"build", "impact"}
+            or summary.get("status") != "pass"
+            or not _review_nonnegative_int(summary.get("exit_code"))
+            or summary.get("exit_code") != 0
+            or not isinstance(summary.get("output_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", summary["output_sha256"]) is None
+        ):
+            return False, "review-summary-graph-metadata-invalid"
+        return True, "verified"
+    if engine != "coderabbit" or set(summary) != _CODERABBIT_REVIEW_SUMMARY_FIELDS:
+        return False, "review-summary-fields-invalid"
+    if (
+        summary.get("authenticated") is not True
+        or summary.get("status") != "pass"
+        or not _review_nonnegative_int(summary.get("exit_code"))
+        or summary.get("exit_code") != 0
+        or not _review_positive_int(summary.get("structured_events"))
+        or summary.get("terminal_outcome") != "success"
+        or summary.get("context_bound") is not True
+    ):
+        return False, "review-summary-success-metadata-invalid"
+
+    count_fields = (
+        "finding_count",
+        "complete_reported_findings",
+        "blocking_findings",
+    )
+    if any(not _review_nonnegative_int(summary.get(field)) for field in count_fields):
+        return False, "review-summary-count-invalid"
+    finding_count = summary["finding_count"]
+    if (
+        summary["complete_reported_findings"] != finding_count
+        or summary["blocking_findings"] != 0
+    ):
+        return False, "review-summary-count-mismatch"
+
+    severity_counts = summary.get("severity_counts")
+    if (
+        not isinstance(severity_counts, dict)
+        or set(severity_counts) != set(_REVIEW_SEVERITY_BUCKETS)
+        or any(
+            not _review_nonnegative_int(severity_counts.get(bucket))
+            for bucket in _REVIEW_SEVERITY_BUCKETS
+        )
+        or sum(severity_counts.values()) != finding_count
+    ):
+        return False, "review-summary-severity-counts-invalid"
+    if severity_counts["critical"] or severity_counts["major"]:
+        return False, "review-summary-blocking-severity-invalid"
+
+    blockers = summary.get("protocol_blockers")
+    if not isinstance(blockers, list) or blockers:
+        return False, "review-summary-protocol-blockers-invalid"
+    if any(
+        not isinstance(summary.get(field), str)
+        or re.fullmatch(r"[0-9a-f]{64}", summary[field]) is None
+        for field in ("stdout_sha256", "stderr_sha256")
+    ):
+        return False, "review-summary-stream-hash-invalid"
+
+    issues = summary.get("issues")
+    if not isinstance(issues, list) or len(issues) != finding_count:
+        return False, "review-summary-issues-count-invalid"
+    observed_counts = {bucket: 0 for bucket in _REVIEW_SEVERITY_BUCKETS}
+    for issue in issues:
+        if not isinstance(issue, dict) or set(issue) != _REVIEW_SUMMARY_ISSUE_FIELDS:
+            return False, "review-summary-issue-fields-invalid"
+        severity = issue.get("severity")
+        line = issue.get("line")
+        title = issue.get("title")
+        message = issue.get("message")
+        if (
+            issue.get("kind") != "finding"
+            or severity not in _REVIEW_SUPPORTED_SEVERITIES
+            or not _valid_review_issue_path(issue.get("path"))
+            or not (
+                line is None
+                or _review_positive_int(line)
+            )
+            or not isinstance(title, str)
+            or not title.strip()
+            or len(title) > 160
+            or not isinstance(message, str)
+            or len(message) > 500
+        ):
+            return False, "review-summary-issue-invalid"
+        for bucket, severities in _REVIEW_SEVERITY_BUCKETS.items():
+            if severity in severities:
+                observed_counts[bucket] += 1
+                break
+    if observed_counts != severity_counts:
+        return False, "review-summary-severity-count-mismatch"
+    return True, "verified"
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -183,9 +1032,26 @@ def capture_supervisor_source_snapshot() -> dict[str, Any]:
     required_names = _required_supervisor_source_names()
 
     core_root = roots["shared-core"]
+    from .runtime_bundle import RuntimeBundleError, bound_resource_bytes
+
     for relative in _CORE_SOURCE_WHITELIST:
         logical = f"shared-core/{relative}"
-        files[logical] = _source_file_record(core_root, core_root / relative, logical)
+        try:
+            bound_content = bound_resource_bytes(relative)
+        except RuntimeBundleError:
+            bound_content = None
+            files[logical] = {
+                "status": "unreadable",
+                "sha256": sha256_text(f"unreadable:{logical}"),
+            }
+        if bound_content is not None:
+            files[logical] = {
+                "status": "hashed",
+                "sha256": sha256_bytes(bound_content),
+                "size": len(bound_content),
+            }
+        elif logical not in files:
+            files[logical] = _source_file_record(core_root, core_root / relative, logical)
 
     codex_root = roots["codex-adapter"]
     for filename in _CODEX_ADAPTER_WHITELIST:
@@ -355,10 +1221,13 @@ def _hash_workspace_entry(root: Path, path: Path, relative: str) -> str | None:
             except OSError:
                 target = "opaque-reparse-point"
             try:
-                link_name = current.relative_to(root).as_posix()
+                link_name = _persistent_workspace_path(
+                    current.relative_to(root).as_posix()
+                )
             except ValueError:
                 return sha256_text(f"unsafe-or-unreadable-entry:{relative}")
-            return sha256_text(f"link-metadata:{link_name}:{target}")
+            safe_target = _persistent_workspace_path(str(target))
+            return sha256_text(f"link-metadata:{link_name}:{safe_target}")
         current = parent
     try:
         resolved = path.resolve(strict=True)
@@ -370,6 +1239,29 @@ def _hash_workspace_entry(root: Path, path: Path, relative: str) -> str | None:
         return sha256_text(f"unsafe-or-unreadable-entry:{relative}")
 
 
+def _persistent_workspace_path(relative: str) -> str:
+    """Return an injective, UTF-8-safe representation of a Git path.
+
+    Git path output is bytes.  Python's ``surrogateescape`` preserves a byte
+    sequence that is not valid UTF-8, but those surrogate code points cannot
+    be encoded by the Supervisor's canonical JSON writer.  Raw paths therefore
+    use a reserved hexadecimal namespace.  Legitimate UTF-8 names beginning
+    with either reserved prefix are themselves escaped into a disjoint
+    namespace, so no valid filename can alias a raw-byte filename.
+    """
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in relative):
+        raw = relative.encode("utf-8", errors="surrogateescape")
+        return f"{_RAW_WORKSPACE_PATH_PREFIX}{raw.hex()}"
+    if relative.startswith(
+        (_RAW_WORKSPACE_PATH_PREFIX, _ESCAPED_WORKSPACE_PATH_PREFIX)
+    ):
+        return (
+            f"{_ESCAPED_WORKSPACE_PATH_PREFIX}"
+            f"{relative.encode('utf-8').hex()}"
+        )
+    return relative
+
+
 def _relative_files(workspace: Path, extra_globs: list[str]) -> tuple[set[str], str | None]:
     result: set[str] = set()
     listed = _git(workspace, "ls-files", "-co", "--exclude-standard", "-z")
@@ -377,7 +1269,10 @@ def _relative_files(workspace: Path, extra_globs: list[str]) -> tuple[set[str], 
         return set(), _git_runtime_failure(listed) or "git-ls-files-failed"
     for raw in listed.stdout.split(b"\0"):
         if raw:
-            result.add(raw.decode("utf-8", errors="surrogateescape").replace("\\", "/"))
+            # Git's -z path format uses '/' as its separator on every host.
+            # Preserve a literal backslash byte on POSIX instead of silently
+            # conflating it with a directory separator.
+            result.add(raw.decode("utf-8", errors="surrogateescape"))
     for pattern in extra_globs:
         normalized = str(pattern).replace("\\", "/")
         if not normalized or normalized.startswith("/") or (len(normalized) > 2 and normalized[1] == ":"):
@@ -405,6 +1300,7 @@ def _degraded_workspace_snapshot(root: Path, extra_globs: list[str], reason: str
         "git": False,
         "workspace": str(root),
         "files": {},
+        "git_object_format": None,
         "snapshot_hash": sha256_text(payload),
         "captured_at": utc_now(),
         "extra_globs": extra_globs,
@@ -423,7 +1319,16 @@ def capture_workspace_snapshot(workspace: str, extra_globs: list[str] | None = N
     if runtime_failure:
         return _degraded_workspace_snapshot(root, requested_globs, runtime_failure)
     if inside.returncode != 0 or inside.stdout.strip() != b"true":
-        return {"contract": "WorkspaceSnapshot/v3", "git": False, "workspace": str(root), "files": {}, "snapshot_hash": sha256_text("non-git"), "captured_at": utc_now(), "extra_globs": requested_globs}
+        return {
+            "contract": "WorkspaceSnapshot/v3",
+            "git": False,
+            "workspace": str(root),
+            "files": {},
+            "snapshot_hash": sha256_text("non-git"),
+            "captured_at": utc_now(),
+            "extra_globs": requested_globs,
+            "git_object_format": None,
+        }
     head_result = _git(root, "rev-parse", "HEAD")
     head_runtime_failure = _git_runtime_failure(head_result)
     if head_runtime_failure:
@@ -435,21 +1340,26 @@ def capture_workspace_snapshot(workspace: str, extra_globs: list[str] | None = N
     # An unborn repository legitimately has no HEAD yet; its file manifest is
     # still useful and must not be mislabeled as a Supervisor runtime failure.
     head = head_result.stdout.decode("ascii", errors="ignore").strip() if head_result.returncode == 0 else ""
+    object_format, format_error = _git_object_format(root, head)
+    if format_error:
+        return _degraded_workspace_snapshot(root, requested_globs, format_error)
     files: dict[str, str] = {}
     relative_files, list_error = _relative_files(root, requested_globs)
     if list_error:
         return _degraded_workspace_snapshot(root, requested_globs, list_error)
     for relative in sorted(relative_files):
         path = root / Path(relative)
-        digest = _hash_workspace_entry(root, path, relative)
+        persistent_relative = _persistent_workspace_path(relative)
+        digest = _hash_workspace_entry(root, path, persistent_relative)
         if digest is not None:
-            files[relative] = digest
+            files[persistent_relative] = digest
     digest_payload = json.dumps({"head": head, "files": files}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "contract": "WorkspaceSnapshot/v3",
         "git": True,
         "workspace": str(root),
         "head": head,
+        "git_object_format": object_format,
         "files": files,
         "snapshot_hash": sha256_text(digest_payload),
         "captured_at": utc_now(),
@@ -466,11 +1376,72 @@ def workspace_delta(baseline: dict[str, Any], current: dict[str, Any]) -> dict[s
         if before.get(path) != after.get(path)
     }
     payload = json.dumps(changed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    workspace_base_sha256 = str(baseline.get("snapshot_hash") or "")
+    workspace_head_sha256 = str(current.get("snapshot_hash") or "")
+    object_format = str(
+        current.get("git_object_format")
+        or baseline.get("git_object_format")
+        or ""
+    ).casefold()
+    baseline_head = str(baseline.get("head") or "")
+    current_head = str(current.get("head") or "")
+    git_base: str | None = None
+    git_head: str | None = None
+    git_binding_status = "unavailable"
+    git_binding_reason = "git-commit-binding-unavailable"
+    git_binding_source: str | None = None
+    git_repository_root: str | None = None
+    if baseline.get("status") == "degraded" or current.get("status") == "degraded":
+        git_binding_status = "degraded"
+        git_binding_reason = str(current.get("reason") or baseline.get("reason") or "workspace-snapshot-degraded")
+    elif baseline.get("git") is True and current.get("git") is True and baseline_head and current_head:
+        workspace = str(current.get("workspace") or baseline.get("workspace") or "")
+        root = Path(workspace).resolve() if workspace else Path("<invalid-workspace>")
+        merge_base = _git(root, "merge-base", baseline_head, current_head)
+        runtime_failure = _git_runtime_failure(merge_base)
+        candidate = (
+            merge_base.stdout.decode("ascii", errors="ignore").strip().casefold()
+            if merge_base.returncode == 0
+            else ""
+        )
+        if runtime_failure:
+            git_binding_status = "degraded"
+            git_binding_reason = runtime_failure
+        elif not candidate:
+            git_binding_status = "degraded"
+            git_binding_reason = "git-merge-base-unavailable"
+        else:
+            valid, reason = validate_git_commit_binding(
+                workspace,
+                base=candidate,
+                head=current_head.casefold(),
+                object_format=object_format,
+            )
+            if valid:
+                git_base = candidate
+                git_head = current_head.casefold()
+                git_binding_status = "verified"
+                git_binding_reason = "verified"
+                git_binding_source = "workspace"
+                git_repository_root = str(root)
+            else:
+                git_binding_status = "degraded"
+                git_binding_reason = reason
     return {
         "contract": "WorkspaceDelta/v3",
         "files": sorted(changed),
-        "base": str(baseline.get("snapshot_hash") or ""),
-        "head": str(current.get("snapshot_hash") or ""),
+        "base": git_base,
+        "head": git_head,
+        "git_object_format": object_format or None,
+        "git_binding_status": git_binding_status,
+        "git_binding_reason": git_binding_reason,
+        "git_binding_source": git_binding_source,
+        "git_repository_root": git_repository_root,
+        "review_artifact": None,
+        "review_artifact_sha256": None,
+        "git_diff_sha256": None,
+        "workspace_base_sha256": workspace_base_sha256,
+        "workspace_head_sha256": workspace_head_sha256,
         "diff_hash": sha256_text(payload),
         "manifest": changed,
         "collected_at": utc_now(),

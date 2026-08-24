@@ -15,12 +15,17 @@ from .storage import StateContext, atomic_write_json, exclusive_lock
 from .util import json_load, sha256_bytes, sha256_text, utc_now
 from .workspace import capture_workspace_snapshot
 from .rollout import initial_rollout
+from .runtime_bundle import RuntimeBundleError, bound_resource_bytes
 
 
 _CORE_SCHEMA_ROOT = Path(__file__).with_name("schemas")
 _CORE_SCHEMAS = {
     "project": _CORE_SCHEMA_ROOT / "project-config.schema.json",
     "quality": _CORE_SCHEMA_ROOT / "quality-profile.schema.json",
+}
+_CORE_SCHEMA_RESOURCES = {
+    "project": "supervisor_core/schemas/project-config.schema.json",
+    "quality": "supervisor_core/schemas/quality-profile.schema.json",
 }
 _MAX_INLINE_PRIOR_ROUNDS = 20
 _PRIVACY_SAFE_TEXT = re.compile(
@@ -115,6 +120,22 @@ def _read_stable_json_object(path: Path, *, label: str) -> dict[str, Any]:
         raise ValueError(f"{label} changed during validation or became a symlink/reparse point")
     try:
         value = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must contain valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _read_core_schema(kind: str, *, label: str) -> dict[str, Any]:
+    try:
+        content = bound_resource_bytes(_CORE_SCHEMA_RESOURCES[kind])
+    except RuntimeBundleError as exc:
+        raise ValueError(f"{label} bound core schema is unavailable") from exc
+    if content is None:
+        return _read_stable_json_object(_CORE_SCHEMAS[kind], label=label)
+    try:
+        value = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} must contain valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
@@ -238,8 +259,7 @@ def _validated_json_document(path: Path, *, label: str, kind: str) -> dict[str, 
     schema_path = _resolve_declared_schema(path, schema_reference, label=label)
     schema = _read_stable_json_object(schema_path, label=f"{label} $schema")
     _reject_external_schema_refs(schema, label=label)
-    core_schema_path = _CORE_SCHEMAS[kind]
-    core_schema = _read_stable_json_object(core_schema_path, label=f"{label} core schema")
+    core_schema = _read_core_schema(kind, label=f"{label} core schema")
     try:
         from jsonschema import Draft202012Validator
         from jsonschema.exceptions import SchemaError, ValidationError

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import supervisor_core.discovery as discovery
 from supervisor_core.discovery import RootSpec, baseline_report, scan_skills, write_baseline
 from supervisor_core.routing import route_intents, split_intents
 
@@ -45,36 +46,125 @@ def test_discovery_hash_failure_degrades_only_the_affected_skill(tmp_path, monke
     skill(root / "healthy", "healthy-skill", "healthy")
     skill(root / "unreadable", "unreadable-skill", "unreadable")
     unreadable = root / "unreadable" / "SKILL.md"
-    real_read_bytes = Path.read_bytes
+    real_open = discovery.os.open
 
-    def selective_read_bytes(path):
-        if path == unreadable:
-            raise PermissionError("fixture denies hash read")
-        return real_read_bytes(path)
+    def selective_open(path, *args, **kwargs):
+        if Path(path) == unreadable:
+            raise PermissionError("fixture denies stable read")
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", selective_read_bytes)
+    monkeypatch.setattr(discovery.os, "open", selective_open)
 
     inventory = scan_skills([RootSpec(root, "test")])
     by_name = {row["name"]: row for row in inventory["skills"]}
+    unreadable_row = next(row for row in inventory["skills"] if Path(row["path"]) == unreadable)
     assert by_name["healthy-skill"]["health"] == "healthy"
     assert by_name["healthy-skill"]["sha256"]
-    assert by_name["unreadable-skill"]["availability"] == "unavailable"
-    assert by_name["unreadable-skill"]["health"] == "unavailable"
-    assert by_name["unreadable-skill"]["active"] is False
-    assert "hash-read-PermissionError" in by_name["unreadable-skill"]["error"]
+    assert unreadable_row["availability"] == "unavailable"
+    assert unreadable_row["health"] == "unavailable"
+    assert unreadable_row["active"] is False
+    assert unreadable_row["error"] == "skill-read-PermissionError"
 
 
-def test_duplicate_versions_choose_enabled_latest_and_cache_is_not_available(tmp_path):
+def test_duplicate_versions_fail_closed_without_selecting_a_winner(tmp_path):
     root = tmp_path / "enabled"
     cache = tmp_path / "cache"
     skill(root / "plugin" / "1.0.0" / "x", "dup", "v1")
     skill(root / "plugin" / "2.0.0" / "x", "dup", "v2")
     skill(cache / "plugin" / "9.0.0" / "x", "dup", "cached")
     inventory = scan_skills([RootSpec(root, "enabled"), RootSpec(cache, "cache", True, True)])
-    active = [row for row in inventory["skills"] if row["name"] == "dup" and row["active"]]
-    assert len(active) == 1
-    assert active[0]["version"] == "2.0.0"
-    assert any(row["availability"] == "cache-only" for row in inventory["skills"] if row["version"] == "9.0.0")
+    duplicates = [row for row in inventory["skills"] if row["name"] == "dup"]
+    assert len(duplicates) == 3
+    assert all(row["active"] is False for row in duplicates)
+    assert all(row["automatic"] is False for row in duplicates)
+    assert all(row["availability"] == "unavailable" for row in duplicates)
+    assert all(row["error"] == "canonical-capability-id-collision" for row in duplicates)
+    assert inventory["identity_collisions"] == [{
+        "code": "canonical-capability-id-collision",
+        "canonical_id": "dup",
+        "record_count": 3,
+        "kinds": ["skill"],
+        "responsibility_groups": [],
+    }]
+    route = route_intents(message="dup", inventory=inventory)
+    assert route["valid"] is False
+    assert route["identity_conflicts"] == ["dup"]
+    assert route["selected_capabilities"] == []
+
+
+@pytest.mark.parametrize(
+    ("skills", "agents", "canonical_id", "kinds", "groups", "includes_fallback"),
+    [
+        (
+            [],
+            [
+                {"id": "worker", "responsibility_group": "implementation", "fallback_only": False},
+                {"id": "WORKER", "responsibility_group": "implementation", "fallback_only": True},
+            ],
+            "worker",
+            ["agent"],
+            ["implementation"],
+            True,
+        ),
+        (
+            [],
+            [
+                {"id": "backup", "responsibility_group": "group-a", "fallback_only": True},
+                {"id": "Backup", "responsibility_group": "group-b", "fallback_only": True},
+            ],
+            "backup",
+            ["agent"],
+            ["group-a", "group-b"],
+            True,
+        ),
+        (
+            [],
+            [
+                {"id": "Owner", "responsibility_group": "group-a", "fallback_only": False},
+                {"id": "owner", "responsibility_group": "group-b", "fallback_only": False},
+            ],
+            "owner",
+            ["agent"],
+            ["group-a", "group-b"],
+            False,
+        ),
+        (
+            [{"id": "reviewer", "name": "reviewer"}],
+            [{"id": "REVIEWER", "responsibility_group": "review", "fallback_only": False}],
+            "reviewer",
+            ["agent", "skill"],
+            ["review"],
+            False,
+        ),
+    ],
+    ids=[
+        "primary-fallback-casefold",
+        "fallback-fallback-cross-group",
+        "primary-primary-casefold-cross-group",
+        "skill-agent-casefold",
+    ],
+)
+def test_global_capability_identity_collisions_are_never_routed(
+    skills, agents, canonical_id, kinds, groups, includes_fallback
+):
+    route = route_intents(
+        message="review capability",
+        inventory={"skills": skills, "agents": agents},
+    )
+
+    assert route["valid"] is False
+    assert route["identity_conflicts"] == [canonical_id]
+    assert route["selected_capabilities"] == []
+    assert route["selected_skills"] == []
+    assert route["selected_agents"] == []
+    assert route["identity_conflict_diagnostics"] == [{
+        "code": "canonical-capability-id-collision",
+        "canonical_id": canonical_id,
+        "record_count": 2,
+        "kinds": kinds,
+        "responsibility_groups": groups,
+        "includes_fallback": includes_fallback,
+    }]
 
 
 def test_154_baseline_is_exactly_explainable(tmp_path):
@@ -206,6 +296,56 @@ def test_supervisor_request_does_not_route_to_unrelated_ui_skill():
     result = route_intents(message=message, inventory=inventory, phase_budget=3)
     assert "animal-island-ui-style" not in result["selected_capabilities"]
     assert {"supervisor", "code-review-graph-helper", "superpowers:executing-plans"}.issubset(result["selected_capabilities"])
+
+
+def test_prerelease_review_routes_only_high_signal_supervisor_and_coderabbit():
+    def capability(name: str, description: str) -> dict:
+        return {
+            "id": name,
+            "name": name,
+            "description": description,
+            "active": True,
+            "automatic": True,
+            "availability": "enabled",
+            "health": "healthy",
+        }
+
+    inventory = {
+        "skills": [
+            capability("academic-pipeline", "validate candidate source pipeline"),
+            capability("netlify:netlify-frameworks", "global adapters framework"),
+            capability("advise-project-approach", "project planning advice"),
+            capability("Refactor Safely", "safe immutable source refactor"),
+            capability("Debug Issue", "debug tests and project hooks"),
+            capability("vercel:routing-middleware", "routing middleware"),
+            capability(
+                "dev-supervisor",
+                "Supervisor pre-release review for global activation and skill routing",
+            ),
+            capability(
+                "coderabbit:code-review",
+                "CodeRabbit immutable code review and test integrity",
+            ),
+        ]
+    }
+    message = (
+        "Supervisor v3.1.1 pre-release immutable review: validate all candidate source, "
+        "global adapters, project hooks, skill routing, tests, CodeRabbit and test "
+        "integrity before global activation."
+    )
+
+    coderabbit = route_intents(message="CodeRabbit", inventory=inventory, phase_budget=3)
+    assert coderabbit["selected_capabilities"] == ["coderabbit:code-review"]
+    result = route_intents(message=message, inventory=inventory, phase_budget=3)
+
+    assert set(result["selected_capabilities"]) == {
+        "dev-supervisor",
+        "coderabbit:code-review",
+    }
+    general = [row for row in result["coverage"] if row["domain"] == "general"]
+    assert general
+    assert all(row["status"] == "skipped" for row in general)
+    assert all("no high-signal" in row["reason"] for row in general)
 
 
 def test_words_containing_ui_do_not_false_match_technical_domain():

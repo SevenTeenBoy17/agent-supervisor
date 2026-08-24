@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ import supervisor_core.workspace as workspace_module
 from supervisor_core.cli import command_hook
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
-from supervisor_core.util import sha256_text
+from supervisor_core.util import sha256_file, sha256_text
 from supervisor_core.validation import _trusted_invocation_for_runtime
 
 
@@ -48,6 +49,32 @@ def _write_install_source_fixture(home: Path) -> None:
         target = roots[prefix] / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"fixture:{logical_name}\n", encoding="utf-8")
+    git_path = shutil.which("git")
+    assert git_path is not None
+    executables = {
+        "git": Path(git_path).resolve(),
+        "python": Path(sys.executable).resolve(),
+    }
+    registry = home / ".agent-supervisor" / "trusted-executables.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "contract": "TrustedExecutableRegistry/v1",
+                "entries": {
+                    name: {
+                        "kind": "local",
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                    }
+                    for name, path in executables.items()
+                },
+                "generated_at": "2026-08-24T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _quality_controls() -> dict[str, Any]:
@@ -288,7 +315,7 @@ def test_codex_apply_patch_scope_and_native_invocation_correlation(
     assert post_code == 0
     assert post_output == {}
     state = ctx.load()
-    assert _trusted_invocation_for_runtime(
+    assert not _trusted_invocation_for_runtime(
         ctx.events(), "apply-1", actor="codex", state=state
     )
     pair = [
@@ -298,10 +325,15 @@ def test_codex_apply_patch_scope_and_native_invocation_correlation(
         and row.get("event_type") in {"invocation_attempt", "invocation_result"}
     ]
     assert [row["identity_assurance"] for row in pair] == [
-        "host-hook-observed",
-        "host-hook-observed",
+        "codex-hook-observation",
+        "codex-hook-observation",
     ]
     assert all(row["actor"] == "codex" for row in pair)
+    assert all(row["completion_eligible"] is False for row in pair)
+    assert all(
+        row["identity_provenance"] == "caller-declared-local-observation"
+        for row in pair
+    )
 
     for invocation_id, denied_patch in (
         (
@@ -567,7 +599,8 @@ def test_codex_subagent_and_stop_lifecycle_never_force_success(
         row for row in ctx.events() if row.get("event_type") == "session_end"
     )
     assert session_end["actor"] == "codex"
-    assert session_end["identity_assurance"] == "host-hook-observed"
+    assert session_end["identity_assurance"] == "codex-hook-observation"
+    assert session_end["identity_provenance"] == "caller-declared-local-observation"
 
     outputs = []
     for _ in range(3):

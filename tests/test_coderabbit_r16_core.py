@@ -13,7 +13,12 @@ import pytest
 
 from supervisor_core import cli as cli_module
 from supervisor_core import lifecycle as lifecycle_module
+from supervisor_core.contracts import invocation_event
 from supervisor_core.discovery import _version_key
+from supervisor_core.executable_trust import (
+    load_trusted_executable_registry,
+    registry_public_record,
+)
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
 from supervisor_core.util import sha256_text
@@ -35,6 +40,18 @@ def _context(tmp_path: Path, round_id: str) -> StateContext:
 
 def _messages(state: dict, events: list[dict]) -> list[str]:
     return validate_state(state, events)["errors"]
+
+
+def _trusted_python_registry_record() -> dict:
+    executable = Path(sys.executable).resolve(strict=True)
+    record = registry_public_record(load_trusted_executable_registry())
+    python_entry = record["entries"]["python"]
+    assert python_entry == {
+        "kind": "local",
+        "path": str(executable),
+        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+    }
+    return record
 
 
 def test_project_denied_uses_segment_aware_pattern_intersection(valid_bundle) -> None:
@@ -208,6 +225,7 @@ def test_gate_evidence_retains_hashes_without_persisting_captured_secret(
     monkeypatch.setenv("R16_GATE_SENTINEL", sentinel)
     monkeypatch.setattr(cli_module, "_MAX_GATE_CAPTURE_BYTES", 32)
     assert len(sentinel.encode("utf-8")) < cli_module._MAX_GATE_CAPTURE_BYTES
+    trusted_registry = _trusted_python_registry_record()
     ctx = _context(tmp_path, "gate")
     state = start_round(
         ctx,
@@ -245,20 +263,49 @@ def test_gate_evidence_retains_hashes_without_persisting_captured_secret(
             ],
         },
     )
+    state = cli_module._initialize_cli_source_snapshot(ctx, state, shadow=False)
+    state = ctx.update(
+        lambda current: current.update(
+            {"trusted_executable_registry": copy.deepcopy(trusted_registry)}
+        )
+    )
+    runner_invocation_id = "gate-runner-r16"
+    invocation_binding = cli_module._invocation_state_binding(state)
+    ctx.append_event(invocation_event(
+        invocation_id=runner_invocation_id,
+        capability="independent-gate-runner",
+        stage="attempt",
+        result=None,
+        actor="gate-runner-r16",
+        details=invocation_binding,
+        identity_assurance="host-hook-observed",
+        responsibility_group="independent-gate-execution-r16",
+    ))
     evidence, execution, code = cli_module._run_registered_gate(
         ctx,
         {
-            "actor": "reviewer-r16",
+            "actor": "gate-runner-r16",
             "record": {
                 "gate_id": "gate.r16",
                 "criterion_id": state["goal"]["acceptance_criteria"][0][
                     "criterion_id"
                 ],
                 "evidence_id": "evidence-r16",
-                "collector_responsibility_group": "quality-r16",
+                "collector_responsibility_group": "independent-gate-execution-r16",
+                "collector_invocation_id": runner_invocation_id,
             },
         },
     )
+    ctx.append_event(invocation_event(
+        invocation_id=runner_invocation_id,
+        capability="independent-gate-runner",
+        stage="result",
+        result="success",
+        actor="gate-runner-r16",
+        details=invocation_binding,
+        identity_assurance="host-hook-observed",
+        responsibility_group="independent-gate-execution-r16",
+    ))
 
     persisted = json.dumps(
         {"state": ctx.load(), "events": ctx.events(), "evidence": evidence, "execution": execution},

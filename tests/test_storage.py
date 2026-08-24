@@ -53,12 +53,23 @@ def test_100_way_authoritative_state_update_is_lossless(tmp_path):
 def test_100_way_cli_event_updates_keep_state_and_event_ledger(tmp_path):
     root = Path(__file__).resolve().parents[1]
     state_root = tmp_path / "state"
+    skill_root = tmp_path / "skill-home" / ".codex" / "skills"
+    skill_file = skill_root / "concurrency" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        "---\n"
+        "name: concurrency\n"
+        "description: concurrency state event capability\n"
+        "---\n"
+        "# Test concurrency capability\n",
+        encoding="utf-8",
+    )
     common = [
         "--runtime", "codex", "--workspace", str(tmp_path), "--session", "cli-100",
         "--round", "round-100", "--state-root", str(state_root),
     ]
     started = subprocess.run(
-        [sys.executable, "-m", "supervisor_core", "start", *common, "--message", "concurrency", "--change-mode", "replace", "--execution-mode", "observe"],
+        [sys.executable, "-m", "supervisor_core", "start", *common, "--message", "concurrency", "--change-mode", "replace", "--execution-mode", "observe", "--roots", str(skill_root)],
         cwd=root, capture_output=True, text=True, encoding="utf-8", check=True,
     )
     state_file = Path(json.loads(started.stdout)["state_file"])

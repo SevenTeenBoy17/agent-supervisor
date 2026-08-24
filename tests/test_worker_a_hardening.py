@@ -15,7 +15,7 @@ from supervisor_core import workspace as workspace_module
 from supervisor_core.cli import _evaluate_builtin_gate, main
 from supervisor_core.contracts import build_goal
 from supervisor_core.routing import split_intents
-from supervisor_core.util import sha256_text
+from supervisor_core.util import sha256_file, sha256_text
 
 
 def _common(tmp_path: Path, *, session: str = "worker-a-session") -> list[str]:
@@ -96,7 +96,11 @@ def test_source_snapshot_is_deterministic_and_whitelisted(tmp_path, monkeypatch)
 
 def test_static_core_manifest_covers_every_runtime_source_file() -> None:
     core_root = Path(workspace_module.__file__).resolve().parents[1]
-    runtime_sources = {"bin/agent-supervisor.py"} | {
+    runtime_sources = {
+        "bin/agent-supervisor.py",
+        "bin/build-core-release-manifest.py",
+        "bin/run-coderabbit-review.py",
+    } | {
         path.relative_to(core_root).as_posix()
         for path in (core_root / "supervisor_core").rglob("*")
         if path.is_file() and path.suffix in {".py", ".json"}
@@ -193,34 +197,56 @@ def test_gate_binds_source_snapshot_and_source_change_blocks_old_evidence(tmp_pa
         "capture_supervisor_source_snapshot",
         lambda: first_snapshot,
     )
+    install_home = tmp_path / "install-home"
+    registry_path = install_home / ".agent-supervisor" / "trusted-executables.json"
+    registry_path.parent.mkdir(parents=True)
+    trusted_python = Path(sys.executable).resolve(strict=True)
+    registry_path.write_text(
+        json.dumps({
+            "contract": "TrustedExecutableRegistry/v1",
+            "entries": {
+                "python": {
+                    "kind": "local",
+                    "path": str(trusted_python),
+                    "sha256": sha256_file(trusted_python),
+                }
+            },
+            "generated_at": "2026-08-24T00:00:00Z",
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
     common, state_file = _start(tmp_path, capsys)
     state = json.loads(state_file.read_text(encoding="utf-8"))
     criterion_id = state["goal"]["acceptance_criteria"][0]["criterion_id"]
     state["supervisor_source_snapshot"] = first_snapshot
     state["quality_profile"] = {
         "global_gates": [],
-        "common_gates": [{"id": "gate.source", "command": [sys.executable, "-c", "print('ok')"]}],
+        "common_gates": [{"id": "gate.source", "command": [str(trusted_python), "-c", "print('ok')"]}],
     }
     state_file.write_text(json.dumps(state), encoding="utf-8")
     request = json.dumps({"record": {
         "gate_id": "gate.source",
         "criterion_id": criterion_id,
         "evidence_id": "source-evidence",
-        "collector_responsibility_group": "quality",
     }})
 
-    assert main(["event", *common, "--event-type", "gate_run", "--actor", "reviewer", "--data-json", request]) == 0
+    assert main(["event", *common, "--event-type", "gate_run", "--data-json", request]) == 0
     execution = json.loads(capsys.readouterr().out)
     persisted = json.loads(state_file.read_text(encoding="utf-8"))
     assert execution["source_snapshot_hash"] == first_snapshot["snapshot_sha256"]
     assert persisted["evidence"][0]["source_snapshot_hash"] == first_snapshot["snapshot_sha256"]
+    assert persisted["evidence"][0]["collector"] == "supervisor-core"
+    assert persisted["evidence"][0]["collector_responsibility_group"] == "trusted-core-gate-execution"
+    assert persisted["evidence"][0]["collector_identity_assurance"] == "core-executed-gate"
+    assert persisted["evidence"][0]["collector_completion_eligible"] is True
 
     monkeypatch.setattr(
         lifecycle_module.workspace_module,
         "capture_supervisor_source_snapshot",
         lambda: second_snapshot,
     )
-    assert main(["event", *common, "--event-type", "gate_run", "--actor", "reviewer", "--data-json", request]) == 4
+    assert main(["event", *common, "--event-type", "gate_run", "--data-json", request]) == 4
     degraded = json.loads(capsys.readouterr().out)
     persisted = json.loads(state_file.read_text(encoding="utf-8"))
     assert degraded["error"] == "SupervisorSourceSnapshotMismatch"
@@ -405,7 +431,10 @@ def test_manual_specialized_no_longer_bypasses_intent_invocation_coverage() -> N
     }
     code, artifact = _evaluate_builtin_gate(state, [], "intent-coverage", finalize_internal=False)
     assert code == 2
-    assert any("no successful correlated invocation" in failure for failure in artifact["failures"])
+    assert any(
+        "no completion-trusted correlated invocation" in failure
+        for failure in artifact["failures"]
+    )
 
 
 @pytest.mark.parametrize(

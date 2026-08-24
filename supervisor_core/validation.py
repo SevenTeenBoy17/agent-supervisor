@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import workspace as workspace_module
 from .constants import CHANGE_MODES, EXECUTION_MODES, INTENT_STATES, REVIEW_VERDICTS
 from .attestation import verify_record
 from .contracts import validate_review_shape
@@ -13,12 +14,30 @@ from .workspace import (
     capture_supervisor_source_snapshot,
     capture_workspace_snapshot,
     segment_glob_match,
+    validate_git_commit_binding,
+    validate_review_artifact,
+    validate_review_output_artifact,
     validated_supervisor_source_snapshot_hash,
     workspace_delta,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
 _PLACEHOLDER = re.compile(r"(?i)\b(?:tbd|todo|fixme|placeholder|trust\s+me|稍后|待定|未解决)\b")
+_TRUSTED_CORE_REVIEW_RUNNERS = {
+    "review.coderabbit": [
+        "supervisor-trusted-core-runner",
+        "bin/run-coderabbit-review.py",
+        "--review-category",
+        "independent",
+    ],
+    "review.coderabbit.test-integrity": [
+        "supervisor-trusted-core-runner",
+        "bin/run-coderabbit-review.py",
+        "--review-category",
+        "test-integrity",
+    ],
+}
 
 
 def _nonempty_string(value: Any) -> bool:
@@ -39,6 +58,160 @@ def _array_or_empty(value: Any, label: str, errors: list[str]) -> list[Any]:
 
 def _valid_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA256.fullmatch(value))
+
+
+def _valid_git_oid(value: Any, object_format: Any) -> bool:
+    expected = _GIT_OID_LENGTHS.get(str(object_format or ""))
+    return bool(
+        expected
+        and isinstance(value, str)
+        and len(value) == expected
+        and value == value.casefold()
+        and re.fullmatch(r"[0-9a-f]+", value)
+    )
+
+
+def _review_output_matches_gate(
+    gate_id: Any,
+    output: Any,
+) -> tuple[bool, str]:
+    """Bind a validated review summary to the registered review engine/check."""
+    exact_gate = gate_id if isinstance(gate_id, str) else ""
+    if not isinstance(output, dict) or not isinstance(output.get("review_summary"), dict):
+        return False, "review-summary-missing"
+    summary = output["review_summary"]
+    if exact_gate == "review.coderabbit":
+        if (
+            summary.get("engine") != "coderabbit"
+            or output.get("review_category") != "independent"
+        ):
+            return False, "review-summary-engine-mismatch"
+        return True, "verified"
+    if exact_gate == "review.coderabbit.test-integrity":
+        if (
+            summary.get("engine") != "coderabbit"
+            or output.get("review_category") != "test-integrity"
+        ):
+            return False, "review-summary-engine-mismatch"
+        return True, "verified"
+    if exact_gate == "review.code-review-graph.build":
+        expected_check = "build"
+    elif exact_gate == "review.code-review-graph.impact":
+        expected_check = "impact"
+    else:
+        return False, "review-summary-gate-unsupported"
+    if summary.get("engine") != "code-review-graph":
+        return False, "review-summary-engine-mismatch"
+    if summary.get("check") != expected_check:
+        return False, "review-summary-graph-check-mismatch"
+    return True, "verified"
+
+
+_BINDING_FIELDS = (
+    "base",
+    "head",
+    "git_object_format",
+    "git_binding_status",
+    "git_binding_source",
+    "git_repository_root",
+    "review_artifact_sha256",
+    "git_diff_sha256",
+    "workspace_base_sha256",
+    "workspace_head_sha256",
+    "diff_hash",
+)
+
+
+def _validate_binding_shape(record: dict[str, Any], label: str, errors: list[str]) -> None:
+    status = record.get("git_binding_status")
+    source = record.get("git_binding_source")
+    object_format = record.get("git_object_format")
+    if not _valid_hash(record.get("workspace_base_sha256")):
+        errors.append(f"{label} workspace_base_sha256 invalid")
+    if not _valid_hash(record.get("workspace_head_sha256")):
+        errors.append(f"{label} workspace_head_sha256 invalid")
+    if not _valid_hash(record.get("diff_hash")):
+        errors.append(f"{label} diff_hash invalid")
+    if status == "verified":
+        if source not in {"workspace", "review-artifact"}:
+            errors.append(f"{label} git binding source invalid")
+        if not _valid_git_oid(record.get("base"), object_format):
+            errors.append(f"{label} base Git OID invalid")
+        if not _valid_git_oid(record.get("head"), object_format):
+            errors.append(f"{label} head Git OID invalid")
+        if source == "workspace":
+            if not _nonempty_string(record.get("git_repository_root")):
+                errors.append(f"{label} workspace Git repository root missing")
+            if record.get("review_artifact_sha256") not in {None, ""}:
+                errors.append(f"{label} workspace binding contains review artifact identity")
+        elif source == "review-artifact":
+            if record.get("git_repository_root") not in {None, ""}:
+                errors.append(f"{label} review artifact binding claims a live repository root")
+            if not _valid_hash(record.get("review_artifact_sha256")):
+                errors.append(f"{label} review artifact identity invalid")
+            if not _valid_hash(record.get("git_diff_sha256")):
+                errors.append(f"{label} review artifact Git diff hash invalid")
+    elif status in {"unavailable", "degraded"}:
+        if record.get("base") not in {None, ""} or record.get("head") not in {None, ""}:
+            errors.append(f"{label} unavailable Git binding contains pseudo OIDs")
+        if source not in {None, ""}:
+            errors.append(f"{label} unavailable Git binding source must be empty")
+    else:
+        errors.append(f"{label} git binding status invalid")
+
+
+def _validate_live_or_artifact_binding(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    label: str,
+    errors: list[str],
+    *,
+    observed: dict[str, Any] | None = None,
+) -> None:
+    _validate_binding_shape(record, label, errors)
+    if record.get("git_binding_status") != "verified":
+        return
+    if record.get("git_binding_source") == "workspace":
+        repository_root = str(record.get("git_repository_root") or "")
+        workspace = str(state.get("workspace") or "")
+        try:
+            same_root = Path(repository_root).resolve() == Path(workspace).resolve()
+        except (OSError, ValueError):
+            same_root = False
+        if not same_root:
+            errors.append(f"{label} Git repository root is not the active workspace")
+            return
+        valid, reason = validate_git_commit_binding(
+            repository_root,
+            base=record.get("base"),
+            head=record.get("head"),
+            object_format=record.get("git_object_format"),
+        )
+        if not valid:
+            errors.append(f"{label} Git commit binding invalid: {reason}")
+    elif record.get("git_binding_source") == "review-artifact":
+        valid, reason, manifest = validate_review_artifact(
+            record.get("review_artifact"),
+            base=record.get("base"),
+            head=record.get("head"),
+            object_format=record.get("git_object_format"),
+            diff_hash=record.get("diff_hash"),
+            workspace_base_sha256=record.get("workspace_base_sha256"),
+            workspace_head_sha256=record.get("workspace_head_sha256"),
+        )
+        if not valid or not isinstance(manifest, dict):
+            errors.append(f"{label} immutable review artifact invalid: {reason}")
+            return
+        artifact = record.get("review_artifact")
+        if not isinstance(artifact, dict) or artifact.get("manifest_sha256") != record.get("review_artifact_sha256"):
+            errors.append(f"{label} review artifact identity does not match its manifest")
+        if manifest.get("git_diff_sha256") != record.get("git_diff_sha256"):
+            errors.append(f"{label} review artifact Git diff is not bound")
+        if observed is not None:
+            if manifest.get("files") != observed.get("files"):
+                errors.append(f"{label} review artifact files do not match observed workspace delta")
+            if manifest.get("workspace_delta_manifest") != observed.get("manifest"):
+                errors.append(f"{label} review artifact delta manifest does not match observed workspace delta")
 
 
 def _canonical_relative_path(value: Any) -> str | None:
@@ -269,13 +442,19 @@ def successful_invocations(events: list[dict[str, Any]]) -> tuple[set[str], dict
         if not attempt_actor or result_actor != attempt_actor:
             errors.append(f"invocation {invocation_id} actor changed between attempt and result")
             continue
+        if result.get("responsibility_group") != attempt.get("responsibility_group"):
+            errors.append(
+                f"invocation {invocation_id} responsibility group changed between attempt and result"
+            )
+            continue
         if result.get("result") == "success":
             successful.add(attempt_capability)
     return successful, results, errors
 
 
 def _trusted_invocation_for_runtime(
-    events: list[dict[str, Any]], invocation_id: str, *, actor: Any, state: dict[str, Any]
+    events: list[dict[str, Any]], invocation_id: str, *, actor: Any,
+    responsibility_group: Any | None = None, state: dict[str, Any]
 ) -> bool:
     pair = [
         event for event in events
@@ -307,13 +486,66 @@ def _trusted_invocation_for_runtime(
     attempt_assurance = attempt.get("identity_assurance")
     result_assurance = result.get("identity_assurance")
     accepted_assurances = _accepted_runtime_assurances(state)
+    core_finalize_identity_valid = bool(
+        attempt_assurance != "core-trusted-finalize"
+        or (
+            actor == "supervisor-core"
+            and attempt.get("actor") == "supervisor-core"
+            and result.get("actor") == "supervisor-core"
+            and attempt.get("responsibility_group") == "trusted-runtime"
+            and result.get("responsibility_group") == "trusted-runtime"
+            and _nonempty_string(attempt_details.get("gate_id"))
+            and _nonempty_string(attempt_details.get("criterion_id"))
+            and attempt.get("capability")
+            == f"supervisor-core-builtin:{attempt_details.get('gate_id')}"
+            and attempt_details.get("phase") == "builtin-finalize"
+            and result_details.get("phase") == "builtin-finalize"
+            and attempt_details.get("gate_id") == result_details.get("gate_id")
+            and attempt_details.get("criterion_id")
+            == result_details.get("criterion_id")
+        )
+    )
+    core_gate_identity_valid = bool(
+        attempt_assurance != "core-executed-gate"
+        or (
+            actor == "supervisor-core"
+            and attempt.get("actor") == "supervisor-core"
+            and result.get("actor") == "supervisor-core"
+            and attempt.get("responsibility_group") == "trusted-core-gate-execution"
+            and result.get("responsibility_group") == "trusted-core-gate-execution"
+            and _nonempty_string(attempt_details.get("gate_id"))
+            and _nonempty_string(attempt_details.get("criterion_id"))
+            and attempt.get("capability")
+            == f"supervisor-core-gate:{attempt_details.get('gate_id')}"
+            and attempt_details.get("phase") == "registered-gate-execution"
+            and result_details.get("phase") == "registered-gate-execution"
+            and attempt_details.get("gate_id") == result_details.get("gate_id")
+            and attempt_details.get("criterion_id")
+            == result_details.get("criterion_id")
+            and attempt.get("identity_provenance")
+            == "core-minted-single-use-gate-execution"
+            and result.get("identity_provenance")
+            == "core-minted-single-use-gate-execution"
+            and attempt.get("completion_eligible") is True
+            and result.get("completion_eligible") is True
+        )
+    )
     return bool(
         result.get("result") == "success"
         and attempt.get("actor") == actor
         and result.get("actor") == actor
+        and (
+            responsibility_group is None
+            or (
+                attempt.get("responsibility_group") == responsibility_group
+                and result.get("responsibility_group") == responsibility_group
+            )
+        )
         and attempt.get("capability") == result.get("capability")
         and attempt_assurance == result_assurance
         and attempt_assurance in accepted_assurances
+        and core_finalize_identity_valid
+        and core_gate_identity_valid
         and verify_record(attempt)
         and verify_record(result)
         and all(attempt_details.get(key) == value for key, value in expected_binding.items())
@@ -322,16 +554,120 @@ def _trusted_invocation_for_runtime(
 
 
 def _accepted_runtime_assurances(state: dict[str, Any]) -> set[str]:
-    if state.get("runtime") == "codex":
-        # Native Codex Hooks are host observations.  Keep explicit audit as a
-        # compatibility lane for older Codex adapters and manually finalized
-        # rounds; both remain bound to signed attempt/result pairs.
-        return {"host-hook-observed", "codex-explicit-audit"}
-    return {"host-hook-observed"}
+    runtime = str(state.get("runtime") or "").strip().casefold()
+    if runtime == "codex":
+        # Codex does not expose an external host-signed identity primitive to
+        # this adapter. CLI submissions and hook payloads are useful audit
+        # observations, but the caller can choose their actor/group fields.
+        # They therefore cannot establish implementer/reviewer/gate-runner
+        # independence or contribute to a completed round.  Only the narrowly
+        # constrained core builtin finalize identity is accepted here.
+        return {"core-executed-gate", "core-trusted-finalize"}
+    if runtime in {"claude", "test"}:
+        return {"host-hook-observed", "core-executed-gate", "core-trusted-finalize"}
+    return {"core-executed-gate", "core-trusted-finalize"}
 
 
 def _runtime_assurance_accepted(state: dict[str, Any], assurance: Any) -> bool:
     return isinstance(assurance, str) and assurance in _accepted_runtime_assurances(state)
+
+
+def _completion_trusted_invocations(
+    state: dict[str, Any], events: list[dict[str, Any]]
+) -> tuple[set[str], dict[str, dict[str, Any]], list[str]]:
+    """Return capability successes that may close intent coverage.
+
+    A Codex ``locally-audited`` pair is intentionally accepted only in this
+    capability-contribution projection.  It does not authenticate an actor or
+    responsibility group and therefore is never accepted by
+    :func:`_trusted_invocation_for_runtime` for implementer, reviewer, or gate
+    independence.  Gate execution retains its separate core-minted identity.
+    """
+    _, results, errors = successful_invocations(events)
+    capabilities: set[str] = set()
+    for invocation_id, result in results.items():
+        if result.get("result") != "success":
+            continue
+        if result.get("identity_assurance") in {
+            "core-executed-gate",
+            "core-trusted-finalize",
+        }:
+            # Quality-gate executions are evidence collectors, not routed
+            # capabilities, and must never be used to claim that a Skill ran.
+            continue
+        actor = result.get("actor")
+        responsibility_group = result.get("responsibility_group")
+        trusted_identity = _trusted_invocation_for_runtime(
+            events,
+            invocation_id,
+            actor=actor,
+            responsibility_group=responsibility_group,
+            state=state,
+        )
+        locally_audited = _locally_audited_capability_invocation(
+            state, events, invocation_id
+        )
+        if trusted_identity or locally_audited:
+            capability = str(result.get("capability") or "").strip()
+            if capability:
+                capabilities.add(capability)
+    return capabilities, results, errors
+
+
+def _locally_audited_capability_invocation(
+    state: dict[str, Any], events: list[dict[str, Any]], invocation_id: str
+) -> bool:
+    """Validate a Codex capability contribution without granting actor trust."""
+    if str(state.get("runtime") or "").strip().casefold() != "codex":
+        return False
+    pair = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("invocation_id") == invocation_id
+        and event.get("event_type") in {"invocation_attempt", "invocation_result"}
+    ]
+    attempts = [event for event in pair if event.get("event_type") == "invocation_attempt"]
+    results = [event for event in pair if event.get("event_type") == "invocation_result"]
+    if len(pair) != 2 or len(attempts) != 1 or len(results) != 1:
+        return False
+    attempt, result = attempts[0], results[0]
+    actor = attempt.get("actor")
+    group = attempt.get("responsibility_group")
+    capability = attempt.get("capability")
+    if not all(_nonempty_string(value) for value in (actor, group, capability)):
+        return False
+    goal = state.get("goal", {}) if isinstance(state.get("goal"), dict) else {}
+    manifest = state.get("request_manifest") if isinstance(state.get("request_manifest"), dict) else {}
+    expected_binding = {
+        "runtime": state.get("runtime"),
+        "project": state.get("project"),
+        "workspace": str(Path(str(state.get("workspace") or "")).resolve()),
+        "session": state.get("session"),
+        "round": state.get("round"),
+        "goal_id": goal.get("goal_id"),
+        "goal_version": goal.get("version"),
+        "request_manifest_sha256": canonical_sha256(manifest),
+    }
+    attempt_details = attempt.get("details") if isinstance(attempt.get("details"), dict) else {}
+    result_details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    return bool(
+        result.get("result") == "success"
+        and result.get("actor") == actor
+        and result.get("responsibility_group") == group
+        and result.get("capability") == capability
+        and attempt.get("identity_assurance") == "codex-explicit-audit"
+        and result.get("identity_assurance") == "codex-explicit-audit"
+        and attempt.get("identity_provenance") == "caller-declared-local-observation"
+        and result.get("identity_provenance") == "caller-declared-local-observation"
+        and attempt.get("completion_eligible") is False
+        and result.get("completion_eligible") is False
+        and attempt_details.get("phase") == result_details.get("phase")
+        and verify_record(attempt)
+        and verify_record(result)
+        and all(attempt_details.get(key) == value for key, value in expected_binding.items())
+        and all(result_details.get(key) == value for key, value in expected_binding.items())
+    )
 
 
 def _validate_goal(state: dict[str, Any], errors: list[str]) -> None:
@@ -493,7 +829,13 @@ def _validate_tasks(state: dict[str, Any], criterion_ids: set[str], evidence: di
                 )
 
 
-def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: list[dict[str, Any]], errors: list[str]) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, set[str]]]:
+def _validate_evidence(
+    state: dict[str, Any],
+    criterion_ids: set[str],
+    events: list[dict[str, Any]],
+    errors: list[str],
+    observed: dict[str, Any] | None = None,
+) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, set[str]]]:
     evidence = state.get("evidence")
     if not isinstance(evidence, list):
         errors.append("evidence must be an array")
@@ -517,6 +859,13 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
         for event in events
         if isinstance(event, dict) and event.get("event_type") == "gate_execution" and event.get("execution_id")
     }
+    grants = {
+        str(event.get("grant_id")): event
+        for event in events
+        if isinstance(event, dict) and event.get("event_type") == "gate_grant" and event.get("grant_id")
+    }
+    _, invocation_results, invocation_errors = successful_invocations(events)
+    errors.extend(invocation_errors)
     source_snapshot_hash = (
         validated_supervisor_source_snapshot_hash(state.get("supervisor_source_snapshot"))
         if state.get("runtime") != "test"
@@ -559,9 +908,23 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     "collected_at": record.get("collected_at"),
                     "base": record.get("base"),
                     "head": record.get("head"),
+                    "git_object_format": record.get("git_object_format"),
+                    "git_binding_status": record.get("git_binding_status"),
+                    "git_binding_source": record.get("git_binding_source"),
+                    "git_repository_root": record.get("git_repository_root"),
+                    "review_artifact_sha256": record.get("review_artifact_sha256"),
+                    "git_diff_sha256": record.get("git_diff_sha256"),
+                    "workspace_base_sha256": record.get("workspace_base_sha256"),
+                    "workspace_head_sha256": record.get("workspace_head_sha256"),
                     "diff_hash": record.get("diff_hash"),
                     "collector": record.get("collector"),
                     "collector_responsibility_group": record.get("collector_responsibility_group"),
+                    "collector_invocation_id": record.get("collector_invocation_id"),
+                    "collector_identity_assurance": record.get("collector_identity_assurance"),
+                    "collector_completion_eligible": record.get("collector_completion_eligible"),
+                    "review_binding_input_sha256": record.get("review_binding_input_sha256"),
+                    "review_output_artifact": record.get("review_output_artifact"),
+                    "gate_grant_id": record.get("gate_grant_id"),
                     "output_sha256": record.get("output_sha256"),
                     "artifact_hash": record.get("artifact_hash"),
                     "resolved_executable": record.get("resolved_executable"),
@@ -588,6 +951,32 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
                     or record.get("source_snapshot_hash") != source_snapshot_hash
                 ):
                     errors.append(f"evidence {evidence_id} was signed for a different Supervisor source snapshot")
+                grant = grants.get(str(record.get("gate_grant_id") or ""))
+                if not isinstance(grant, dict) or not verify_record(grant):
+                    errors.append(f"evidence {evidence_id} lacks a valid single-use core gate grant")
+                else:
+                    grant_bindings = {
+                        "execution_id": record.get("execution_id"),
+                        "evidence_id": evidence_id,
+                        "gate_id": record.get("gate_id"),
+                        "criterion_id": record.get("criterion_id"),
+                        "collector": record.get("collector"),
+                        "collector_responsibility_group": record.get("collector_responsibility_group"),
+                        "collector_invocation_id": record.get("collector_invocation_id"),
+                        "collector_identity_assurance": record.get("collector_identity_assurance"),
+                        "collector_completion_eligible": record.get("collector_completion_eligible"),
+                        "review_binding_input_sha256": record.get("review_binding_input_sha256"),
+                    }
+                    if any(grant.get(key) != value for key, value in grant_bindings.items()):
+                        errors.append(f"evidence {evidence_id} does not match its core gate grant")
+                    uses = [
+                        event for event in events
+                        if isinstance(event, dict)
+                        and event.get("event_type") == "gate_execution"
+                        and event.get("gate_grant_id") == grant.get("grant_id")
+                    ]
+                    if len(uses) != 1:
+                        errors.append(f"evidence {evidence_id} core gate grant is not single-use")
         raw_criterion_id = record.get("criterion_id")
         criterion_id = raw_criterion_id.strip() if isinstance(raw_criterion_id, str) else ""
         if not criterion_id or criterion_id not in criterion_ids:
@@ -614,17 +1003,150 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
             errors.append(f"evidence {evidence_id} output hash invalid")
         elif record.get("artifact_hash") != record.get("output_sha256"):
             errors.append(f"evidence {evidence_id} artifact hash does not match complete gate output")
-        for binding_hash in ("base", "head", "diff_hash"):
-            if not _valid_hash(record.get(binding_hash)):
-                errors.append(f"evidence {evidence_id} {binding_hash} invalid")
+        _validate_binding_shape(record, f"evidence {evidence_id}", errors)
         if not _nonempty_string(record.get("collector")) or not _nonempty_string(record.get("collector_responsibility_group")):
             errors.append(f"evidence {evidence_id} collector identity/group missing")
+        collector_invocation = str(record.get("collector_invocation_id") or "")
+        collector_result = invocation_results.get(collector_invocation)
+        collector_completion_trusted = False
+        if (
+            not collector_invocation
+            or not isinstance(collector_result, dict)
+            or collector_result.get("result") != "success"
+            or collector_result.get("actor") != record.get("collector")
+            or collector_result.get("identity_assurance") != record.get("collector_identity_assurance")
+        ):
+            errors.append(f"evidence {evidence_id} collector lacks a successful bound runner invocation")
+        else:
+            collector_completion_trusted = _trusted_invocation_for_runtime(
+                events, collector_invocation, actor=record.get("collector"),
+                responsibility_group=record.get("collector_responsibility_group"), state=state
+            )
+            if not collector_completion_trusted:
+                errors.append(f"evidence {evidence_id} collector invocation lacks accepted runtime assurance")
+        if str(state.get("runtime") or "").strip().casefold() == "codex":
+            if record.get("collector_completion_eligible") is not collector_completion_trusted:
+                errors.append(
+                    f"evidence {evidence_id} collector completion-eligibility provenance mismatch"
+                )
+            if not collector_completion_trusted:
+                errors.append(
+                    f"evidence {evidence_id} is an auditable Codex observation, not completion evidence"
+                )
         if not _nonempty_string(record.get("gate_id")) or record.get("relevant") is not True:
             errors.append(f"evidence {evidence_id} unrelated to a registered gate")
         elif record.get("gate_id") not in gate_commands:
             errors.append(f"evidence {evidence_id} gate is not registered in QualityProfile")
         elif isinstance(command, dict) and command.get("args") != gate_commands.get(str(record.get("gate_id"))):
             errors.append(f"evidence {evidence_id} command does not match registered gate")
+        exact_gate_id = record.get("gate_id")
+        requires_review_binding = (
+            exact_gate_id == "review.coderabbit"
+            or exact_gate_id == "review.coderabbit.test-integrity"
+            or exact_gate_id == "review.code-review-graph.build"
+            or exact_gate_id == "review.code-review-graph.impact"
+        )
+        if requires_review_binding and not _valid_hash(
+            record.get("review_binding_input_sha256")
+        ):
+            errors.append(f"evidence {evidence_id} review gate lacks core-observed binding input")
+        elif requires_review_binding:
+            if not isinstance(observed, dict) or not isinstance(observed.get("manifest"), dict):
+                errors.append(f"evidence {evidence_id} review artifact cannot be rebound to an observed workspace delta")
+            else:
+                binding_input = {
+                    "contract": "ReviewArtifactBindingInput/v1",
+                    "workspace_base_sha256": record.get("workspace_base_sha256"),
+                    "workspace_head_sha256": record.get("workspace_head_sha256"),
+                    "diff_hash": record.get("diff_hash"),
+                    "workspace_delta_manifest": observed.get("manifest"),
+                }
+                review_output = record.get("review_output_artifact")
+                artifact_manifest: dict[str, Any] | None = None
+                if isinstance(review_output, dict):
+                    artifact_valid, _, candidate_manifest = workspace_module.validate_review_artifact(
+                        review_output.get("review_artifact"),
+                        base=review_output.get("base"),
+                        head=review_output.get("head"),
+                        object_format=review_output.get("git_object_format"),
+                        diff_hash=review_output.get("diff_hash"),
+                        workspace_base_sha256=review_output.get(
+                            "workspace_base_sha256"
+                        ),
+                        workspace_head_sha256=review_output.get(
+                            "workspace_head_sha256"
+                        ),
+                    )
+                    if artifact_valid and isinstance(candidate_manifest, dict):
+                        artifact_manifest = candidate_manifest
+                if isinstance(artifact_manifest, dict):
+                    source_manifest = artifact_manifest.get("source_review_manifest")
+                    source_fields = (
+                        "supervisor_source_snapshot_sha256",
+                        "review_core_manifest_sha256",
+                        "review_adapter_manifest_sha256",
+                    )
+                    source_binding_present = any(
+                        field in artifact_manifest for field in source_fields
+                    )
+                    if source_binding_present:
+                        adapter_manifest = {
+                            path: digest
+                            for path, digest in (
+                                source_manifest.items()
+                                if isinstance(source_manifest, dict)
+                                else []
+                            )
+                            if isinstance(path, str)
+                            and path.startswith(
+                                ("global-codex/", "global-claude/")
+                            )
+                        }
+                        if (
+                            all(
+                                _valid_hash(artifact_manifest.get(field))
+                                for field in source_fields
+                            )
+                            and adapter_manifest
+                            and canonical_sha256(adapter_manifest)
+                            == artifact_manifest.get(
+                                "review_adapter_manifest_sha256"
+                            )
+                        ):
+                            binding_input.update({
+                                "supervisor_source_snapshot_sha256": artifact_manifest[
+                                    "supervisor_source_snapshot_sha256"
+                                ],
+                                "review_core_manifest_sha256": artifact_manifest[
+                                    "review_core_manifest_sha256"
+                                ],
+                                "review_adapter_manifest": adapter_manifest,
+                                "review_adapter_manifest_sha256": artifact_manifest[
+                                    "review_adapter_manifest_sha256"
+                                ],
+                            })
+                if canonical_sha256(binding_input) != record.get("review_binding_input_sha256"):
+                    errors.append(f"evidence {evidence_id} review binding input hash is not core-reproducible")
+                valid_output, output_reason, validated_output = validate_review_output_artifact(
+                    review_output, binding_input
+                )
+                if not valid_output:
+                    errors.append(
+                        f"evidence {evidence_id} immutable review output artifact invalid: {output_reason}"
+                    )
+                else:
+                    engine_valid, engine_reason = _review_output_matches_gate(
+                        exact_gate_id, validated_output
+                    )
+                    if not engine_valid:
+                        errors.append(
+                            f"evidence {evidence_id} review output does not match registered gate: {engine_reason}"
+                        )
+        else:
+            if record.get("review_binding_input_sha256") not in {None, ""}:
+                errors.append(f"evidence {evidence_id} non-review gate claims review binding input")
+            if record.get("review_output_artifact") is not None and record.get("review_output_artifact") != "":
+                errors.append(f"evidence {evidence_id} non-review gate claims review output artifact")
         gate_definition = gate_definitions.get(str(record.get("gate_id")))
         if isinstance(gate_definition, dict):
             expected_precondition = gate_definition.get("precondition")
@@ -657,7 +1179,7 @@ def _validate_evidence(state: dict[str, Any], criterion_ids: set[str], events: l
             errors.append(f"evidence {evidence_id} belongs to a different goal version")
         changes = state.get("changes") if isinstance(state.get("changes"), dict) else {}
         if changes.get("diff_hash"):
-            if record.get("base") != changes.get("base") or record.get("head") != changes.get("head") or record.get("diff_hash") != changes.get("diff_hash"):
+            if any(record.get(field) != changes.get(field) for field in _BINDING_FIELDS):
                 errors.append(f"evidence {evidence_id} is not bound to the reviewed diff")
         if len(errors) == record_error_count:
             satisfied_labels.setdefault(str(criterion_id), set()).add(str(record.get("gate_id")))
@@ -676,7 +1198,9 @@ def _validate_intents(
         intents = []
     elif not intents:
         errors.append("IntentCoverage is empty")
-    success_caps, invocation_results, invocation_errors = successful_invocations(events)
+    success_caps, invocation_results, invocation_errors = _completion_trusted_invocations(
+        state, events
+    )
     errors.extend(invocation_errors)
     manifest = state.get("intent_manifest")
     if not isinstance(manifest, list) or not manifest:
@@ -741,7 +1265,9 @@ def _validate_intents(
         if status == "covered":
             capabilities = intent.get("capability_ids")
             if not _nonempty_string_list(capabilities) or not set(capabilities).intersection(success_caps):
-                errors.append(f"intent {intent.get('intent_id', index)} has no successful correlated invocation")
+                errors.append(
+                    f"intent {intent.get('intent_id', index)} has no completion-trusted correlated invocation and no locally-audited correlated capability invocation"
+                )
         elif status == "skipped":
             if not _nonempty_string(intent.get("reason")) or intent.get("reason") == "awaiting routing":
                 errors.append(f"intent {intent.get('intent_id', index)} skipped without concrete reason")
@@ -762,7 +1288,7 @@ def _validate_intents(
             implementer = str(review.get("implementer") or "")
             reviewer = str(review.get("reviewer") or "")
             implementer_group = str(review.get("implementer_responsibility_group") or "")
-            reviewer_group = str(review.get("responsibility_group") or "")
+            reviewer_group = str(review.get("reviewer_responsibility_group") or "")
             implementer_invocation = str(review.get("implementer_invocation_id") or "")
             reviewer_invocation = str(review.get("reviewer_invocation_id") or "")
             implementer_result = invocation_results.get(implementer_invocation)
@@ -783,22 +1309,43 @@ def _validate_intents(
                 and isinstance(reviewer_result, dict)
                 and reviewer_result.get("result") == "success"
                 and reviewer_result.get("actor") == reviewer
-                and _trusted_invocation_for_runtime(events, implementer_invocation, actor=implementer, state=state)
-                and _trusted_invocation_for_runtime(events, reviewer_invocation, actor=reviewer, state=state)
+                and _trusted_invocation_for_runtime(
+                    events, implementer_invocation, actor=implementer,
+                    responsibility_group=implementer_group, state=state
+                )
+                and _trusted_invocation_for_runtime(
+                    events, reviewer_invocation, actor=reviewer,
+                    responsibility_group=reviewer_group, state=state
+                )
                 and _runtime_assurance_accepted(state, review.get("actor_identity_assurance"))
                 and review.get("request_manifest_sha256") == request_manifest_sha256
                 and review.get("goal_id") == goal.get("goal_id")
                 and review.get("goal_version") == goal.get("version")
+                and review.get("issued_by") == "supervisor-core-review-finalize"
+                and verify_record(review)
             )
             if not independent:
                 continue
             rerun_ids = review.get("rerun_evidence_ids", [])
             if not set(rerun_ids).issubset(evidence):
                 continue
-            if all(
-                evidence[evidence_id].get("collector") == review.get("reviewer")
-                and evidence[evidence_id].get("collector_responsibility_group") == review.get("responsibility_group")
-                for evidence_id in rerun_ids
+            verification = review.get("evidence_verification")
+            if (
+                review.get("gate_collector") not in {implementer, reviewer}
+                and review.get("gate_collector_responsibility_group")
+                not in {implementer_group, reviewer_group}
+                and all(
+                    evidence[evidence_id].get("collector") == review.get("gate_collector")
+                    and evidence[evidence_id].get("collector_responsibility_group")
+                    == review.get("gate_collector_responsibility_group")
+                    and evidence[evidence_id].get("collector_invocation_id")
+                    == review.get("gate_runner_invocation_id")
+                    for evidence_id in rerun_ids
+                )
+                and isinstance(verification, dict)
+                and verification.get("status") == "VERIFIED"
+                and verification.get("reviewer") == reviewer
+                and verification.get("evidence_ids") == rerun_ids
             ):
                 approved = True
                 break
@@ -844,6 +1391,166 @@ def _validate_supervisor_source_snapshot(state: dict[str, Any], errors: list[str
         errors.append("Supervisor source changed after round start")
         return None
     return expected_hash
+
+
+def _validate_automated_external_review(
+    state: dict[str, Any],
+    review: dict[str, Any],
+    changes: dict[str, Any],
+    evidence: dict[str, dict[str, Any]],
+    events: list[dict[str, Any]],
+    invocation_results: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> bool:
+    """Validate the fixed three-domain Codex external-review trust model."""
+    review_id = str(review.get("review_id") or "automated-external")
+    category = review.get("review_category")
+    expected_gate = {
+        "independent": "review.coderabbit",
+        "test-integrity": "review.coderabbit.test-integrity",
+    }.get(category)
+    expected_reviewer = {
+        "independent": (
+            "coderabbit",
+            "external-coderabbit-independent-review",
+        ),
+        "test-integrity": (
+            "coderabbit-test-integrity",
+            "external-coderabbit-test-integrity",
+        ),
+    }.get(category)
+    valid = True
+
+    def reject(reason: str) -> None:
+        nonlocal valid
+        valid = False
+        errors.append(f"review {review_id} automated external review {reason}")
+
+    if expected_gate is None or expected_reviewer is None:
+        reject("category invalid")
+        return False
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    fixed = {
+        "contract": "ReviewRecord/v3",
+        "review_mode": "automated-external",
+        "reviewer": expected_reviewer[0],
+        "reviewer_responsibility_group": expected_reviewer[1],
+        "implementer": "codex-local-workspace",
+        "implementer_responsibility_group": "local-workspace-producer",
+        "gate_collector": "supervisor-core",
+        "gate_collector_responsibility_group": "trusted-core-gate-execution",
+        "actor_identity_assurance": "core-attested-external-review",
+        "issued_by": "supervisor-core-automated-external-review",
+        "verdict": "APPROVE",
+        "unresolved_p0_p1": 0,
+    }
+    if any(review.get(key) != value for key, value in fixed.items()):
+        reject("fixed identity or verdict fields mismatch")
+    if (
+        review.get("goal_id") != goal.get("goal_id")
+        or review.get("goal_version") != goal.get("version")
+    ):
+        reject("goal version binding mismatch")
+    if review.get("trust_domains") != {
+        "producer": "core-observed-codex-local-workspace",
+        "reviewer": "authenticated-external-coderabbit",
+        "gate_execution": "core-executed-registered-gate",
+    }:
+        reject("trust domains mismatch")
+    if (
+        review.get("request_manifest_sha256")
+        != canonical_sha256(state.get("request_manifest", {}))
+        or not verify_record(review)
+    ):
+        reject("core attestation invalid")
+    if any(review.get(field) != changes.get(field) for field in _BINDING_FIELDS):
+        reject("diff binding mismatch")
+    if (
+        review.get("implementer_invocation_id")
+        != changes.get("implementer_invocation_id")
+    ):
+        reject("producer reference mismatch")
+    rerun_ids = review.get("rerun_evidence_ids")
+    if not isinstance(rerun_ids, list) or len(rerun_ids) != 1:
+        reject("must bind exactly one dedicated evidence record")
+        return False
+    record = evidence.get(str(rerun_ids[0]))
+    if not isinstance(record, dict) or record.get("gate_id") != expected_gate:
+        reject("dedicated gate evidence missing or wrong category")
+        return False
+    output = record.get("review_output_artifact")
+    summary = output.get("review_summary") if isinstance(output, dict) else None
+    if (
+        not isinstance(output, dict)
+        or output.get("review_category") != category
+        or not isinstance(summary, dict)
+        or summary.get("engine") != "coderabbit"
+        or summary.get("authenticated") is not True
+        or summary.get("context_bound") is not True
+        or summary.get("status") != "pass"
+        or summary.get("blocking_findings") != 0
+        or summary.get("severity_counts", {}).get("critical") != 0
+        or summary.get("severity_counts", {}).get("major") != 0
+    ):
+        reject("CodeRabbit artifact is not an exact blocker-free approval")
+    artifact_sha256 = canonical_sha256(output) if isinstance(output, dict) else ""
+    expected_review_id = (
+        f"review-coderabbit-{category}-{str(record.get('execution_id') or '')}"
+    )
+    if (
+        review.get("review_id") != expected_review_id
+        or not _nonempty_string(review.get("issued_at"))
+        or review.get("external_review_artifact_sha256") != artifact_sha256
+        or review.get("reviewer_invocation_id")
+        != f"external-artifact-{artifact_sha256[:24]}"
+        or review.get("findings") != (
+            summary.get("issues") if isinstance(summary, dict) else None
+        )
+    ):
+        reject("external artifact hash/findings binding mismatch")
+    runner_invocation = str(review.get("gate_runner_invocation_id") or "")
+    runner_result = invocation_results.get(runner_invocation)
+    if (
+        record.get("collector") != "supervisor-core"
+        or record.get("collector_responsibility_group")
+        != "trusted-core-gate-execution"
+        or record.get("collector_identity_assurance") != "core-executed-gate"
+        or record.get("collector_invocation_id") != runner_invocation
+        or not isinstance(runner_result, dict)
+        or runner_result.get("result") != "success"
+        or not _trusted_invocation_for_runtime(
+            events,
+            runner_invocation,
+            actor="supervisor-core",
+            responsibility_group="trusted-core-gate-execution",
+            state=state,
+        )
+    ):
+        reject("core gate execution provenance invalid")
+    verification = review.get("evidence_verification")
+    if verification != {
+        "status": "VERIFIED",
+        "reviewer": "supervisor-core-external-review-validator",
+        "evidence_ids": rerun_ids,
+    }:
+        reject("core evidence verification mismatch")
+    finalized_events = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("event_type") == "review_finalized"
+        and event.get("review_id") == review.get("review_id")
+    ]
+    if (
+        len(finalized_events) != 1
+        or not verify_record(finalized_events[0])
+        or finalized_events[0].get("review_sha256") != canonical_sha256(review)
+        or finalized_events[0].get("reviewer") != review.get("reviewer")
+        or finalized_events[0].get("verdict") != "APPROVE"
+        or finalized_events[0].get("review_category") != category
+    ):
+        reject("finalization event provenance invalid")
+    return valid
 
 
 def _is_test_path(path: str) -> bool:
@@ -907,29 +1614,64 @@ def _validate_changes_and_reviews(
             errors.append(f"real workspace diff omitted from changes record: {path}")
         for path in sorted(declared_files - observed_files):
             errors.append(f"changes record claims path absent from observed workspace diff: {path}")
-        for field in ("base", "head", "diff_hash"):
+        for field in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
             if changes.get(field) != observed.get(field):
                 errors.append(f"changes.{field} does not match core-observed workspace delta")
+        if changes.get("git_binding_source") == "workspace":
+            for field in (
+                "base", "head", "git_object_format", "git_binding_status",
+                "git_binding_source", "git_repository_root",
+            ):
+                if changes.get(field) != observed.get(field):
+                    errors.append(f"changes.{field} does not match core-observed workspace delta")
     allowed = []
     tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
     for task in tasks:
         if isinstance(task, dict) and task.get("status") == "done":
-            allowed.extend([p for p in task.get("allowed_paths", []) if _nonempty_string(p)])
+            task_allowed = task.get("allowed_paths")
+            if isinstance(task_allowed, list):
+                allowed.extend([p for p in task_allowed if _nonempty_string(p)])
     for path in files:
         if not _nonempty_string(path) or not _path_allowed(str(path), allowed):
             errors.append(f"out-of-scope diff: {path}")
     if files:
         _, invocation_results, invocation_errors = successful_invocations(events)
         errors.extend(invocation_errors)
-        for field in ("base", "head", "diff_hash", "implementer", "implementer_responsibility_group"):
+        for field in ("implementer", "implementer_responsibility_group"):
             if not _nonempty_string(changes.get(field)):
                 errors.append(f"changes.{field} missing")
+        _validate_live_or_artifact_binding(
+            state, changes, "changes", errors, observed=observed
+        )
+        if changes.get("git_binding_status") != "verified":
+            errors.append("changed diff lacks a verified Git or immutable review-artifact binding")
         implementer_invocation = str(changes.get("implementer_invocation_id") or "")
-        result = invocation_results.get(implementer_invocation)
-        if not implementer_invocation or not isinstance(result, dict) or result.get("result") != "success" or result.get("actor") != changes.get("implementer"):
-            errors.append("changes implementer identity lacks a successful correlated invocation")
-        elif not _trusted_invocation_for_runtime(events, implementer_invocation, actor=changes.get("implementer"), state=state):
-            errors.append("changes implementer identity is not bound to the active round with accepted runtime assurance")
+        codex_core_producer = bool(
+            str(state.get("runtime") or "").strip().casefold() == "codex"
+            and changes.get("contract") == "ChangesRecord/v3"
+            and changes.get("implementer") == "codex-local-workspace"
+            and changes.get("implementer_responsibility_group")
+            == "local-workspace-producer"
+            and changes.get("producer_identity_assurance")
+            == "core-observed-local-workspace"
+            and changes.get("issued_by") == "supervisor-core-workspace-observer"
+            and changes.get("goal_id") == goal.get("goal_id")
+            and changes.get("goal_version") == goal.get("version")
+            and changes.get("request_manifest_sha256")
+            == canonical_sha256(state.get("request_manifest", {}))
+            and implementer_invocation
+            == f"core-workspace-{str(changes.get('diff_hash') or '')[:24]}"
+            and verify_record(changes)
+        )
+        if not codex_core_producer:
+            result = invocation_results.get(implementer_invocation)
+            if not implementer_invocation or not isinstance(result, dict) or result.get("result") != "success" or result.get("actor") != changes.get("implementer"):
+                errors.append("changes implementer identity lacks a successful correlated invocation")
+            elif not _trusted_invocation_for_runtime(
+                events, implementer_invocation, actor=changes.get("implementer"),
+                responsibility_group=changes.get("implementer_responsibility_group"), state=state
+            ):
+                errors.append("changes implementer identity is not bound to the active round with accepted runtime assurance")
         if changes.get("diff") and sha256_text(str(changes["diff"])) != changes.get("diff_hash"):
             errors.append("changes.diff_hash does not match diff content")
         reviews = state.get("reviews") if isinstance(state.get("reviews"), list) else []
@@ -937,16 +1679,49 @@ def _validate_changes_and_reviews(
             errors.append("changed diff lacks independent ReviewRecord")
         else:
             approvals = 0
+            test_integrity_approvals = 0
             for index, review in enumerate(reviews):
                 if not validate_review_shape(review):
                     errors.append(f"review[{index}] shape invalid")
                     continue
-                if review.get("responsibility_group") == changes.get("implementer_responsibility_group"):
+                if review.get("review_mode") == "automated-external":
+                    automated_valid = _validate_automated_external_review(
+                        state,
+                        review,
+                        changes,
+                        evidence,
+                        events,
+                        invocation_results,
+                        errors,
+                    )
+                    if (
+                        automated_valid
+                        and review.get("review_category") == "independent"
+                    ):
+                        approvals += 1
+                    if (
+                        automated_valid
+                        and review.get("review_category") == "test-integrity"
+                    ):
+                        test_integrity_approvals += 1
+                    continue
+                reviewer_group = review.get("reviewer_responsibility_group")
+                implementer_group = changes.get("implementer_responsibility_group")
+                if reviewer_group == implementer_group:
                     errors.append(f"review {review.get('review_id')} is from implementer responsibility group")
                 if review.get("goal_id") != goal.get("goal_id") or review.get("goal_version") != goal.get("version"):
                     errors.append(f"review {review.get('review_id')} belongs to a different goal version")
-                if review.get("reviewer") == changes.get("implementer") or review.get("implementer") != changes.get("implementer"):
+                if (
+                    review.get("reviewer") == changes.get("implementer")
+                    or review.get("implementer") != changes.get("implementer")
+                    or review.get("implementer_responsibility_group") != implementer_group
+                ):
                     errors.append(f"review {review.get('review_id')} actor/implementer identity is not independent")
+                if (
+                    review.get("issued_by") != "supervisor-core-review-finalize"
+                    or not verify_record(review)
+                ):
+                    errors.append(f"review {review.get('review_id')} was not issued by core review_finalize")
                 reviewer_invocation = str(review.get("reviewer_invocation_id") or "")
                 reviewer_result = invocation_results.get(reviewer_invocation)
                 if (
@@ -956,7 +1731,10 @@ def _validate_changes_and_reviews(
                     or reviewer_result.get("actor") != review.get("reviewer")
                 ):
                     errors.append(f"review {review.get('review_id')} reviewer identity lacks a successful correlated invocation")
-                elif not _trusted_invocation_for_runtime(events, reviewer_invocation, actor=review.get("reviewer"), state=state):
+                elif not _trusted_invocation_for_runtime(
+                    events, reviewer_invocation, actor=review.get("reviewer"),
+                    responsibility_group=reviewer_group, state=state
+                ):
                     errors.append(
                         f"review {review.get('review_id')} reviewer identity is not bound to the active round "
                         "with accepted runtime assurance"
@@ -965,10 +1743,15 @@ def _validate_changes_and_reviews(
                     errors.append(f"review {review.get('review_id')} invocation identities are not independently bound")
                 assurance = review.get("actor_identity_assurance")
                 if not _runtime_assurance_accepted(state, assurance):
-                    errors.append(
-                        f"review {review.get('review_id')} actor identity assurance is not host-hook-observed or another accepted assurance for {state.get('runtime')}"
-                    )
-                if review.get("diff_hash") != changes.get("diff_hash") or review.get("base") != changes.get("base") or review.get("head") != changes.get("head"):
+                    if str(state.get("runtime") or "").strip().casefold() == "codex":
+                        errors.append(
+                            f"review {review.get('review_id')} actor identity assurance is not completion-trusted for codex"
+                        )
+                    else:
+                        errors.append(
+                            f"review {review.get('review_id')} actor identity assurance is not host-hook-observed or another accepted assurance for {state.get('runtime')}"
+                        )
+                if any(review.get(field) != changes.get(field) for field in _BINDING_FIELDS):
                     errors.append(f"review {review.get('review_id')} not bound to current base/head/diff")
                 rerun_ids = review.get("rerun_evidence_ids", [])
                 if not set(rerun_ids).issubset(evidence):
@@ -976,14 +1759,53 @@ def _validate_changes_and_reviews(
                 else:
                     for evidence_id in rerun_ids:
                         record = evidence[evidence_id]
-                        if record.get("collector") != review.get("reviewer") or record.get("collector_responsibility_group") != review.get("responsibility_group"):
-                            errors.append(f"review {review.get('review_id')} did not collect its rerun evidence")
+                        if (
+                            record.get("collector") != review.get("gate_collector")
+                            or record.get("collector_responsibility_group")
+                            != review.get("gate_collector_responsibility_group")
+                            or record.get("collector_invocation_id")
+                            != review.get("gate_runner_invocation_id")
+                        ):
+                            errors.append(f"review {review.get('review_id')} gate collector does not match rerun evidence")
+                collector = review.get("gate_collector")
+                collector_group = review.get("gate_collector_responsibility_group")
+                if (
+                    collector in {review.get("reviewer"), changes.get("implementer")}
+                    or collector_group in {reviewer_group, implementer_group}
+                ):
+                    errors.append(f"review {review.get('review_id')} gate collector is not independent")
+                runner_invocation = str(review.get("gate_runner_invocation_id") or "")
+                runner_result = invocation_results.get(runner_invocation)
+                if (
+                    not runner_invocation
+                    or not isinstance(runner_result, dict)
+                    or runner_result.get("result") != "success"
+                    or runner_result.get("actor") != collector
+                ):
+                    errors.append(f"review {review.get('review_id')} gate runner lacks a successful correlated invocation")
+                elif not _trusted_invocation_for_runtime(
+                    events, runner_invocation, actor=collector,
+                    responsibility_group=collector_group, state=state
+                ):
+                    errors.append(f"review {review.get('review_id')} gate runner lacks accepted runtime assurance")
+                verification = review.get("evidence_verification")
+                if (
+                    not isinstance(verification, dict)
+                    or verification.get("status") != "VERIFIED"
+                    or verification.get("reviewer") != review.get("reviewer")
+                    or verification.get("evidence_ids") != rerun_ids
+                ):
+                    errors.append(f"review {review.get('review_id')} evidence verification assertion invalid")
                 if review.get("verdict") == "APPROVE":
                     approvals += 1
                 else:
                     errors.append(f"review {review.get('review_id')} verdict {review.get('verdict')}")
             if approvals == 0:
                 errors.append("no independent APPROVE review for changed diff")
+            if _test_paths_changed(changes) and test_integrity_approvals == 0:
+                errors.append(
+                    "changed tests lack a dedicated core-executed CodeRabbit test-integrity APPROVE review"
+                )
         test_flags = changes.get("test_changes", {})
         declared_risky = any(bool(test_flags.get(key)) for key in ("deleted", "skips_added", "threshold_loosened", "assertions_changed")) if isinstance(test_flags, dict) else False
         observed_test_change = bool(observed and any(_is_test_path(path) for path in observed.get("files", [])))
@@ -1008,6 +1830,22 @@ def _profile_gates(profile: dict[str, Any], domains: set[str]) -> set[str]:
     return {str(gate) for gate in gates if _nonempty_string(gate)}
 
 
+def _test_paths_changed(changes: Any) -> bool:
+    if not isinstance(changes, dict):
+        return False
+    files = changes.get("files")
+    if not isinstance(files, list):
+        return False
+    test_suffixes = (".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx")
+    for raw in files:
+        if not isinstance(raw, str):
+            continue
+        path = raw.replace("\\", "/").casefold()
+        if path.startswith("tests/") or path.endswith(test_suffixes):
+            return True
+    return False
+
+
 def _string_values(value: Any) -> list[str]:
     return [str(item).strip() for item in value] if isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value) else []
 
@@ -1029,10 +1867,18 @@ def _registered_gate_definitions(profile: Any) -> dict[str, dict[str, Any]]:
             continue
         if _nonempty_string_list(row.get("command")):
             precondition = list(row["precondition"]) if _nonempty_string_list(row.get("precondition")) else None
+            gate_id = str(row["id"])
+            command = list(row["command"])
+            trusted_core_runner = _TRUSTED_CORE_REVIEW_RUNNERS.get(gate_id)
             result[str(row["id"])] = {
-                "command": list(row["command"]),
+                "command": command,
                 "precondition": precondition,
                 "builtin": None,
+                "trusted_core_runner": bool(
+                    trusted_core_runner is not None
+                    and command == trusted_core_runner
+                    and precondition is None
+                ),
             }
         elif row.get("builtin") in {"intent-coverage", "claim-source-map", "goal-finalize"}:
             builtin = str(row["builtin"])
@@ -1066,6 +1912,17 @@ def _validate_gate_registry(profile: Any, errors: list[str]) -> None:
         seen.add(gate_id)
         if "builtin" in row and row.get("builtin") not in supported_builtins:
             errors.append(f"quality gate {gate_id} has unsupported builtin")
+        expected_runner = _TRUSTED_CORE_REVIEW_RUNNERS.get(gate_id)
+        if expected_runner is not None:
+            if row.get("command") != expected_runner or row.get("precondition") is not None:
+                errors.append(
+                    f"quality gate {gate_id} must use its exact immutable trusted-core runner declaration"
+                )
+        elif (
+            isinstance(row.get("command"), list)
+            and row.get("command", [])[:1] == ["supervisor-trusted-core-runner"]
+        ):
+            errors.append(f"quality gate {gate_id} cannot claim a trusted-core runner")
 
 
 def _registered_gate_commands(profile: Any) -> dict[str, list[str]]:
@@ -1098,6 +1955,8 @@ def _validate_quality(state: dict[str, Any], evidence: dict[str, dict[str, Any]]
         errors.append("quality profile missing")
         return
     required = _profile_gates(profile, domains)
+    if _test_paths_changed(changes):
+        required.add("review.coderabbit.test-integrity")
     if not required:
         errors.append(f"quality profile has no binary gates for domains: {sorted(domains)}")
         return
@@ -1187,7 +2046,7 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
         warnings.append("local HMAC provides operational tamper evidence, not a security boundary against same-user processes")
     if state.get("runtime") == "codex":
         warnings.append(
-            "Codex native host-hook-observed evidence uses host lifecycle observation; codex-explicit-audit compatibility evidence is auditable local evidence, not host lifecycle observation or a hard host block"
+            "Codex hook and CLI invocation records are caller-declared local audit observations; without an external host-signed identity mechanism they cannot satisfy completion identity or independence gates"
         )
     raw_execution_mode = state.get("execution_mode")
     normalized_execution_mode = (
@@ -1207,10 +2066,12 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
         for c in criteria
         if isinstance(c, dict) and _nonempty_string(c.get("criterion_id"))
     } if isinstance(criteria, list) else set()
-    evidence_ids, evidence_by_id, satisfied_labels = _validate_evidence(state, criterion_ids, events, errors)
+    observed = _observe_workspace(state, errors)
+    evidence_ids, evidence_by_id, satisfied_labels = _validate_evidence(
+        state, criterion_ids, events, errors, observed
+    )
     _validate_tasks(state, criterion_ids, evidence_by_id, errors)
     _validate_intents(state, events, evidence_by_id, errors)
-    observed = _observe_workspace(state, errors)
     _validate_changes_and_reviews(state, evidence_by_id, events, errors, warnings, observed)
     _validate_quality(state, evidence_by_id, errors, observed)
     valid_waived = _validate_criteria_and_waivers(state, satisfied_labels, errors)

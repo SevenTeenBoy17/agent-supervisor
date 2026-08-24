@@ -142,7 +142,15 @@ def test_checkpoint_replay_preserves_rollback_lineage_and_rejects_tampering(
 ) -> None:
     monkeypatch.setenv("AGENT_SUPERVISOR_ATTESTATION_KEY_FILE", str(tmp_path / "attestation.key"))
     state = initial_rollout({}, "observe")
-    active = {"version": "4.0.0", "path": "C:/releases/4.0.0"}
+    active = {
+        "contract": "SupervisorReleaseIdentity/v1",
+        "version": "4.0.0",
+        "path": "C:/releases/4.0.0",
+        "bundle_relpath": "runtime/supervisor-runtime.zip",
+        "bundle_sha256": "1" * 64,
+        "manifest_sha256": "2" * 64,
+        "source_tree_sha256": "3" * 64,
+    }
     for record in (
         _observation("fixtures", "fixture_replay", passed=True),
         _observation("history", "historical_replay", passed=True),

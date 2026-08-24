@@ -3,11 +3,13 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from .attestation import key_path, sign_record, verify_record
 from .storage import atomic_write_json, exclusive_lock
 from .util import canonical_sha256, json_load, utc_now
+from .runtime_bundle import RuntimeBundleError, inspect_runtime_bundle
 
 
 _MIN_OBSERVATION_RETENTION = 64
@@ -443,10 +445,35 @@ def _pointer_lock_path(path: Path) -> Path:
 
 
 def _valid_active_identity(value: Any) -> bool:
+    required = {
+        "bundle_relpath", "bundle_sha256", "contract", "manifest_sha256",
+        "path", "source_tree_sha256", "version",
+    }
     return (
         isinstance(value, dict)
+        and set(value) == required
+        and value.get("contract") == "SupervisorReleaseIdentity/v1"
         and bool(str(value.get("version") or "").strip())
         and bool(str(value.get("path") or "").strip())
+        and bool(str(value.get("bundle_relpath") or "").strip())
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or ""))
+            for key in ("bundle_sha256", "manifest_sha256", "source_tree_sha256")
+        )
+    )
+
+
+def _valid_active_pointer(value: Any) -> bool:
+    """Accept only the exact v4 pointer envelope used by every stage-0 adapter."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"contract", "active", "previous"}
+        and value.get("contract") == "ActiveVersionPointer/v4"
+        and _valid_active_identity(value.get("active"))
+        and (
+            value.get("previous") is None
+            or _valid_active_identity(value.get("previous"))
+        )
     )
 
 
@@ -477,13 +504,36 @@ def _canonical_supervisor_release_root(path: Path) -> Path | None:
     return resolved
 
 
+def _validated_release_identity(identity: Any) -> Path | None:
+    if not _valid_active_identity(identity):
+        return None
+    root = _canonical_supervisor_release_root(Path(str(identity["path"])))
+    if root is None:
+        return None
+    relative = Path(str(identity["bundle_relpath"].replace("/", os.sep)))
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    lexical = Path(os.path.abspath(os.fspath(root / relative)))
+    try:
+        lexical.relative_to(root)
+        resolved = lexical.resolve(strict=True)
+        resolved.relative_to(root)
+        blob = resolved.read_bytes()
+        inspect_runtime_bundle(blob, expected_identity=identity)
+    except (OSError, RuntimeError, ValueError, RuntimeBundleError):
+        return None
+    return root
+
+
 def active_version_snapshot() -> dict[str, Any] | None:
     """Read the active release identity under the same lock used for pointer replacement."""
     path = active_pointer_path()
     with exclusive_lock(_pointer_lock_path(path)):
         pointer = json_load(path, {})
-        active = pointer.get("active") if isinstance(pointer, dict) else None
-        return copy.deepcopy(active) if _valid_active_identity(active) else None
+        if not _valid_active_pointer(pointer):
+            return None
+        active = pointer["active"]
+        return copy.deepcopy(active) if _validated_release_identity(active) is not None else None
 
 
 def rollback_active_version(*, expected_active: dict[str, Any] | None) -> dict[str, Any]:
@@ -493,24 +543,10 @@ def rollback_active_version(*, expected_active: dict[str, Any] | None) -> dict[s
     path = active_pointer_path()
     with exclusive_lock(_pointer_lock_path(path)):
         pointer = json_load(path, {})
-        active = pointer.get("active") if isinstance(pointer, dict) else None
-        previous = pointer.get("previous") if isinstance(pointer, dict) else None
-        marker = pointer.get("rollback") if isinstance(pointer, dict) and isinstance(pointer.get("rollback"), dict) else {}
-        if marker.get("performed") is True:
-            marker_expected = marker.get("expected_active")
-            marker_target = marker.get("target")
-            rollback_lineage_is_active = active == marker_target and previous == marker_expected
-            original_claim_replay = marker_expected == expected_active
-            rollback_target_observed = expected_active == marker_target and rollback_lineage_is_active
-            if original_claim_replay or rollback_target_observed:
-                return {
-                    "performed": True,
-                    "reason": "rollback-lineage-already-active",
-                    "target": active.get("version") if isinstance(active, dict) else None,
-                    "target_active": copy.deepcopy(active) if isinstance(active, dict) else None,
-                    "path": active.get("path") if isinstance(active, dict) else None,
-                    "idempotent": True,
-                }
+        if not _valid_active_pointer(pointer):
+            return {"performed": False, "reason": "active-pointer-invalid", "target": None}
+        active = pointer["active"]
+        previous = pointer["previous"]
         if active != expected_active:
             return {
                 "performed": False,
@@ -519,29 +555,14 @@ def rollback_active_version(*, expected_active: dict[str, Any] | None) -> dict[s
             }
         if not _valid_active_identity(previous):
             return {"performed": False, "reason": "previous-version-unavailable", "target": None}
-        previous_path = Path(str(previous.get("path"))) if isinstance(previous, dict) and previous.get("path") else None
-        canonical_previous_path = (
-            _canonical_supervisor_release_root(previous_path)
-            if previous_path and previous_path.is_dir()
-            else None
-        )
-        if not isinstance(active, dict) or not previous_path or canonical_previous_path is None:
+        canonical_previous_path = _validated_release_identity(previous)
+        if not isinstance(active, dict) or canonical_previous_path is None:
             return {"performed": False, "reason": "previous-version-unavailable", "target": None}
         previous_path = canonical_previous_path
-        expected = copy.deepcopy(expected_active)
-        rolled_back_at = utc_now()
         updated = {
-            "contract": "ActiveVersionPointer/v3",
+            "contract": "ActiveVersionPointer/v4",
             "active": previous,
             "previous": active,
-            "rolled_back_at": rolled_back_at,
-            "rolled_back_from": active.get("version"),
-            "rollback": {
-                "performed": True,
-                "expected_active": expected,
-                "target": copy.deepcopy(previous),
-                "performed_at": rolled_back_at,
-            },
         }
         atomic_write_json(path, updated)
         return {
@@ -567,8 +588,8 @@ def resolve_active_root(default_root: Path) -> Path:
             pointer = json_load(pointer_path, {})
     except (OSError, RuntimeError, ValueError):
         return fallback
-    active = pointer.get("active") if isinstance(pointer, dict) else None
-    if not _valid_active_identity(active):
+    if not _valid_active_pointer(pointer):
         return fallback
-    candidate = _canonical_supervisor_release_root(Path(str(active["path"])))
+    active = pointer["active"]
+    candidate = _validated_release_identity(active)
     return candidate or fallback

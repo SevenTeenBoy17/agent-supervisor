@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -211,13 +212,88 @@ def _release_owned_lock(path: Path, identity: tuple[int, int], nonce: str) -> No
             time.sleep(0.005)
 
 
+def _path_may_exist(path: Path) -> bool:
+    """Return False only when the OS positively reports a missing path."""
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable/indeterminate destination is never safe to replace.
+        return True
+
+
+def _fsync_parent_directory(directory: Path) -> bool:
+    """Durably publish directory metadata where the host exposes directory fsync."""
+    if os.name == "nt":
+        # Python cannot open a Windows directory with the flags required by
+        # FlushFileBuffers.  The file payload itself is still fsynced before
+        # the atomic no-clobber publish.
+        return False
+    unsupported = {
+        errno.EACCES,
+        errno.EBADF,
+        errno.EINVAL,
+        errno.EISDIR,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.EPERM,
+    }
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return False
+        raise
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno in unsupported:
+                return False
+            raise
+    finally:
+        os.close(fd)
+    return True
+
+
+def _publish_lock_no_clobber(temp: Path, path: Path) -> bool:
+    """Atomically publish a complete owner file iff ``path`` is absent.
+
+    A same-directory hard link is an atomic no-clobber operation on POSIX and
+    Windows filesystems that support hard links.  Windows' rename operation is
+    also no-clobber and is used only when hard-link creation itself is
+    unavailable; POSIX rename is deliberately never used because it replaces
+    an existing destination.
+    """
+    try:
+        os.link(temp, path)
+        return True
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        if _path_may_exist(path):
+            return False
+        if os.name != "nt":
+            raise
+        try:
+            os.rename(temp, path)
+            return True
+        except FileExistsError:
+            return False
+        except OSError as rename_exc:
+            if _path_may_exist(path):
+                return False
+            raise rename_exc from exc
+
+
 @contextmanager
 def _exclusive_file_lock(path: Path, timeout: float) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
-    fd: int | None = None
     identity: tuple[int, int] | None = None
-    created_identity: tuple[int, int] | None = None
     nonce = secrets.token_hex(16)
     _, process_start = _process_probe(os.getpid())
     owner_payload = json.dumps({
@@ -229,26 +305,13 @@ def _exclusive_file_lock(path: Path, timeout: float) -> Iterator[None]:
         "created_at": time.time(),
     }, sort_keys=True, separators=(",", ":")).encode("utf-8")
     while identity is None:
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{nonce}.{time.time_ns()}.owner.tmp"
+        )
+        fd: int | None = None
+        created_identity: tuple[int, int] | None = None
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except (FileExistsError, PermissionError):
-            # Windows may report a sharing violation as PermissionError while a
-            # different process/thread owns the O_EXCL lock file.
-            if _reclaim_confirmed_dead_lock(path):
-                # Reclaiming a stale owner can itself consume the caller's
-                # complete wait budget.  Do not turn a successful cleanup into
-                # an acquisition that happened after the advertised deadline.
-                if time.monotonic() >= deadline:
-                    raise LockTimeout(f"lock timeout: {path}")
-                continue
-            if time.monotonic() >= deadline:
-                raise LockTimeout(f"lock timeout: {path}")
-            time.sleep(0.01)
-            continue
-        try:
-            # Bind cleanup to the descriptor we actually created.  A path
-            # snapshot can already describe a replacement owner if the
-            # pathname was swapped after O_EXCL creation.
+            fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             created_stat = os.fstat(fd)
             created_identity = (created_stat.st_dev, created_stat.st_ino)
             written = 0
@@ -259,22 +322,53 @@ def _exclusive_file_lock(path: Path, timeout: float) -> Iterator[None]:
                 written += count
             os.fsync(fd)
         except BaseException:
-            os.close(fd)
-            fd = None
-            _release_self_created_lock(path, created_identity, owner_payload)
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            _release_self_created_lock(temp, created_identity, owner_payload)
             raise
-        os.close(fd)
-        fd = None
-        observed = _lock_snapshot(path)
-        if (
-            observed is None
-            or observed[0] != created_identity
-            or (_lock_owner(observed[1]) or {}).get("owner_nonce") != nonce
-        ):
-            if observed is not None:
-                _release_owned_lock(path, observed[0], nonce)
-            raise RuntimeError(f"could not verify acquired lock: {path}")
-        identity = observed[0]
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+        try:
+            published = _publish_lock_no_clobber(temp, path)
+        except BaseException:
+            _release_self_created_lock(temp, created_identity, owner_payload)
+            raise
+        if not published:
+            _release_self_created_lock(temp, created_identity, owner_payload)
+            if _reclaim_confirmed_dead_lock(path):
+                # Reclaiming a stale owner can itself consume the caller's
+                # complete wait budget.  Do not acquire after the advertised
+                # deadline merely because cleanup succeeded.
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(f"lock timeout: {path}")
+                continue
+            if time.monotonic() >= deadline:
+                raise LockTimeout(f"lock timeout: {path}")
+            time.sleep(0.01)
+            continue
+
+        observed: tuple[tuple[int, int], bytes] | None = None
+        try:
+            observed = _lock_snapshot(path)
+            if (
+                observed is None
+                or observed[0] != created_identity
+                or (_lock_owner(observed[1]) or {}).get("owner_nonce") != nonce
+            ):
+                raise RuntimeError(f"could not verify acquired lock: {path}")
+            # The complete payload was fsynced before publication.  On POSIX,
+            # also fsync the containing directory so the new name is durable.
+            _fsync_parent_directory(path.parent)
+            identity = observed[0]
+        except BaseException:
+            if created_identity is not None:
+                _release_owned_lock(path, created_identity, nonce)
+            _release_self_created_lock(temp, created_identity, owner_payload)
+            raise
+        _release_self_created_lock(temp, created_identity, owner_payload)
     try:
         yield
     finally:

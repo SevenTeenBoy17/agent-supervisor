@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import hashlib
 import os
@@ -14,10 +15,55 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
+from supervisor_core import workspace as workspace_module
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.workspace import capture_workspace_snapshot, workspace_delta
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _trusted_python_path() -> Path:
+    registry = json.loads((ROOT / "trusted-executables.json").read_text(encoding="utf-8"))
+    return Path(registry["entries"]["python"]["path"]).resolve(strict=True)
+
+
+def _write_trusted_executable_registry(
+    home: Path,
+    *,
+    names: tuple[str, ...] = ("git", "python"),
+) -> Path:
+    """Create a strict fixture registry from executables verified on this host."""
+    source = json.loads(
+        (ROOT / "trusted-executables.json").read_text(encoding="utf-8")
+    )
+    entries: dict[str, dict[str, str]] = {}
+    for name in names:
+        source_entry = source["entries"][name]
+        assert source_entry["kind"] == "local"
+        executable = Path(source_entry["path"]).resolve(strict=True)
+        hasher = hashlib.sha256()
+        with executable.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                hasher.update(chunk)
+        assert hasher.hexdigest() == source_entry["sha256"]
+        entries[name] = {
+            "kind": "local",
+            "path": str(executable),
+            "sha256": hasher.hexdigest(),
+        }
+    registry = {
+        "contract": "TrustedExecutableRegistry/v1",
+        "entries": entries,
+        "generated_at": source["generated_at"],
+    }
+    target = home / ".agent-supervisor" / "trusted-executables.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(registry, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return target
 
 
 def _resolve_adapter_roots() -> tuple[Path, Path]:
@@ -68,6 +114,8 @@ CODEX_ADAPTER_FILES = (
     "supervisor-finalize.ps1",
     "supervisor-gate.ps1",
     "supervisor-handoff.ps1",
+    "supervisor-hook.ps1",
+    "supervisor-process-job.py",
     "supervisor-record.ps1",
     "supervisor-turn-ended.ps1",
     "supervisor-validate.ps1",
@@ -110,15 +158,42 @@ def _hermetic_adapter_env(home: Path, *, session_id: str | None) -> dict[str, st
     claude_target = home / ".claude" / "skills" / "supervisor" / "scripts"
     codex_target.mkdir(parents=True)
     claude_target.mkdir(parents=True)
+    (codex_target.parent / "SKILL.md").write_text(
+        "---\n"
+        "name: dev-supervisor\n"
+        "description: Supervisor configuration quality implementation verification blocker UI contract typed bootstrap 监工 验证 实现\n"
+        "---\n"
+        "# Test Supervisor capability\n",
+        encoding="utf-8",
+    )
     for filename in CODEX_ADAPTER_FILES:
         shutil.copy2(CODEX_ROOT / "scripts" / filename, codex_target / filename)
     for filename in CLAUDE_ADAPTER_FILES:
         shutil.copy2(CLAUDE_ROOT / "scripts" / filename, claude_target / filename)
-    pointer = home / "active-version.json"
+    core_target = home / ".agent-supervisor-releases" / "test-source"
+    shutil.copytree(ROOT / "supervisor_core", core_target / "supervisor_core")
+    shutil.copytree(ROOT / "bin", core_target / "bin")
+    shutil.copytree(ROOT / "schemas", core_target / "schemas")
+    for filename in ("VERSION", "pyproject.toml"):
+        if (ROOT / filename).is_file():
+            shutil.copy2(ROOT / filename, core_target / filename)
+    bundle = build_runtime_bundle(core_target, "test-source")
+    bundle_path = core_target / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
+    active_identity = release_identity(
+        core_target,
+        "test-source",
+        "runtime/supervisor-runtime.zip",
+        bundle,
+    )
+    pointer = home / ".agent-supervisor" / "active-version.json"
+    pointer.parent.mkdir(parents=True)
+    _write_trusted_executable_registry(home)
     pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v3",
-        "active": {"version": "test-source", "path": str(ROOT)},
-        "previous": {"version": "none", "path": str(ROOT)},
+        "contract": "ActiveVersionPointer/v4",
+        "active": active_identity,
+        "previous": None,
     }), encoding="utf-8")
     env = os.environ.copy()
     for key in (
@@ -219,8 +294,16 @@ def _run_script(
     env: dict[str, str],
     expected: int = 0,
 ) -> dict:
+    scripts_root = CODEX_SCRIPTS
+    configured_home = env.get("AGENT_SUPERVISOR_INSTALL_HOME")
+    if configured_home:
+        installed_scripts = (
+            Path(configured_home) / ".codex" / "skills" / "dev-supervisor" / "scripts"
+        )
+        if (installed_scripts / script).is_file():
+            scripts_root = installed_scripts
     completed = subprocess.run(
-        [_powershell(), "-NoLogo", "-NoProfile", "-File", str(CODEX_SCRIPTS / script), *arguments],
+        [_powershell(), "-NoLogo", "-NoProfile", "-File", str(scripts_root / script), *arguments],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -234,6 +317,122 @@ def _run_script(
     return json.loads("\n".join(lines))
 
 
+def _run_gate_adapter_with_fake_child(
+    tmp_path: Path,
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+) -> subprocess.CompletedProcess[str]:
+    scripts = tmp_path / "gate-adapter" / "scripts"
+    scripts.mkdir(parents=True)
+    gate_script = scripts / "supervisor-gate.ps1"
+    shutil.copy2(CODEX_SCRIPTS / gate_script.name, gate_script)
+    (scripts / "supervisor-event.ps1").write_text(
+        textwrap.dedent(
+            r"""
+            param(
+                [string]$Workspace,
+                [string]$RoundId,
+                [string]$SessionId,
+                [string]$Event,
+                [string]$Actor,
+                [string]$ResponsibilityGroup,
+                [string]$DataJson
+            )
+            [Console]::Out.Write($env:FAKE_GATE_CHILD_STDOUT)
+            [Console]::Error.Write($env:FAKE_GATE_CHILD_STDERR)
+            exit ([int]$env:FAKE_GATE_CHILD_EXIT)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({
+        "FAKE_GATE_CHILD_EXIT": str(exit_code),
+        "FAKE_GATE_CHILD_STDOUT": stdout,
+        "FAKE_GATE_CHILD_STDERR": stderr,
+    })
+    return subprocess.run(
+        [
+            _powershell(), "-NoLogo", "-NoProfile", "-File", str(gate_script),
+            "-GateId", "gate.wrapper", "-CriterionId", "criterion-wrapper",
+            "-CollectorGroup", "independent-quality-review",
+            "-CollectorInvocationId", "gate-invocation-wrapper",
+            "-Workspace", str(tmp_path), "-RoundId", "round-wrapper",
+            "-SessionId", "session-wrapper",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("exit_code", [1, 4, 7, 125])
+def test_gate_adapter_maps_non_contract_child_exit_to_redacted_degraded(
+    exit_code: int,
+    tmp_path: Path,
+) -> None:
+    completed = _run_gate_adapter_with_fake_child(
+        tmp_path,
+        exit_code=exit_code,
+        stdout="SENSITIVE_CHILD_STDOUT",
+        stderr="SENSITIVE_CHILD_STDERR",
+    )
+
+    assert completed.returncode == 4
+    assert completed.stdout == ""
+    lines = [line for line in completed.stderr.splitlines() if line.strip()]
+    assert len(lines) == 1
+    failure = json.loads(lines[0])
+    assert failure == {
+        "status": "degraded",
+        "reason": "gate-adapter-failure",
+        "child_exit_code": exit_code,
+        "message": "Supervisor gate event recording failed; state is degraded.",
+    }
+    assert "SENSITIVE_CHILD_STDOUT" not in completed.stdout + completed.stderr
+    assert "SENSITIVE_CHILD_STDERR" not in completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("exit_code", [0, 2, 3, 64])
+def test_gate_adapter_forwards_only_structured_contract_exit_codes(
+    exit_code: int,
+    tmp_path: Path,
+) -> None:
+    stdout = '{"status":"contract-result"}\n'
+    stderr = "contract-diagnostic\n"
+    completed = _run_gate_adapter_with_fake_child(
+        tmp_path,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert completed.returncode == exit_code
+    if exit_code == 0:
+        assert completed.stdout == stdout
+        assert completed.stderr == ""
+    else:
+        assert completed.stdout == ""
+        lines = [line for line in completed.stderr.splitlines() if line.strip()]
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == {
+            "status": "degraded",
+            "reason": {
+                2: "gate-event-incomplete",
+                3: "gate-event-blocked",
+                64: "gate-event-invalid-state",
+            }[exit_code],
+            "child_exit_code": exit_code,
+            "message": "Supervisor gate event did not complete; captured failure output was suppressed.",
+        }
+    assert "contract-diagnostic" not in completed.stdout + completed.stderr
+
+
 def _write_record(path: Path, record: dict) -> None:
     path.write_text(json.dumps({"record": record}, ensure_ascii=False), encoding="utf-8")
 
@@ -243,6 +442,140 @@ def test_installed_ledger_template_is_schema_valid():
     schema = json.loads((CODEX_ROOT / "templates" / "ledger.schema.json").read_text(encoding="utf-8"))
 
     Draft202012Validator(schema).validate(template)
+
+
+def test_readme_lists_the_complete_codex_thin_adapter_deployment_set() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    required = {
+        "codex-supervisor-hook.py",
+        "supervisor-bootstrap.ps1",
+        "supervisor-core.ps1",
+        "supervisor-event.ps1",
+        "supervisor-finalize.ps1",
+        "supervisor-gate.ps1",
+        "supervisor-handoff.ps1",
+        "supervisor-process-job.py",
+        "supervisor-record.ps1",
+        "supervisor-turn-ended.ps1",
+        "supervisor-validate.ps1",
+    }
+    assert all(f"`{name}`" in readme for name in required)
+    assert "shared runtime dependency" in readme
+
+
+def test_process_job_launcher_is_bound_to_the_trusted_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = {
+        "shared-core": tmp_path / "shared-core",
+        "codex-adapter": tmp_path / "codex-adapter",
+        "claude-adapter": tmp_path / "claude-adapter",
+    }
+    for root in roots.values():
+        root.mkdir(parents=True)
+    for relative in workspace_module._CORE_SOURCE_WHITELIST:
+        source = ROOT / relative
+        target = roots["shared-core"] / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    for filename in workspace_module._CODEX_ADAPTER_WHITELIST:
+        shutil.copy2(CODEX_SCRIPTS / filename, roots["codex-adapter"] / filename)
+    for filename in workspace_module._CLAUDE_ADAPTER_WHITELIST:
+        shutil.copy2(
+            CLAUDE_ROOT / "scripts" / filename,
+            roots["claude-adapter"] / filename,
+        )
+    monkeypatch.setattr(workspace_module, "_supervisor_source_roots", lambda: roots)
+
+    first = workspace_module.capture_supervisor_source_snapshot()
+    launcher_name = "codex-adapter/supervisor-process-job.py"
+    launcher = roots["codex-adapter"] / "supervisor-process-job.py"
+
+    assert first["status"] == "healthy"
+    assert first["files"][launcher_name] == {
+        "status": "hashed",
+        "sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        "size": launcher.stat().st_size,
+    }
+    assert (
+        workspace_module.validated_supervisor_source_snapshot_hash(first)
+        == first["snapshot_sha256"]
+    )
+
+    launcher.write_bytes(launcher.read_bytes() + b"\n# tampered fixture\n")
+    tampered = workspace_module.capture_supervisor_source_snapshot()
+    assert tampered["status"] == "healthy"
+    assert tampered["files"][launcher_name]["sha256"] != first["files"][launcher_name]["sha256"]
+    assert tampered["snapshot_sha256"] != first["snapshot_sha256"]
+
+    launcher.unlink()
+    missing = workspace_module.capture_supervisor_source_snapshot()
+    assert missing["status"] == "degraded"
+    assert missing["files"][launcher_name]["status"] == "missing"
+    assert workspace_module.validated_supervisor_source_snapshot_hash(missing) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "goal-bool-version",
+        "criterion-scalar",
+        "criterion-bool-required",
+        "scope-scalar",
+        "task-scalar",
+        "task-missing-id",
+        "task-bool-version",
+        "intent-scalar",
+        "intent-bool-phase",
+        "invocation-scalar",
+        "evidence-scalar",
+        "review-scalar",
+        "waiver-scalar",
+    ],
+)
+def test_installed_ledger_schema_rejects_malformed_array_items(case: str) -> None:
+    template = json.loads(
+        (CODEX_ROOT / "templates" / "ledger.template.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    schema = json.loads(
+        (CODEX_ROOT / "templates" / "ledger.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    candidate = copy.deepcopy(template)
+    if case == "goal-bool-version":
+        candidate["goal"]["version"] = True
+    elif case == "criterion-scalar":
+        candidate["goal"]["acceptance_criteria"] = [7]
+    elif case == "criterion-bool-required":
+        candidate["goal"]["acceptance_criteria"][0]["required"] = 1
+    elif case == "scope-scalar":
+        candidate["goal"]["in_scope"] = [False]
+    elif case == "task-scalar":
+        candidate["tasks"] = ["not-a-task"]
+    elif case == "task-missing-id":
+        candidate["tasks"][0].pop("task_id")
+    elif case == "task-bool-version":
+        candidate["tasks"][0]["goal_version"] = True
+    elif case == "intent-scalar":
+        candidate["intent_coverage"] = [3]
+    elif case == "intent-bool-phase":
+        candidate["intent_coverage"][0]["phase"] = False
+    elif case == "invocation-scalar":
+        candidate["invocations"] = ["not-an-invocation"]
+    elif case == "evidence-scalar":
+        candidate["evidence"] = [0]
+    elif case == "review-scalar":
+        candidate["reviews"] = [True]
+    elif case == "waiver-scalar":
+        candidate["waivers"] = [None]
+    else:  # pragma: no cover - parametrization is closed above.
+        raise AssertionError(case)
+
+    assert list(Draft202012Validator(schema).iter_errors(candidate)), case
 
 
 def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaiming_host_identity(tmp_path):
@@ -267,7 +600,7 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
         "global_gates": ["gate.wrapper"],
         "common_gates": [{
             "id": "gate.wrapper",
-            "command": [os.fspath(Path(os.sys.executable)), "-c", "print('WRAPPER_GATE_PASS')"],
+            "command": [os.fspath(_trusted_python_path()), "-c", "print('WRAPPER_GATE_PASS')"],
         }],
         "domains": {"config/agent": {"required_gates": ["gate.wrapper"]}},
         "profiles": {"config_agent": {"applies_to": ["config.json"], "gates": []}},
@@ -315,8 +648,11 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
     _write_record(changes_file, {
         "files": delta["files"], "base": delta["base"], "head": delta["head"],
         "diff_hash": delta["diff_hash"], "domains": ["config/agent"],
-        "implementer": "codex-worker", "implementer_responsibility_group": "implementation",
-        "implementer_invocation_id": "invocation-wrapper",
+        "git_object_format": delta["git_object_format"], "git_binding_status": delta["git_binding_status"],
+        "git_binding_source": delta["git_binding_source"], "git_repository_root": delta["git_repository_root"],
+        "review_artifact": delta["review_artifact"], "review_artifact_sha256": delta["review_artifact_sha256"],
+        "git_diff_sha256": delta["git_diff_sha256"], "workspace_base_sha256": delta["workspace_base_sha256"],
+        "workspace_head_sha256": delta["workspace_head_sha256"],
         "test_changes": {},
     })
     _run_script(
@@ -326,6 +662,13 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
     )
 
     evidence_ids = []
+    _run_script(
+        "supervisor-event.ps1",
+        [*common, "-Event", "invocation_attempt", "-Skill", "independent-gate-runner",
+         "-InvocationId", "gate-invocation-wrapper", "-Actor", "codex-gate-runner",
+         "-ResponsibilityGroup", "independent-quality-review"],
+        env=env,
+    )
     for index, criterion_id in enumerate(criterion_ids, start=1):
         evidence_id = f"evidence-wrapper-{index}"
         evidence_ids.append(evidence_id)
@@ -333,10 +676,17 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
             "supervisor-gate.ps1",
             [*common, "-GateId", "gate.wrapper", "-CriterionId", criterion_id,
              "-CollectorGroup", "independent-quality-review", "-EvidenceId", evidence_id,
-             "-Actor", "codex-reviewer"],
+             "-CollectorInvocationId", "gate-invocation-wrapper", "-Actor", "codex-gate-runner"],
             env=env,
         )
         assert gate["exit_code"] == 0
+    _run_script(
+        "supervisor-event.ps1",
+        [*common, "-Event", "invocation_result", "-Skill", "independent-gate-runner",
+         "-InvocationId", "gate-invocation-wrapper", "-Actor", "codex-gate-runner",
+         "-ResponsibilityGroup", "independent-quality-review", "-Result", "success"],
+        env=env,
+    )
 
     for index, intent_id in enumerate(intent_ids, start=1):
         intent_file = records / f"intent-{index}.json"
@@ -367,14 +717,18 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
             env=env,
         )
 
-    for invocation_id, capability, actor in (
-        ("invocation-wrapper", "codex-wrapper", "codex-worker"),
-        ("review-invocation-wrapper", "independent-reviewer", "codex-reviewer"),
+    for invocation_id, capability, actor, responsibility_group in (
+        ("invocation-wrapper", "codex-wrapper", "codex-worker", "implementation"),
+        (
+            "review-invocation-wrapper", "independent-reviewer", "codex-reviewer",
+            "independent-quality-reviewer",
+        ),
     ):
         for event_type, result in (("invocation_attempt", ""), ("invocation_result", "success")):
             arguments = [
                 *common, "-Event", event_type, "-Skill", capability,
                 "-InvocationId", invocation_id, "-Actor", actor,
+                "-ResponsibilityGroup", responsibility_group,
             ]
             if result:
                 arguments.extend(["-Result", result])
@@ -384,24 +738,33 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
     _write_record(review_file, {
         "contract": "ReviewRecord/v3", "review_id": "review-wrapper",
         "goal_id": goal_id, "goal_version": goal_version,
-        "reviewer": "codex-reviewer", "responsibility_group": "independent-quality-review",
-        "implementer": "codex-worker", "base": delta["base"], "head": delta["head"],
+        "reviewer": "codex-reviewer", "reviewer_responsibility_group": "independent-quality-reviewer",
+        "implementer": "codex-worker", "implementer_responsibility_group": "implementation",
+        "gate_collector": "codex-gate-runner", "gate_collector_responsibility_group": "independent-quality-review",
+        "gate_runner_invocation_id": "gate-invocation-wrapper",
+        "base": delta["base"], "head": delta["head"],
         "diff_hash": delta["diff_hash"], "rerun_evidence_ids": evidence_ids,
+        "git_object_format": delta["git_object_format"], "git_binding_status": delta["git_binding_status"],
+        "git_binding_source": delta["git_binding_source"], "git_repository_root": delta["git_repository_root"],
+        "review_artifact_sha256": delta["review_artifact_sha256"], "git_diff_sha256": delta["git_diff_sha256"],
+        "workspace_base_sha256": delta["workspace_base_sha256"], "workspace_head_sha256": delta["workspace_head_sha256"],
+        "evidence_verification": {"status": "VERIFIED", "reviewer": "codex-reviewer", "evidence_ids": evidence_ids},
         "verdict": "APPROVE", "category": "config-agent",
         "implementer_invocation_id": "invocation-wrapper", "reviewer_invocation_id": "review-invocation-wrapper",
-        "actor_identity_assurance": "codex-explicit-audit",
     })
-    _run_script(
-        "supervisor-record.ps1",
-        [*common, "-RecordType", "review", "-RecordFile", str(review_file), "-Actor", "codex-reviewer"],
+    rejected_review = _run_script(
+        "supervisor-event.ps1",
+        [*common, "-Event", "review_finalize", "-DataFile", str(review_file), "-Actor", "codex-reviewer"],
         env=env,
+        expected=64,
     )
+    assert "reviewer lacks a successful trusted invocation" in rejected_review["message"]
 
-    final = _run_script("supervisor-finalize.ps1", common, env=env)
-    assert final["terminal_state"] == "complete"
+    final = _run_script("supervisor-finalize.ps1", common, env=env, expected=2)
+    assert final["terminal_state"] == "incomplete"
     persisted = json.loads(state_file.read_text(encoding="utf-8"))
-    assert persisted["validation"]["valid"] is True
-    assert any("not host lifecycle observation" in warning for warning in persisted["validation"]["warnings"])
+    assert persisted["validation"]["valid"] is False
+    assert "changed diff lacks independent ReviewRecord" in persisted["validation"]["errors"]
     _run_script("supervisor-handoff.ps1", common, env=env)
     handoff_events = [
         json.loads(line)
@@ -448,7 +811,7 @@ def test_powershell_finalize_adapter_exposes_blocked_terminal(tmp_path):
 
     started = _run_script(
         "supervisor-bootstrap.ps1",
-        [*common, "-Message", "Record a genuine external blocker", "-ChangeMode", "replace", "-ExecutionMode", "observe"],
+        [*common, "-Message", "Supervisor: record a genuine external blocker", "-ChangeMode", "replace", "-ExecutionMode", "observe"],
         env=env,
     )
     final = _run_script("supervisor-finalize.ps1", [*common, "-Blocked"], env=env, expected=3)
@@ -544,6 +907,202 @@ def test_powershell_bootstrap_rejects_pid_scoped_session_fallback(tmp_path):
     assert "stable SessionId" in completed.stderr
 
 
+def test_codex_entrypoints_ignore_workspace_and_pythonpath_module_hijacks(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "hostile workspace"
+    workspace.mkdir()
+    fake_home = tmp_path / "isolated install"
+    fake_home.mkdir()
+    malicious = workspace / "attacker-pythonpath"
+    malicious_core = malicious / "supervisor_core"
+    malicious_core.mkdir(parents=True)
+    sentinel = tmp_path / "hijack-sentinel"
+    side_effect = (
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['SUPERVISOR_HIJACK_SENTINEL']).write_text('ran', encoding='utf-8')\n"
+    )
+    (malicious / "sitecustomize.py").write_text(side_effect, encoding="utf-8")
+    (malicious_core / "__init__.py").write_text(side_effect, encoding="utf-8")
+    (malicious_core / "__main__.py").write_text(side_effect, encoding="utf-8")
+    workspace_core = workspace / "supervisor_core"
+    shutil.copytree(malicious_core, workspace_core)
+
+    env = _hermetic_adapter_env(fake_home, session_id="isolation-session")
+    env.update({
+        "PYTHONPATH": str(malicious),
+        "SUPERVISOR_HIJACK_SENTINEL": str(sentinel),
+    })
+    started = _run_script(
+        "supervisor-bootstrap.ps1",
+        [
+            "-Workspace", str(workspace),
+            "-RoundId", "isolation-round",
+            "-Message", "Supervisor configuration quality verification",
+            "-ChangeMode", "replace",
+        ],
+        env=env,
+    )
+    assert started["namespace"]["round"] == "isolation-round"
+    common = [
+        "-Workspace", str(workspace),
+        "-RoundId", "isolation-round",
+        "-SessionId", "isolation-session",
+    ]
+    _run_script(
+        "supervisor-event.ps1",
+        [
+            *common,
+            "-Event", "observation",
+            "-Message", "trusted launcher remained isolated",
+            "-Actor", "qa-isolation-test",
+        ],
+        env=env,
+    )
+    _run_script(
+        "supervisor-validate.ps1", [*common, "-Json"], env=env, expected=2
+    )
+    _run_script("supervisor-finalize.ps1", common, env=env, expected=2)
+    handoff = subprocess.run(
+        [
+            _powershell(), "-NoLogo", "-NoProfile", "-File",
+            str(
+                fake_home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+                / "supervisor-handoff.ps1"
+            ),
+            *common,
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert handoff.returncode == 0, handoff.stdout + handoff.stderr
+    assert not sentinel.exists()
+
+    for script_name in (
+        "supervisor-bootstrap.ps1",
+        "supervisor-event.ps1",
+        "supervisor-validate.ps1",
+        "supervisor-finalize.ps1",
+        "supervisor-handoff.ps1",
+    ):
+        source = (CODEX_SCRIPTS / script_name).read_text(encoding="utf-8")
+        assert "Resolve-AgentSupervisorTrustedLauncherPath" in source
+        assert "'-E'" in source
+        assert "'-P'" in source
+        assert "'utf8'" in source
+        assert "$launcherPath" in source
+        assert "-m', 'supervisor_core" not in source
+
+
+def test_codex_adapters_ignore_environment_core_and_profile_trust_overrides(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "environment trust workspace"
+    workspace.mkdir()
+    attacker_home = tmp_path / "attacker profile"
+    attacker_core = attacker_home / ".agent-supervisor-releases" / "attacker"
+    attacker_launcher = attacker_core / "bin" / "agent-supervisor.py"
+    attacker_package = attacker_core / "supervisor_core"
+    attacker_launcher.parent.mkdir(parents=True)
+    attacker_package.mkdir(parents=True)
+    sentinel = tmp_path / "environment-core-sentinel"
+    malicious_source = (
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['SUPERVISOR_ENV_CORE_SENTINEL']).write_text('ran', encoding='utf-8')\n"
+    )
+    attacker_launcher.write_text(malicious_source, encoding="utf-8")
+    (attacker_package / "__init__.py").write_text("ATTACKER = True\n", encoding="utf-8")
+    (attacker_package / "cli.py").write_text(malicious_source, encoding="utf-8")
+    (attacker_package / "__main__.py").write_text(malicious_source, encoding="utf-8")
+    attacker_bundle = build_runtime_bundle(attacker_core, "attacker")
+    attacker_bundle_path = attacker_core / "runtime" / "supervisor-runtime.zip"
+    attacker_bundle_path.parent.mkdir(parents=True)
+    attacker_bundle_path.write_bytes(attacker_bundle)
+    attacker_identity = release_identity(
+        attacker_core,
+        "attacker",
+        "runtime/supervisor-runtime.zip",
+        attacker_bundle,
+    )
+    attacker_pointer = attacker_home / ".agent-supervisor" / "active-version.json"
+    attacker_pointer.parent.mkdir(parents=True)
+    attacker_pointer.write_text(json.dumps({
+        "contract": "ActiveVersionPointer/v4",
+        "active": attacker_identity,
+        "previous": None,
+    }), encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update({
+        "AGENT_SUPERVISOR_HOME": str(attacker_core),
+        "AGENT_SUPERVISOR_CORE": str(attacker_core),
+        "AGENT_SUPERVISOR_ACTIVE_POINTER": str(attacker_pointer),
+        "AGENT_SUPERVISOR_RELEASE_ROOT": str(attacker_home),
+        "AGENT_SUPERVISOR_INSTALL_HOME": str(attacker_home),
+        "USERPROFILE": str(attacker_home),
+        "HOME": str(attacker_home),
+        "SUPERVISOR_ENV_CORE_SENTINEL": str(sentinel),
+        "CODEX_THREAD_ID": "environment-trust-session",
+    })
+    for variable in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT"):
+        env.pop(variable, None)
+    bootstrap = subprocess.run(
+        [
+            _powershell(), "-NoLogo", "-NoProfile", "-File",
+            str(CODEX_SCRIPTS / "supervisor-bootstrap.ps1"),
+            "-Workspace", str(workspace),
+            "-RoundId", "environment-trust-round",
+            "-Message", "verify adapter anchored trust",
+            "-ChangeMode", "replace",
+            "-Shadow",
+        ],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert bootstrap.returncode in {0, 2}
+    assert not sentinel.exists()
+
+    payload = json.dumps({
+        "session_id": "environment-trust-no-round",
+        "cwd": str(workspace),
+        "hook_event_name": "SessionEnd",
+    }).encode("utf-8")
+    native = subprocess.run(
+        [
+            sys.executable, "-E", "-P", "-X", "utf8",
+            str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+            "--event", "SessionEnd",
+        ],
+        cwd=workspace,
+        env=env,
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert native.returncode == 0
+    assert json.loads(native.stdout.decode("utf-8")) == {}
+    assert not sentinel.exists()
+
+
+def test_windows_process_tree_termination_never_resolves_taskkill_from_path() -> None:
+    source = (CODEX_SCRIPTS / "supervisor-core.ps1").read_text(encoding="utf-8")
+    assert "[Environment]::SystemDirectory" in source
+    assert "taskkill.exe" in source
+    assert "$killerInfo.FileName = 'taskkill.exe'" not in source
+    assert "Get-Command 'taskkill" not in source
+
+
 def _native_hook_env(home: Path) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
@@ -562,6 +1121,7 @@ def _native_hook_env(home: Path) -> dict[str, str]:
     ):
         env.pop(key, None)
     env.update({
+        "AGENT_SUPERVISOR_INSTALL_HOME": str(home),
         "HOME": str(home),
         "USERPROFILE": str(home),
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -574,9 +1134,20 @@ def _run_native_hook(
     payload: bytes,
     env: dict[str, str],
     workspace: Path,
+    *,
+    event: str = "SessionStart",
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        [sys.executable, str(adapter), "--event", "SessionStart"],
+        [
+            sys.executable,
+            "-E",
+            "-P",
+            "-X",
+            "utf8",
+            str(adapter),
+            "--event",
+            event,
+        ],
         cwd=workspace,
         env=env,
         input=payload,
@@ -586,30 +1157,254 @@ def _run_native_hook(
     )
 
 
-def _write_native_fake_core(root: Path) -> None:
+def _write_native_fake_core(
+    home: Path,
+    *,
+    response: bytes = b"{}",
+    exit_code: int = 0,
+    capture: Path | None = None,
+    environment_probe: Path | None = None,
+    poisoned_appdata: Path | None = None,
+    poisoned_localappdata: Path | None = None,
+) -> None:
+    root = home / ".agent-supervisor-releases" / "native-fake"
     package = root / "supervisor_core"
     package.mkdir(parents=True, exist_ok=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "__main__.py").write_text(
-        textwrap.dedent(
-            """
+    (package / "__init__.py").write_text("VERSION = 'native-fake'\n", encoding="utf-8")
+    encoded_response = base64.b64encode(response).decode("ascii")
+    capture_path = str(capture) if capture is not None else ""
+    environment_probe_path = str(environment_probe) if environment_probe is not None else ""
+    poisoned_appdata_path = str(poisoned_appdata) if poisoned_appdata is not None else ""
+    poisoned_localappdata_path = (
+        str(poisoned_localappdata) if poisoned_localappdata is not None else ""
+    )
+    fake_source = textwrap.dedent(
+        f"""
             import base64
+            import json
             import os
             import sys
             from pathlib import Path
 
-            raw = sys.stdin.buffer.read()
-            capture = os.environ.get("FAKE_CORE_CAPTURE")
-            if capture:
-                Path(capture).write_bytes(raw)
-            output = os.environ.get("FAKE_CORE_STDOUT_B64")
-            if output:
-                sys.stdout.buffer.write(base64.b64decode(output))
-            raise SystemExit(int(os.environ.get("FAKE_CORE_EXIT", "0")))
-            """
-        ).lstrip(),
+            def main(argv=None):
+                raw = sys.stdin.buffer.read()
+                capture = {capture_path!r}
+                if capture:
+                    Path(capture).write_bytes(raw)
+                environment_probe = {environment_probe_path!r}
+                if environment_probe:
+                    Path(environment_probe).write_text(json.dumps({{
+                        "names": sorted(os.environ),
+                        "appdata_present": bool(os.environ.get("APPDATA")),
+                        "localappdata_present": bool(os.environ.get("LOCALAPPDATA")),
+                        "appdata_is_poison": os.environ.get("APPDATA") == {poisoned_appdata_path!r},
+                        "localappdata_is_poison": os.environ.get("LOCALAPPDATA") == {poisoned_localappdata_path!r},
+                    }}, separators=(",", ":")), encoding="utf-8")
+                sys.stdout.buffer.write(base64.b64decode({encoded_response!r}))
+                return {exit_code!r}
+        """
+    ).lstrip()
+    (package / "cli.py").write_text(fake_source, encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "from .cli import main\nraise SystemExit(main())\n",
         encoding="utf-8",
     )
+    launcher = root / "bin" / "agent-supervisor.py"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text(
+        "from supervisor_core.cli import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    bundle = build_runtime_bundle(root, "native-fake")
+    bundle_path = root / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
+    active = release_identity(
+        root,
+        "native-fake",
+        "runtime/supervisor-runtime.zip",
+        bundle,
+    )
+    pointer = home / ".agent-supervisor" / "active-version.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps({
+            "contract": "ActiveVersionPointer/v4",
+            "active": active,
+            "previous": None,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_native_hook_ignores_workspace_and_pythonpath_module_hijacks(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "native isolated home"
+    workspace = tmp_path / "native hostile workspace"
+    adapter = (
+        home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+        / "codex-supervisor-hook.py"
+    )
+    workspace.mkdir()
+    env = _hermetic_adapter_env(home, session_id="native-isolation-session")
+
+    malicious = workspace / "attacker-pythonpath"
+    malicious_core = malicious / "supervisor_core"
+    malicious_core.mkdir(parents=True)
+    sentinel = tmp_path / "native-hijack-sentinel"
+    side_effect = (
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['SUPERVISOR_HIJACK_SENTINEL']).write_text('ran', encoding='utf-8')\n"
+    )
+    (malicious / "sitecustomize.py").write_text(side_effect, encoding="utf-8")
+    (malicious_core / "__init__.py").write_text(side_effect, encoding="utf-8")
+    (malicious_core / "__main__.py").write_text(side_effect, encoding="utf-8")
+    shutil.copytree(malicious_core, workspace / "supervisor_core")
+
+    env.update({
+        "AGENT_SUPERVISOR_HOME": str(ROOT),
+        "PYTHONPATH": str(malicious),
+        "SUPERVISOR_HIJACK_SENTINEL": str(sentinel),
+    })
+    payload = json.dumps({
+        "session_id": "native-isolation-session",
+        "cwd": str(workspace),
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }).encode("utf-8")
+
+    official_events = (
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+    )
+    for event in official_events:
+        event_payload = json.loads(payload.decode("utf-8"))
+        event_payload["hook_event_name"] = event
+        completed = _run_native_hook(
+            adapter,
+            json.dumps(event_payload).encode("utf-8"),
+            env,
+            workspace,
+            event=event,
+        )
+        assert completed.returncode == 0
+        assert isinstance(json.loads(completed.stdout.decode("utf-8")), dict)
+    assert not sentinel.exists()
+    source = adapter.read_text(encoding="utf-8")
+    assert "_trusted_hook_bridge_source" in source
+    assert "_trusted_powershell" in source
+    assert '"-EncodedCommand"' not in source
+    assert '"-File"' in source
+    assert "CreateFileW" in source
+    assert "0x00000001" in source
+    assert "cwd=install_home" in source
+    assert "def _minimal_hook_environment()" in source
+    assert "env = _minimal_hook_environment()" in source
+    assert "dict(os.environ)" not in source
+    assert "os.environ.copy()" not in source
+
+
+def test_native_hook_child_environment_drops_poison_and_preserves_os_known_folders(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "allowlist home"
+    workspace = tmp_path / "allowlist workspace"
+    workspace.mkdir()
+    adapter = (
+        home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+        / "codex-supervisor-hook.py"
+    )
+    adapter.parent.mkdir(parents=True)
+    for filename in (
+        "codex-supervisor-hook.py",
+        "supervisor-hook.ps1",
+        "supervisor-core.ps1",
+        "supervisor-process-job.py",
+    ):
+        shutil.copy2(CODEX_SCRIPTS / filename, adapter.parent / filename)
+    _write_trusted_executable_registry(home, names=("python",))
+    poison_appdata = tmp_path / "caller appdata"
+    poison_localappdata = tmp_path / "caller localappdata"
+    poison_appdata.mkdir()
+    poison_localappdata.mkdir()
+    probe = tmp_path / "environment-probe.json"
+    _write_native_fake_core(
+        home,
+        environment_probe=probe,
+        poisoned_appdata=poison_appdata,
+        poisoned_localappdata=poison_localappdata,
+    )
+    env = _native_hook_env(home)
+    forbidden = {
+        "SYNTHETIC_TOKEN": "sentinel",
+        "SYNTHETIC_SECRET": "sentinel",
+        "SYNTHETIC_KEY": "sentinel",
+        "SYNTHETIC_CREDENTIAL": "sentinel",
+        "PSModulePath": str(tmp_path / "attacker modules"),
+        "COR_ENABLE_PROFILING": "1",
+        "COMPlus_ReadyToRun": "0",
+    }
+    env.update(forbidden)
+    env["APPDATA"] = str(poison_appdata)
+    env["LOCALAPPDATA"] = str(poison_localappdata)
+    payload = json.dumps({
+        "session_id": "environment-allowlist-session",
+        "cwd": str(workspace),
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }).encode("utf-8")
+
+    completed = _run_native_hook(adapter, payload, env, workspace)
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout.decode("utf-8")) == {}
+    observed = json.loads(probe.read_text(encoding="utf-8"))
+    names = set(observed["names"])
+    assert names.isdisjoint(forbidden)
+    assert not any(name.startswith(("COR_", "COMPlus_")) for name in names)
+    assert observed["appdata_present"] is True
+    assert observed["localappdata_present"] is True
+    assert observed["appdata_is_poison"] is False
+    assert observed["localappdata_is_poison"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows bridge share-lock regression")
+def test_native_hook_holds_verified_bridge_files_read_only_until_launch_returns(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "locked bridge home"
+    _hermetic_adapter_env(home, session_id="locked-bridge-session")
+    adapter = (
+        home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+        / "codex-supervisor-hook.py"
+    )
+    namespace = runpy.run_path(str(adapter), run_name="locked_bridge_probe")
+    core_path = adapter.parent / "supervisor-core.ps1"
+    replacement = tmp_path / "replacement.ps1"
+    replacement.write_bytes(core_path.read_bytes())
+
+    with namespace["_trusted_hook_bridge_files"]() as (core, hook):
+        assert core[1].closed is False
+        assert hook[1].closed is False
+        with pytest.raises(OSError):
+            with core_path.open("ab"):
+                pass
+        with pytest.raises(OSError):
+            os.replace(replacement, core_path)
+
+    assert core[1].closed is True
+    assert hook[1].closed is True
 
 
 def _seed_native_degraded_marker(tmp_path: Path) -> tuple[
@@ -624,7 +1419,14 @@ def _seed_native_degraded_marker(tmp_path: Path) -> tuple[
         / "codex-supervisor-hook.py"
     )
     adapter.parent.mkdir(parents=True)
-    shutil.copy2(CODEX_SCRIPTS / "codex-supervisor-hook.py", adapter)
+    for filename in (
+        "codex-supervisor-hook.py",
+        "supervisor-hook.ps1",
+        "supervisor-core.ps1",
+        "supervisor-process-job.py",
+    ):
+        shutil.copy2(CODEX_SCRIPTS / filename, adapter.parent / filename)
+    _write_trusted_executable_registry(home, names=("python",))
     env = _native_hook_env(home)
     payload = json.dumps({
         "session_id": "durable-ack-session",
@@ -634,12 +1436,11 @@ def _seed_native_degraded_marker(tmp_path: Path) -> tuple[
     }).encode("utf-8")
     missing = _run_native_hook(adapter, payload, env, workspace)
     assert missing.returncode == 0
-    assert missing.stdout == b"{}"
+    assert missing.stdout in {b"", b"{}"}
     markers = list(
         (home / ".agent-supervisor" / "fallback" / "codex" / "markers").glob("*.json")
     )
     assert len(markers) == 1
-    _write_native_fake_core(home / ".agent-supervisor")
     return adapter, workspace, env, payload, markers[0]
 
 
@@ -649,11 +1450,12 @@ def test_native_hook_never_clears_degraded_marker_for_exit_without_durable_ack(
 ) -> None:
     adapter, workspace, env, payload, marker = _seed_native_degraded_marker(tmp_path)
     capture = tmp_path / "forwarded.json"
-    env.update({
-        "FAKE_CORE_CAPTURE": str(capture),
-        "FAKE_CORE_EXIT": str(exit_code),
-        "FAKE_CORE_STDOUT_B64": base64.b64encode(b"{}").decode("ascii"),
-    })
+    _write_native_fake_core(
+        Path(env["USERPROFILE"]),
+        response=b"{}",
+        exit_code=exit_code,
+        capture=capture,
+    )
 
     completed = _run_native_hook(adapter, payload, env, workspace)
 
@@ -676,7 +1478,7 @@ def test_native_hook_rejects_malformed_or_unscoped_durable_ack(
     response: bytes, tmp_path: Path
 ) -> None:
     adapter, workspace, env, payload, marker = _seed_native_degraded_marker(tmp_path)
-    env["FAKE_CORE_STDOUT_B64"] = base64.b64encode(response).decode("ascii")
+    _write_native_fake_core(Path(env["USERPROFILE"]), response=response)
 
     completed = _run_native_hook(adapter, payload, env, workspace)
 
@@ -690,10 +1492,11 @@ def test_native_hook_clears_marker_only_for_structurally_valid_durable_ack(
 ) -> None:
     adapter, workspace, env, payload, marker = _seed_native_degraded_marker(tmp_path)
     response = b'{"agent_supervisor":{"health":"degraded","durable_ack":true}}'
-    env.update({
-        "FAKE_CORE_EXIT": "4",
-        "FAKE_CORE_STDOUT_B64": base64.b64encode(response).decode("ascii"),
-    })
+    _write_native_fake_core(
+        Path(env["USERPROFILE"]),
+        response=response,
+        exit_code=4,
+    )
 
     completed = _run_native_hook(adapter, payload, env, workspace)
 
@@ -703,11 +1506,11 @@ def test_native_hook_clears_marker_only_for_structurally_valid_durable_ack(
 
 
 def test_python_allowed_roots_ignore_core_selection_environment(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows trusted-Python path semantics")
     powershell = _powershell()
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
-    known_user_install = profile_home / "AppData" / "Local" / "Programs" / "Python"
-    known_user_install.mkdir(parents=True)
     malicious_profile_python = profile_home / "python.exe"
     malicious_profile_python.write_bytes(b"not an interpreter")
     untrusted_roots = [
@@ -759,11 +1562,151 @@ def test_python_allowed_roots_ignore_core_selection_environment(tmp_path: Path) 
         for path in result["roots"]
     }
     assert os.path.normcase(str(profile_home.resolve())) not in roots
-    assert os.path.normcase(str(known_user_install.resolve())) in roots
+    assert roots
     assert roots.isdisjoint(
         os.path.normcase(str(path.resolve())) for path in untrusted_roots
     )
     assert result["malicious"] is None
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("legal-relative-leaf-link", r"C:\trusted\python3.exe"),
+        ("broken-link", None),
+        ("directory-target", None),
+        ("link-chain", None),
+        ("resolve-path-erases-link-chain", None),
+        ("cross-root", None),
+        ("wrong-target-name", None),
+    ],
+)
+def test_trusted_python_leaf_link_resolution_is_deterministic_and_fail_closed(
+    tmp_path: Path,
+    scenario: str,
+    expected: str | None,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows trusted-Python path semantics")
+    harness = tmp_path / "trusted-python-link-harness.ps1"
+    harness.write_text(
+        textwrap.dedent(
+            r"""
+            param(
+                [Parameter(Mandatory = $true)][string]$CoreScript,
+                [Parameter(Mandatory = $true)][string]$Scenario
+            )
+            . $CoreScript
+
+            $candidate = 'C:\trusted\python.exe'
+            $allowedRoot = 'C:\trusted'
+            $insideTarget = 'C:\trusted\python3.exe'
+            $finalTarget = 'C:\trusted\python3.14.exe'
+            $outsideTarget = 'C:\outside\python3.exe'
+            $wrongNameTarget = 'C:\trusted\not-python.exe'
+            $targetValue = switch ($Scenario) {
+                'legal-relative-leaf-link' { 'python3.exe' }
+                'cross-root' { $outsideTarget }
+                'wrong-target-name' { $wrongNameTarget }
+                'resolve-path-erases-link-chain' { $insideTarget }
+                default { $insideTarget }
+            }
+
+            function Test-AgentSupervisorDirectoryChain {
+                param([string]$Directory)
+                return $true
+            }
+            function Test-Path {
+                param(
+                    [string]$LiteralPath,
+                    [string]$PathType
+                )
+                if ($LiteralPath -ieq $candidate) { return $true }
+                if ($Scenario -eq 'broken-link' -and $LiteralPath -ieq $insideTarget) {
+                    return $false
+                }
+                if ($Scenario -eq 'directory-target' -and $LiteralPath -ieq $insideTarget) {
+                    return ($PathType -ne 'Leaf')
+                }
+                return $true
+            }
+            function Resolve-Path {
+                param(
+                    [string]$LiteralPath,
+                    [string]$ErrorAction
+                )
+                if (
+                    $Scenario -eq 'resolve-path-erases-link-chain' -and
+                    ($LiteralPath -ieq $candidate -or $LiteralPath -ieq $insideTarget)
+                ) {
+                    return [pscustomobject]@{ Path = $finalTarget }
+                }
+                [pscustomobject]@{ Path = $LiteralPath }
+            }
+            function Get-Item {
+                param(
+                    [string]$LiteralPath,
+                    [switch]$Force,
+                    [string]$ErrorAction
+                )
+                if ($LiteralPath -ieq $candidate) {
+                    return [pscustomobject]@{
+                        PSIsContainer = $false
+                        Attributes = [IO.FileAttributes]::ReparsePoint
+                        Target = @($targetValue)
+                    }
+                }
+                $isDirectory = $Scenario -eq 'directory-target' -and $LiteralPath -ieq $insideTarget
+                $isLinkChain = (
+                    $Scenario -eq 'link-chain' -and $LiteralPath -ieq $insideTarget
+                ) -or (
+                    $Scenario -eq 'resolve-path-erases-link-chain' -and
+                    $LiteralPath -ieq $insideTarget
+                )
+                return [pscustomobject]@{
+                    PSIsContainer = $isDirectory
+                    Attributes = if ($isLinkChain) {
+                        [IO.FileAttributes]::ReparsePoint
+                    } else {
+                        [IO.FileAttributes]::Normal
+                    }
+                }
+            }
+            function Register-AgentSupervisorVerifiedFileHash {
+                param([string]$Path, [hashtable]$Registry)
+                return $true
+            }
+
+            $result = Resolve-AgentSupervisorTrustedPythonPath `
+                -Candidate $candidate `
+                -AllowedRoots @($allowedRoot) `
+                -KnownExecutables @($candidate)
+            [pscustomobject]@{ result = $result } | ConvertTo-Json -Compress
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [
+            _powershell(),
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            str(CODEX_SCRIPTS / "supervisor-core.ps1"),
+            scenario,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(completed.stdout)["result"] == expected
 
 
 def test_spool_tail_drops_oversized_unterminated_partial_record(tmp_path: Path) -> None:

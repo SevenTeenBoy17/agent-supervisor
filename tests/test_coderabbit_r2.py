@@ -198,16 +198,26 @@ def _write_skill(path: Path, *, name: str, version: str | None = None) -> None:
     )
 
 
-def test_discovery_prefers_concrete_version_over_unknown(tmp_path: Path) -> None:
+def test_discovery_rejects_duplicate_identity_regardless_of_version(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root / "unknown-copy", name="same-skill")
     _write_skill(root / "known-copy", name="same-skill", version="1.2.3")
 
     inventory = scan_skills([RootSpec(root, "test")])
-    active = [row for row in inventory["skills"] if row["name"] == "same-skill" and row["active"]]
+    rows = [row for row in inventory["skills"] if row["name"] == "same-skill"]
 
-    assert len(active) == 1
-    assert active[0]["version"] == "1.2.3"
+    assert len(rows) == 2
+    assert all(row["active"] is False for row in rows)
+    assert all(row["automatic"] is False for row in rows)
+    assert all(row["availability"] == "unavailable" for row in rows)
+    assert all(row["error"] == "canonical-capability-id-collision" for row in rows)
+    assert inventory["identity_collisions"] == [{
+        "code": "canonical-capability-id-collision",
+        "canonical_id": "same-skill",
+        "record_count": 2,
+        "kinds": ["skill"],
+        "responsibility_groups": [],
+    }]
 
 
 def test_claude_plugin_registry_rejects_empty_install_path(

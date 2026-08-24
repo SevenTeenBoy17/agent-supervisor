@@ -2,8 +2,13 @@
 state/
 .attestation-key
 active-version.json
+trusted-executables.json
 logs/
 spool/
+review-artifacts/
+review-workspaces/
+round-inputs/
+runtime/
 *.jsonl
 *.lock
 
@@ -11,6 +16,8 @@ spool/
 .pytest_cache/
 .pytest-tmp/
 .pytest-tmp*/
+.pytest-r*/
+.tmp/
 .tmp-tests/
 .agent-supervisor/
 fallback/

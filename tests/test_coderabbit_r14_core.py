@@ -7,6 +7,7 @@ from supervisor_core import cli as cli_module
 from supervisor_core.finalize import finalize_round
 from supervisor_core.lifecycle import start_round
 from supervisor_core.rollout import rollback_active_version
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.storage import StateContext, atomic_write_json
 
 
@@ -15,16 +16,33 @@ def test_rollback_rejects_directory_without_supervisor_release_markers(
 ):
     current = tmp_path / "current"
     previous = tmp_path / "previous"
-    current.mkdir()
+    package = current / "supervisor_core"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VERSION = 'fixture'\n", encoding="utf-8")
+    (package / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    bundle = build_runtime_bundle(current, "3.1.0")
+    bundle_path = current / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
     previous.mkdir()
     pointer = tmp_path / "active-version.json"
-    expected_active = {"version": "3.1.0", "path": str(current)}
+    expected_active = release_identity(
+        current,
+        "3.1.0",
+        "runtime/supervisor-runtime.zip",
+        bundle,
+    )
+    unavailable_previous = {
+        **expected_active,
+        "version": "3.0.0",
+        "path": str(previous.resolve()),
+    }
     pointer.write_text(
         json.dumps(
             {
-                "contract": "ActiveVersionPointer/v3",
+                "contract": "ActiveVersionPointer/v4",
                 "active": expected_active,
-                "previous": {"version": "3.0.0", "path": str(previous)},
+                "previous": unavailable_previous,
             }
         ),
         encoding="utf-8",

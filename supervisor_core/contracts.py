@@ -11,6 +11,7 @@ from .util import canonical_sha256, sha256_text, stable_id, utc_now
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
 
 
 def _list(value: Any) -> list[Any]:
@@ -162,6 +163,10 @@ def build_goal(
     if change_mode not in CHANGE_MODES:
         raise ValueError(f"invalid change mode: {change_mode}")
     supplied = copy.deepcopy(supplied or {})
+    supplied_criteria_present = "acceptance_criteria" in supplied
+    raw_supplied_criteria = supplied.get("acceptance_criteria")
+    if supplied_criteria_present and not isinstance(raw_supplied_criteria, list):
+        raise ValueError("supplied acceptance criteria must be a list")
     previous_goal = previous_goal or {}
     same_identity = change_mode in {"continue", "extend"} and previous_goal.get("goal_id")
     if same_identity:
@@ -174,7 +179,15 @@ def build_goal(
         goal_id = str(supplied.get("goal_id") or stable_id("goal"))
     version = int(previous_goal.get("version", 0)) + 1 if same_identity else int(supplied.get("version", 1))
     previous_criteria = _list(previous_goal.get("acceptance_criteria"))
-    supplied_criteria = _list(supplied.get("acceptance_criteria"))
+    supplied_criteria = _list(raw_supplied_criteria)
+    if (
+        supplied_criteria_present
+        and supplied_criteria
+        and not any(isinstance(raw, (str, dict)) for raw in supplied_criteria)
+    ):
+        raise ValueError(
+            "supplied acceptance criteria contain no valid string or object entries"
+        )
     for index, raw in enumerate(supplied_criteria):
         if isinstance(raw, str):
             raw = {"description": raw}
@@ -239,6 +252,10 @@ def build_goal(
         if not isinstance(raw, dict):
             continue
         description = str(raw.get("description", "")).strip()
+        if not description:
+            raise ValueError(
+                f"acceptance criterion {index} description must not be empty"
+            )
         domain = str(raw.get("domain") or "general").strip() or "general"
         evidence_candidates = [domain, domain.replace("-", "/")]
         if domain in {"api", "db", "database", "backend"}:
@@ -405,7 +422,23 @@ def new_state(
         "reviews": [],
         "claims": [],
         "waivers": [],
-        "changes": {"files": [], "base": "", "head": "", "diff_hash": "", "domains": [], "test_changes": {}},
+        "changes": {
+            "files": [],
+            "base": None,
+            "head": None,
+            "git_object_format": None,
+            "git_binding_status": "unavailable",
+            "git_binding_source": None,
+            "git_repository_root": None,
+            "review_artifact": None,
+            "review_artifact_sha256": None,
+            "git_diff_sha256": None,
+            "workspace_base_sha256": "",
+            "workspace_head_sha256": "",
+            "diff_hash": "",
+            "domains": [],
+            "test_changes": {},
+        },
         "spec": {"status": "unresolved", "hash": "", "path": ""},
         "capability_breakers": {},
         "health": "healthy",
@@ -418,7 +451,8 @@ def new_state(
 
 def invocation_event(
     *, invocation_id: str, capability: str, stage: str, result: str | None, actor: str,
-    details: dict[str, Any] | None = None, identity_assurance: str = "declared-runtime"
+    details: dict[str, Any] | None = None, identity_assurance: str = "declared-runtime",
+    responsibility_group: str | None = None,
 ) -> dict[str, Any]:
     if stage not in {"attempt", "result"}:
         raise ValueError("invocation stage must be attempt or result")
@@ -430,29 +464,86 @@ def invocation_event(
         "stage": stage,
         "result": result if stage == "result" else None,
         "actor": actor,
+        "responsibility_group": responsibility_group,
         "identity_assurance": identity_assurance,
         "details": details or {},
         "timestamp": utc_now(),
     }
-    if identity_assurance in {"host-hook-observed", "codex-explicit-audit"}:
+    if identity_assurance in {"codex-explicit-audit", "codex-hook-observation"}:
+        event["identity_provenance"] = "caller-declared-local-observation"
+        event["completion_eligible"] = False
+    elif identity_assurance == "core-executed-gate":
+        event["identity_provenance"] = "core-minted-single-use-gate-execution"
+        event["completion_eligible"] = True
+    if identity_assurance in {
+        "host-hook-observed",
+        "codex-explicit-audit",
+        "codex-hook-observation",
+        "core-executed-gate",
+        "core-trusted-finalize",
+    }:
+        event["attestation_scope"] = "local-integrity-only"
         event["attestation"] = sign_record(event)
     return event
 
 
 def validate_review_shape(review: Any) -> bool:
+    if not isinstance(review, dict):
+        return False
+    object_format = str(review.get("git_object_format") or "")
+    oid_length = _GIT_OID_LENGTHS.get(object_format)
+    git_binding_status = review.get("git_binding_status")
+    if git_binding_status == "verified":
+        binding_source = review.get("git_binding_source")
+        git_binding_valid = bool(
+            oid_length
+            and binding_source in {"workspace", "review-artifact"}
+            and re.fullmatch(rf"[0-9a-f]{{{oid_length}}}", str(review.get("base", "")))
+            and re.fullmatch(rf"[0-9a-f]{{{oid_length}}}", str(review.get("head", "")))
+            and (
+                (
+                    binding_source == "workspace"
+                    and bool(str(review.get("git_repository_root") or "").strip())
+                    and review.get("review_artifact_sha256") in {None, ""}
+                )
+                or (
+                    binding_source == "review-artifact"
+                    and review.get("git_repository_root") in {None, ""}
+                    and bool(_SHA256_RE.fullmatch(str(review.get("review_artifact_sha256") or "")))
+                    and bool(_SHA256_RE.fullmatch(str(review.get("git_diff_sha256") or "")))
+                )
+            )
+        )
+    else:
+        git_binding_valid = bool(
+            git_binding_status in {"unavailable", "degraded"}
+            and review.get("base") in {None, ""}
+            and review.get("head") in {None, ""}
+        )
+    verification = review.get("evidence_verification")
     return (
-        isinstance(review, dict)
-        and review.get("contract") == "ReviewRecord/v3"
+        review.get("contract") == "ReviewRecord/v3"
         and bool(str(review.get("review_id", "")).strip())
         and bool(str(review.get("goal_id", "")).strip())
-        and isinstance(review.get("goal_version"), int)
+        and type(review.get("goal_version")) is int
         and bool(str(review.get("reviewer", "")).strip())
-        and bool(str(review.get("responsibility_group", "")).strip())
+        and bool(str(review.get("reviewer_responsibility_group", "")).strip())
         and bool(str(review.get("implementer", "")).strip())
-        and bool(re.fullmatch(r"[0-9a-f]{64}", str(review.get("base", ""))))
-        and bool(re.fullmatch(r"[0-9a-f]{64}", str(review.get("head", ""))))
+        and bool(str(review.get("implementer_responsibility_group", "")).strip())
+        and bool(str(review.get("gate_collector", "")).strip())
+        and bool(str(review.get("gate_collector_responsibility_group", "")).strip())
+        and bool(str(review.get("gate_runner_invocation_id", "")).strip())
+        and git_binding_valid
+        and bool(re.fullmatch(r"[0-9a-f]{64}", str(review.get("workspace_base_sha256", ""))))
+        and bool(re.fullmatch(r"[0-9a-f]{64}", str(review.get("workspace_head_sha256", ""))))
         and bool(re.fullmatch(r"[0-9a-f]{64}", str(review.get("diff_hash", ""))))
         and review.get("verdict") in REVIEW_VERDICTS
         and isinstance(review.get("rerun_evidence_ids"), list)
         and bool(review.get("rerun_evidence_ids"))
+        and all(isinstance(item, str) and bool(item.strip()) for item in review.get("rerun_evidence_ids"))
+        and len(set(review.get("rerun_evidence_ids"))) == len(review.get("rerun_evidence_ids"))
+        and isinstance(verification, dict)
+        and verification.get("status") == "VERIFIED"
+        and bool(str(verification.get("reviewer", "")).strip())
+        and isinstance(verification.get("evidence_ids"), list)
     )

@@ -23,9 +23,7 @@ def test_dead_lock_reclaim_cannot_acquire_after_deadline(
     ticks = iter((100.0, 100.2))
     monkeypatch.setattr(storage_module.time, "monotonic", lambda: next(ticks, 100.2))
     monkeypatch.setattr(
-        storage_module.os,
-        "open",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileExistsError()),
+        storage_module, "_publish_lock_no_clobber", lambda _temp, _path: False
     )
     monkeypatch.setattr(storage_module, "_reclaim_confirmed_dead_lock", lambda _path: True)
 

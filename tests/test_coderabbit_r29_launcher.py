@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
+
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
 
@@ -28,15 +30,27 @@ def _write_release(path: Path, marker: str) -> None:
         "    return 0\n",
         encoding="utf-8",
     )
+    bundle = build_runtime_bundle(path, "test-release")
+    bundle_path = path / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(bundle)
 
 
 def _write_pointer(path: Path, release: Path, version: str = "test-release") -> None:
+    bundle = (release / "runtime" / "supervisor-runtime.zip").read_bytes()
+    active = release_identity(
+        release,
+        version,
+        "runtime/supervisor-runtime.zip",
+        bundle,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
-                "contract": "ActiveVersionPointer/v3",
-                "active": {"version": version, "path": str(release)},
+                "contract": "ActiveVersionPointer/v4",
+                "active": active,
+                "previous": None,
             }
         ),
         encoding="utf-8",
