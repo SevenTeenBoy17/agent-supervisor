@@ -5,7 +5,6 @@ import copy
 import json
 import hashlib
 import os
-import re
 import runpy
 import shutil
 import subprocess
@@ -1774,42 +1773,190 @@ def test_spool_never_writes_partial_json_when_single_record_exceeds_cap(
     assert json.loads(marker.read_text(encoding="utf-8"))["health"] == "degraded"
 
 
+class _ModuleProxy:
+    def __init__(self, wrapped, **overrides):
+        self._wrapped = wrapped
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+def _write_posix_hook_fixture(
+    tmp_path: Path,
+    *,
+    pwsh_digest_valid: bool = True,
+    include_pwsh: bool = True,
+) -> tuple[dict, Path, Path, Path]:
+    home = tmp_path / "posix-home"
+    scripts = home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in (
+        "codex-supervisor-hook.py",
+        "supervisor-core.ps1",
+        "supervisor-hook.ps1",
+    ):
+        shutil.copy2(CODEX_SCRIPTS / name, scripts / name)
+    runtime = home / ".pyenv" / "versions" / "3.10" / "bin"
+    runtime.mkdir(parents=True)
+    pwsh = runtime / "pwsh"
+    python_link = runtime / "python3"
+    python_runtime = runtime / "python3.10"
+    pwsh.write_bytes(b"trusted-pwsh-binary")
+    python_link.write_bytes(b"lexical-python-launcher")
+    python_runtime.write_bytes(b"resolved-python-runtime")
+    entries = {
+        "python": {
+            "kind": "local",
+            "path": str(python_link),
+            "sha256": hashlib.sha256(python_runtime.read_bytes()).hexdigest(),
+        }
+    }
+    if include_pwsh:
+        entries["pwsh"] = {
+            "kind": "local",
+            "path": str(pwsh),
+            "sha256": (
+                hashlib.sha256(pwsh.read_bytes()).hexdigest()
+                if pwsh_digest_valid
+                else "0" * 64
+            ),
+        }
+    registry = home / ".agent-supervisor" / "trusted-executables.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({
+        "contract": "TrustedExecutableRegistry/v1",
+        "entries": entries,
+        "generated_at": "2026-08-24T00:00:00Z",
+    }), encoding="utf-8")
+    hook = runpy.run_path(str(scripts / "codex-supervisor-hook.py"), run_name="posix_real")
+    globals_ = hook["_forward"].__globals__
+    globals_["sys"] = _ModuleProxy(sys, platform="linux", executable=str(python_runtime))
+    original_paths = globals_["_posix_executable_paths"]
+
+    def host_neutral_paths(candidate: Path, **kwargs):
+        candidate = Path(candidate)
+        if candidate.name not in kwargs["allowed_names"] or not candidate.is_file():
+            return original_paths(candidate, **kwargs)
+        resolved = python_runtime if candidate == python_link else candidate.resolve(strict=True)
+        allowed = home / ".pyenv" / "versions"
+        try:
+            resolved.relative_to(allowed)
+        except ValueError:
+            return None
+        return candidate, resolved
+
+    globals_["_posix_executable_paths"] = host_neutral_paths
+    return hook, home, pwsh, python_runtime
+
+
 @pytest.mark.parametrize("platform_name", ["linux", "darwin"])
-def test_posix_hook_forward_never_enters_windows_only_trust_functions(
+def test_posix_hook_forward_uses_real_selection_hash_identity_and_frozen_bridge(
     platform_name: str,
     tmp_path: Path,
 ) -> None:
-    hook = runpy.run_path(
-        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
-        run_name=f"posix_forward_{platform_name}",
-    )
+    hook, home, pwsh, python_runtime = _write_posix_hook_fixture(tmp_path)
     globals_ = hook["_forward"].__globals__
+    globals_["sys"] = _ModuleProxy(sys, platform=platform_name, executable=str(python_runtime))
+    captured: dict[str, object] = {}
+
+    selected_python = globals_["_select_posix_executable"](
+        home,
+        registry_names=("python",),
+        allowed_names=frozenset({"python", "python3"}),
+        fixed_candidates=(),
+        require_running_python=True,
+    )
+    assert selected_python[0].name == "python3"
+    assert selected_python[1].name == "python3.10"
 
     def windows_only_called(*_args, **_kwargs):
         raise AssertionError("POSIX hook entered a Windows-only trust primitive")
 
-    class ModuleProxy:
-        def __init__(self, wrapped, **overrides):
-            self._wrapped = wrapped
-            self.__dict__.update(overrides)
+    def run(arguments: list[str], **kwargs):
+        captured["arguments"] = arguments
+        captured["kwargs"] = kwargs
+        return 0, b"{}"
 
-        def __getattr__(self, name):
-            return getattr(self._wrapped, name)
-
-    globals_["sys"] = ModuleProxy(sys, platform=platform_name)
-    globals_["_adapter_install_home"] = lambda: tmp_path
     globals_["_locked_trusted_powershell"] = windows_only_called
     globals_["_locked_trusted_registry_python"] = windows_only_called
-    globals_["_trusted_posix_powershell"] = lambda *_args: (_ for _ in ()).throw(
-        FileNotFoundError("trusted_posix_executable_missing_or_rejected")
-    )
+    globals_["_run_trusted_powershell"] = run
 
+    assert hook["_forward"](
+        "SessionStart",
+        {"session_id": f"{platform_name}-success", "cwd": str(tmp_path)},
+        False,
+    ) == (0, b"{}")
+
+    arguments = captured["arguments"]
+    kwargs = captured["kwargs"]
+    assert arguments[0] == str(pwsh)
+    assert "-Command" in arguments and "-File" not in arguments
+    assert "$script:AgentSupervisorAdapterScriptsRoot" in arguments[-1]
+    assert ". $coreBridge" not in arguments[-1]
+    assert kwargs["cwd"] == home
+    assert kwargs["system_directory"] is None
+    assert kwargs["timeout_seconds"] == hook["_outer_hook_timeout"]("SessionStart")
+    assert kwargs["env"]["AGENT_SUPERVISOR_PYTHON"] == str(selected_python[0])
+    assert kwargs["env"]["PATH"] == str(pwsh.parent)
+    forwarded = json.loads(kwargs["input_bytes"].decode("utf-8"))
+    assert forwarded["_agent_supervisor_adapter"]["degraded_prior"] is False
+
+
+@pytest.mark.parametrize("failure", ["missing-pwsh", "digest-mismatch"])
+def test_posix_hook_real_executable_selection_rejects_missing_or_wrong_digest(
+    failure: str,
+    tmp_path: Path,
+) -> None:
+    hook, _home, _pwsh, _python = _write_posix_hook_fixture(
+        tmp_path,
+        include_pwsh=failure != "missing-pwsh",
+        pwsh_digest_valid=failure != "digest-mismatch",
+    )
     with pytest.raises(FileNotFoundError):
         hook["_forward"](
             "SessionStart",
-            {"session_id": f"{platform_name}-missing-pwsh", "cwd": str(tmp_path)},
+            {"session_id": failure, "cwd": str(tmp_path)},
             False,
         )
+
+
+def test_posix_executable_selection_rejects_python_config_leaf_with_real_helper(
+    tmp_path: Path,
+) -> None:
+    hook, home, _pwsh, _python = _write_posix_hook_fixture(tmp_path)
+    candidate = home / ".pyenv" / "versions" / "3.10" / "bin" / "python3-config"
+    candidate.write_bytes(b"not-a-python-runtime")
+    assert hook["_posix_executable_paths"](
+        candidate,
+        allowed_names=frozenset({"python", "python3"}),
+        allowed_roots=(home / ".pyenv" / "versions",),
+        require_root_owner=False,
+    ) is None
+
+
+def test_posix_real_bridge_digest_and_post_yield_identity_changes_fail_closed(
+    tmp_path: Path,
+) -> None:
+    hook, _home, _pwsh, _python = _write_posix_hook_fixture(tmp_path)
+    globals_ = hook["_forward"].__globals__
+    core = Path(globals_["__file__"]).parent / "supervisor-core.ps1"
+
+    original = core.read_bytes()
+    core.write_bytes(original + b"\n# tamper")
+    with pytest.raises(FileNotFoundError, match="hook_bridge_rejected"):
+        with hook["_trusted_posix_hook_bridge_files"]():
+            pass
+
+    core.write_bytes(original)
+    context = hook["_stable_verified_posix_bridge_file"](
+        "supervisor-core.ps1",
+        len(original),
+        hashlib.sha256(original).hexdigest(),
+    )
+    with pytest.raises(FileNotFoundError, match="hook_bridge_changed"):
+        with context:
+            os.utime(core, ns=(core.stat().st_atime_ns, core.stat().st_mtime_ns + 1_000_000))
 
 
 def test_unknown_hook_platform_fails_closed_before_windows_trust_resolution(
@@ -1820,138 +1967,16 @@ def test_unknown_hook_platform_fails_closed_before_windows_trust_resolution(
         run_name="unknown_platform_forward",
     )
     globals_ = hook["_forward"].__globals__
-
-    def windows_only_called(*_args, **_kwargs):
-        raise AssertionError("unknown platform entered a Windows-only trust primitive")
-
-    class ModuleProxy:
-        def __init__(self, wrapped, **overrides):
-            self._wrapped = wrapped
-            self.__dict__.update(overrides)
-
-        def __getattr__(self, name):
-            return getattr(self._wrapped, name)
-
-    globals_["sys"] = ModuleProxy(sys, platform="plan9")
+    globals_["sys"] = _ModuleProxy(sys, platform="plan9")
+    globals_["os"] = _ModuleProxy(os, name="posix")
     globals_["_adapter_install_home"] = lambda: tmp_path
-    globals_["_locked_trusted_powershell"] = windows_only_called
-    globals_["_locked_trusted_registry_python"] = windows_only_called
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="hook_platform_rejected"):
         hook["_forward"](
             "SessionStart",
             {"session_id": "unknown-platform", "cwd": str(tmp_path)},
             False,
         )
-
-
-@pytest.mark.parametrize("platform_name", ["linux", "darwin"])
-def test_posix_hook_forward_uses_absolute_verified_tools_and_inline_frozen_bridge(
-    platform_name: str,
-    tmp_path: Path,
-) -> None:
-    hook = runpy.run_path(
-        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
-        run_name=f"posix_success_{platform_name}",
-    )
-    globals_ = hook["_forward"].__globals__
-
-    class ModuleProxy:
-        def __init__(self, wrapped, **overrides):
-            self._wrapped = wrapped
-            self.__dict__.update(overrides)
-
-        def __getattr__(self, name):
-            return getattr(self._wrapped, name)
-
-    class Context:
-        def __init__(self, value):
-            self.value = value
-
-        def __enter__(self):
-            return self.value
-
-        def __exit__(self, *_args):
-            return False
-
-    class ByteStream:
-        def __init__(self, content: bytes):
-            self.content = content
-
-        def read(self) -> bytes:
-            return self.content
-
-    def windows_only_called(*_args, **_kwargs):
-        raise AssertionError("POSIX hook entered a Windows-only trust primitive")
-
-    tools = tmp_path / "trusted-tools"
-    powershell = tools / "pwsh"
-    python = tools / "python3"
-    core_bytes = b"verified-core-bytes"
-    hook_bytes = b"verified-hook-bytes"
-    captured: dict[str, object] = {}
-
-    globals_["sys"] = ModuleProxy(sys, platform=platform_name)
-    globals_["_adapter_install_home"] = lambda: tmp_path
-    globals_["_minimal_hook_environment"] = lambda: {"LANG": "C.UTF-8"}
-    globals_["_locked_trusted_powershell"] = windows_only_called
-    globals_["_locked_trusted_registry_python"] = windows_only_called
-    globals_["_trusted_posix_powershell"] = lambda _home: Context(
-        (powershell, object())
-    )
-    globals_["_trusted_posix_python"] = lambda _home: Context((python, object()))
-    globals_["_trusted_posix_hook_bridge_files"] = lambda: Context((
-        (tmp_path / "supervisor-core.ps1", ByteStream(core_bytes)),
-        (tmp_path / "supervisor-hook.ps1", ByteStream(hook_bytes)),
-    ))
-
-    def inline_bridge(scripts_root: Path, core: bytes, bridge: bytes) -> str:
-        captured["inline"] = (scripts_root, core, bridge)
-        return "frozen-inline-bridge"
-
-    def run(arguments: list[str], **kwargs):
-        captured["arguments"] = arguments
-        captured["kwargs"] = kwargs
-        return 0, b"{}"
-
-    globals_["_posix_inline_hook_bridge_source"] = inline_bridge
-    globals_["_run_trusted_powershell"] = run
-
-    result = hook["_forward"](
-        "SessionStart",
-        {"session_id": f"{platform_name}-success", "cwd": str(tmp_path)},
-        False,
-    )
-
-    assert result == (0, b"{}")
-    assert captured["inline"] == (
-        Path(CODEX_SCRIPTS),
-        core_bytes,
-        hook_bytes,
-    )
-    arguments = captured["arguments"]
-    assert isinstance(arguments, list)
-    assert Path(arguments[0]).is_absolute()
-    assert arguments[0] == str(powershell)
-    assert "-Command" in arguments
-    assert "-File" not in arguments
-    assert arguments[-1] == "frozen-inline-bridge"
-    kwargs = captured["kwargs"]
-    assert isinstance(kwargs, dict)
-    assert kwargs["cwd"] == tmp_path
-    assert kwargs["system_directory"] is None
-    assert kwargs["timeout_seconds"] > 0
-    environment = kwargs["env"]
-    assert environment["LANG"] == "C.UTF-8"
-    assert environment["AGENT_SUPERVISOR_PYTHON"] == str(python)
-    assert environment["PATH"] == str(tools)
-    assert "SYNTHETIC_SECRET" not in environment
-    forwarded = json.loads(kwargs["input_bytes"].decode("utf-8"))
-    assert forwarded["session_id"] == f"{platform_name}-success"
-    assert forwarded["_agent_supervisor_adapter"] == {
-        "adapter_version": hook["ADAPTER_VERSION"],
-        "degraded_prior": False,
-    }
 
 
 def test_windows_hook_forward_still_uses_locked_file_bridge_and_job_runner(
@@ -1985,6 +2010,8 @@ def test_windows_hook_forward_still_uses_locked_file_bridge_and_job_runner(
     hook_bridge = tmp_path / "supervisor-hook.ps1"
     captured: dict[str, object] = {}
 
+    globals_["sys"] = _ModuleProxy(sys, platform="win32")
+    globals_["os"] = _ModuleProxy(os, name="nt")
     globals_["_adapter_install_home"] = lambda: tmp_path
     globals_["_minimal_hook_environment"] = lambda: {}
     globals_["_locked_trusted_powershell"] = lambda: Context(
@@ -2030,32 +2057,104 @@ def test_windows_hook_forward_still_uses_locked_file_bridge_and_job_runner(
     assert kwargs["env"]["AGENT_SUPERVISOR_PYTHON"] == str(python)
 
 
-def test_powershell_python_discovery_keeps_versioned_leaf_and_dependency_roots_bounded(
-) -> None:
-    source = (CODEX_SCRIPTS / "supervisor-core.ps1").read_text(encoding="utf-8")
-    leaf_contract = re.compile(r"^(?:python|python3(?:[.][0-9]+)*)$")
-
-    assert leaf_contract.fullmatch("python3")
-    assert leaf_contract.fullmatch("python3.10")
-    assert leaf_contract.fullmatch("python3.10.2")
-    assert not leaf_contract.fullmatch("python3-config")
-    assert not leaf_contract.fullmatch("python3.10-config")
-    assert source.count("'^(?:python|python3(?:[.][0-9]+)*)$'") >= 2
-
-    assert (
-        'k in ("purelib","platlib","stdlib","platstdlib")'
-        in source
+def test_powershell_python_command_executes_dependency_root_policy(tmp_path: Path) -> None:
+    python_path = _trusted_python_path()
+    trusted_root = tmp_path / "trusted-dependencies"
+    site_packages = trusted_root / "lib" / "site-packages"
+    dist_packages = trusted_root / "lib" / "dist-packages"
+    outside_root = tmp_path / "outside-dependencies"
+    outside_site = outside_root / "site-packages"
+    for directory in (site_packages, dist_packages, outside_site):
+        directory.mkdir(parents=True)
+    harness = tmp_path / "python-dependency-policy.ps1"
+    harness.write_text(textwrap.dedent(
+        f"""
+        param([string]$Core, [string]$PythonPath, [string]$TrustedRoot, [string]$OutsideRoot)
+        . $Core
+        $script:Scenario = ''
+        $script:ObservedIdentityProbe = $false
+        function Get-Command {{ @() }}
+        function Get-AgentSupervisorPythonAllowedRoots {{
+            if ($script:Scenario -eq 'zero') {{ return @() }}
+            return @((Split-Path -Parent $PythonPath), $TrustedRoot)
+        }}
+        function Get-AgentSupervisorTrustedRegistryPythonPath {{
+            if ($script:Scenario -eq 'zero') {{ return $null }}
+            return $PythonPath
+        }}
+        function Invoke-AgentSupervisorPython {{
+            param(
+                [string]$Command, [string[]]$PrefixArgs, [string[]]$Arguments,
+                [string]$Operation, [double]$TimeoutSeconds,
+                [switch]$CaptureOutput, [switch]$SuppressOutput,
+                [switch]$IsolatedEnvironment, [switch]$Silent
+            )
+            $script:ObservedIdentityProbe = Test-AgentSupervisorFixedPythonProbe `
+                -Operation $Operation -PrefixArgs $PrefixArgs -Arguments $Arguments
+            $site = switch ($script:Scenario) {{
+                'site' {{ Join-Path $TrustedRoot 'lib\\site-packages' }}
+                'dist' {{ Join-Path $TrustedRoot 'lib\\dist-packages' }}
+                default {{ Join-Path $OutsideRoot 'site-packages' }}
+            }}
+            $dependency = if ($script:Scenario -in @('site','dist')) {{ $TrustedRoot }} else {{ $OutsideRoot }}
+            $payload = @{{
+                executable = $PythonPath
+                site_paths = @($site)
+                dependency_roots = @($dependency)
+            }} | ConvertTo-Json -Compress
+            return [pscustomobject]@{{ ExitCode = 0; StandardOutput = $payload }}
+        }}
+        $results = @{{}}
+        foreach ($scenario in @('site','dist','outside','zero')) {{
+            $script:Scenario = $scenario
+            $script:ObservedIdentityProbe = $false
+            $resolved = Get-AgentSupervisorPythonCommand
+            $results[$scenario] = @{{
+                accepted = $null -ne $resolved
+                identityProbe = $script:ObservedIdentityProbe
+                dependencyLeaf = if (@($script:AgentSupervisorVerifiedDependencyRoots).Count) {{
+                    Split-Path -Leaf $script:AgentSupervisorVerifiedDependencyRoots[0]
+                }} else {{ '' }}
+            }}
+        }}
+        $windowsCandidate = Resolve-AgentSupervisorTrustedPythonPath `
+            -Candidate $PythonPath `
+            -AllowedRoots @((Split-Path -Parent $PythonPath)) `
+            -KnownExecutables @($PythonPath)
+        $configCandidate = Join-Path (Split-Path -Parent $PythonPath) 'python3-config.exe'
+        $windowsConfig = Resolve-AgentSupervisorTrustedPythonPath `
+            -Candidate $configCandidate `
+            -AllowedRoots @((Split-Path -Parent $PythonPath)) `
+            -KnownExecutables @($configCandidate)
+        @{{ results = $results; windowsCandidate = $windowsCandidate; windowsConfig = $windowsConfig }} |
+            ConvertTo-Json -Compress -Depth 8
+        """
+    ).strip() + "\n", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            _powershell(), "-NoLogo", "-NoProfile", "-File", str(harness),
+            str(CODEX_SCRIPTS / "supervisor-core.ps1"), str(python_path),
+            str(trusted_root), str(outside_root),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
     )
-    assert "user_site=site.getusersitepackages()" in source
-    assert "+([user_site] if user_site else [])" in source
-    assert "$dependencyTrustRoots = @($allowedRoots)" in source
-    assert "$resolvedDependency.StartsWith($trustPrefix" in source
-    assert "$dependencyAllowedRoots.Count -eq 0" in source
-    assert "'^(?i:site-packages|dist-packages)$'" in source
-    assert "$resolvedSite.StartsWith($rootPrefix" in source
-    assert "$verifiedDependencyRoots.Count -eq 0" in source
-
-    assert "([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)" in source
-    assert "@('python.exe', 'python3.exe')" in source
-    assert "-Operation 'python-identity'" in source
-    assert "Resolve-AgentSupervisorTrustedPythonPath" in source
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["results"]["site"] == {
+        "accepted": True,
+        "identityProbe": True,
+        "dependencyLeaf": "site-packages",
+    }
+    assert observed["results"]["dist"] == {
+        "accepted": True,
+        "identityProbe": True,
+        "dependencyLeaf": "dist-packages",
+    }
+    assert observed["results"]["outside"]["accepted"] is False
+    assert observed["results"]["zero"]["accepted"] is False
+    assert observed["windowsCandidate"] == str(python_path)
+    assert observed["windowsConfig"] is None
