@@ -24,6 +24,7 @@ ADAPTER = (
 )
 HOOK = ADAPTER / "codex-supervisor-hook.py"
 CORE_BRIDGE = ADAPTER / "supervisor-core.ps1"
+STAGE_ZERO = ADAPTER / "supervisor-process-job.py"
 IDENTITY_FIELDS = {
     "contract",
     "version",
@@ -185,6 +186,89 @@ def test_outer_deadline_strictly_covers_inner_and_tree_cleanup() -> None:
             + module["INNER_STREAM_CLEANUP_SECONDS"]
             + module["OUTER_BRIDGE_GRACE_SECONDS"]
         )
+
+
+def test_frozen_stage_zero_uses_explicit_supported_platform_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(STAGE_ZERO), run_name="stage_zero_platform_probe")
+    establish = namespace["_establish_platform_containment"]
+    globals_ = establish.__globals__
+    observed_job_calls: list[str] = []
+
+    monkeypatch.setitem(
+        globals_,
+        "_enable_kill_on_close",
+        lambda: observed_job_calls.append("job") or True,
+    )
+    monkeypatch.setattr(globals_["sys"], "platform", "win32")
+    assert establish() is True
+    assert observed_job_calls == ["job"]
+
+    observed_job_calls.clear()
+    for platform in ("linux", "linux-musl", "darwin"):
+        monkeypatch.setattr(globals_["sys"], "platform", platform)
+        assert establish() is True
+    assert observed_job_calls == []
+
+    for platform in ("freebsd14", "aix", "cygwin", "unknown"):
+        monkeypatch.setattr(globals_["sys"], "platform", platform)
+        assert establish() is False
+    assert observed_job_calls == []
+
+
+def test_frozen_stage_zero_unknown_platform_exits_125_before_frame_or_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(STAGE_ZERO), run_name="stage_zero_fail_closed_probe")
+    main = namespace["main"]
+    globals_ = main.__globals__
+    calls: list[str] = []
+
+    monkeypatch.setattr(globals_["sys"], "platform", "unsupported-kernel")
+    monkeypatch.setattr(
+        globals_["sys"],
+        "argv",
+        [str(STAGE_ZERO), "--agent-supervisor-bound-bundle", "/logical/launcher"],
+    )
+    monkeypatch.setitem(
+        globals_,
+        "_enable_dependency_paths",
+        lambda: calls.append("dependencies") or True,
+    )
+    monkeypatch.setitem(
+        globals_,
+        "_read_and_install_runtime_frame",
+        lambda: calls.append("runtime-frame") or b"",
+    )
+
+    assert main() == 125
+    assert calls == []
+
+
+def test_frozen_stage_zero_windows_job_failure_exits_125_before_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(STAGE_ZERO), run_name="stage_zero_windows_fail_probe")
+    main = namespace["main"]
+    globals_ = main.__globals__
+    calls: list[str] = []
+
+    monkeypatch.setattr(globals_["sys"], "platform", "win32")
+    monkeypatch.setattr(
+        globals_["sys"],
+        "argv",
+        [str(STAGE_ZERO), "--agent-supervisor-bound-bundle", "C:/logical/launcher"],
+    )
+    monkeypatch.setitem(globals_, "_enable_kill_on_close", lambda: False)
+    monkeypatch.setitem(
+        globals_,
+        "_read_and_install_runtime_frame",
+        lambda: calls.append("runtime-frame") or b"",
+    )
+
+    assert main() == 125
+    assert calls == []
 
 
 def test_timeout_terminates_complete_process_tree_without_late_state_write(

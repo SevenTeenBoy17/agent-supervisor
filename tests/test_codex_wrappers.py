@@ -516,6 +516,40 @@ def test_process_job_launcher_is_bound_to_the_trusted_source_snapshot(
     assert workspace_module.validated_supervisor_source_snapshot_hash(missing) is None
 
 
+def test_core_bridge_returns_the_exact_frozen_stage_zero_bytes() -> None:
+    bridge = CODEX_SCRIPTS / "supervisor-core.ps1"
+    stage_zero = CODEX_SCRIPTS / "supervisor-process-job.py"
+    escaped = str(bridge).replace("'", "''")
+    command = (
+        "$ErrorActionPreference='Stop';"
+        f". '{escaped}';"
+        "$encoded=Get-AgentSupervisorContainmentLauncherSource;"
+        "if ([string]::IsNullOrWhiteSpace($encoded)) { exit 125 };"
+        "[Console]::OpenStandardOutput().Write("
+        "[Convert]::FromBase64String($encoded),0,"
+        "[Convert]::FromBase64String($encoded).Length)"
+    )
+
+    completed = subprocess.run(
+        [
+            _powershell(),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    assert completed.stdout == stage_zero.read_bytes()
+
+
 @pytest.mark.parametrize(
     "case",
     [

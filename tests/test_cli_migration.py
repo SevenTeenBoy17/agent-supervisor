@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from supervisor_core.cli import _classify_goal_change, main
+from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.util import canonical_sha256, sha256_file
 from supervisor_core.validation import validate_state
 
@@ -499,22 +500,102 @@ def test_two_failures_do_not_activate_toml_only_unverified_fallback(
     assert response["fallback_required"] is None
 
 
-@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_bin_bootstrap_runs_from_arbitrary_cwd(tmp_path):
-    script = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
-    isolated_home = tmp_path / "home"
-    isolated_home.mkdir()
-    env = _hermetic_hook_env(isolated_home)
-    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(tmp_path / "missing-active-version.json")
+    fixture_version = "fixture-v4-direct-launcher"
+    install_home = tmp_path / "physical install home"
+    pointer_root = install_home / ".agent-supervisor"
+    launcher = pointer_root / "bin" / "agent-supervisor.py"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "bin" / "agent-supervisor.py", launcher)
+
+    release = (
+        install_home
+        / ".agent-supervisor-releases"
+        / fixture_version
+    )
+    package = release / "supervisor_core"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        '"""Hermetic direct-launcher fixture."""\n',
+        encoding="utf-8",
+    )
+    (package / "cli.py").write_text(
+        (
+            "import sys\n\n"
+            "def main(argv=None):\n"
+            "    args = list(sys.argv[1:] if argv is None else argv)\n"
+            "    if args == ['--version']:\n"
+            f"        print({fixture_version!r})\n"
+            "        return 0\n"
+            "    return 64\n"
+        ),
+        encoding="utf-8",
+    )
+    bundle_relative = "runtime/supervisor-runtime.zip"
+    bundle = build_runtime_bundle(release, fixture_version)
+    bundle_path = release / Path(bundle_relative)
+    bundle_path.parent.mkdir()
+    bundle_path.write_bytes(bundle)
+    active = release_identity(
+        release,
+        fixture_version,
+        bundle_relative,
+        bundle,
+    )
+    physical_pointer = pointer_root / "active-version.json"
+    physical_pointer.write_text(
+        json.dumps(
+            {
+                "contract": "ActiveVersionPointer/v4",
+                "active": active,
+                "previous": None,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    arbitrary_cwd = tmp_path / "unrelated 中文 cwd"
+    arbitrary_cwd.mkdir()
+    environment_home = tmp_path / "unrelated environment home"
+    environment_home.mkdir()
+    override_pointer = tmp_path / "malformed environment override.json"
+    override_pointer.write_text("{}\n", encoding="utf-8")
+    env = os.environ.copy()
+    for key in (
+        "AGENT_SUPERVISOR_ACTIVE_POINTER",
+        "AGENT_SUPERVISOR_HOME",
+        "AGENT_SUPERVISOR_INSTALL_HOME",
+        "AGENT_SUPERVISOR_RELEASE_ROOT",
+        "PYTHONPATH",
+    ):
+        env.pop(key, None)
+    env.update({
+        "AGENT_SUPERVISOR_ACTIVE_POINTER": str(override_pointer),
+        "AGENT_SUPERVISOR_HOME": str(tmp_path / "untrusted supervisor home"),
+        "AGENT_SUPERVISOR_INSTALL_HOME": str(environment_home),
+        "AGENT_SUPERVISOR_RELEASE_ROOT": str(tmp_path / "untrusted releases"),
+        "HOME": str(environment_home),
+        "USERPROFILE": str(environment_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+
     completed = subprocess.run(
-        [sys.executable, str(script), "--version"],
-        cwd=tmp_path,
+        [sys.executable, str(launcher), "--version"],
+        cwd=arbitrary_cwd,
         env=env,
         text=True,
         capture_output=True,
+        encoding="utf-8",
+        check=False,
+        timeout=15,
     )
+
+    assert Path(env["AGENT_SUPERVISOR_ACTIVE_POINTER"]) != physical_pointer
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "3.1.1"
+    assert completed.stdout.strip() == fixture_version
+    assert completed.stderr == ""
 
 
 @pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")

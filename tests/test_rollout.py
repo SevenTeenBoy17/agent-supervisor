@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -27,6 +28,9 @@ from supervisor_core.runtime_bundle import build_runtime_bundle, release_identit
 from supervisor_core.storage import StateContext
 
 
+SOURCE_LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
+
+
 @pytest.fixture(autouse=True)
 def isolated_attestation_key(tmp_path, monkeypatch):
     monkeypatch.setenv(
@@ -35,11 +39,28 @@ def isolated_attestation_key(tmp_path, monkeypatch):
     )
 
 
-def _write_release_root(path: Path, version: str = "3.1.0") -> dict[str, str]:
+def _write_release_root(
+    path: Path,
+    version: str = "3.1.0",
+    *,
+    marker: str | None = None,
+    sentinel: Path | None = None,
+) -> dict[str, str]:
     core = path / "supervisor_core"
     core.mkdir(parents=True)
     (core / "__init__.py").write_text("VERSION = 'fixture'\n", encoding="utf-8")
-    (core / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    if marker is None and sentinel is None:
+        cli_source = "def main():\n    return 0\n"
+    else:
+        cli_source = "from pathlib import Path\n\ndef main():\n"
+        if sentinel is not None:
+            cli_source += (
+                f"    Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+            )
+        if marker is not None:
+            cli_source += f"    print({marker!r})\n"
+        cli_source += "    return 0\n"
+    (core / "cli.py").write_text(cli_source, encoding="utf-8")
     bundle = build_runtime_bundle(path, version)
     bundle_path = path / "runtime" / "supervisor-runtime.zip"
     bundle_path.parent.mkdir(parents=True)
@@ -47,49 +68,138 @@ def _write_release_root(path: Path, version: str = "3.1.0") -> dict[str, str]:
     return release_identity(path, version, "runtime/supervisor-runtime.zip", bundle)
 
 
-def test_launcher_rejects_invalid_contract_and_untrusted_active_path(tmp_path):
-    fake = tmp_path / "untrusted" / "supervisor_core"
-    fake.mkdir(parents=True)
-    (fake / "__init__.py").write_text("", encoding="utf-8")
-    (fake / "cli.py").write_text(
-        "def main():\n    print('UNTRUSTED_POINTER_EXECUTED')\n    return 0\n",
+def _stage_physical_launcher(install_home: Path) -> tuple[Path, Path, Path]:
+    launcher = install_home / ".agent-supervisor" / "bin" / "agent-supervisor.py"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(SOURCE_LAUNCHER, launcher)
+    pointer = install_home / ".agent-supervisor" / "active-version.json"
+    releases = install_home / ".agent-supervisor-releases"
+    return launcher, pointer, releases
+
+
+def _write_exact_v4_pointer(pointer: Path, active: dict[str, str]) -> None:
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "contract": "ActiveVersionPointer/v4",
+                "active": active,
+                "previous": None,
+            },
+            separators=(",", ":"),
+        ),
         encoding="utf-8",
     )
-    pointer = tmp_path / "active-version.json"
-    pointer.write_text(json.dumps({
-        "contract": "WrongPointer/v0",
-        "active": {"version": "evil", "path": str(fake.parent)},
-    }), encoding="utf-8")
+
+
+def _environment_override(tmp_path: Path) -> dict[str, str]:
+    environment_home = tmp_path / "environment override install"
+    environment_release = (
+        environment_home / ".agent-supervisor-releases" / "environment-v4"
+    )
+    active = _write_release_root(
+        environment_release,
+        "environment-v4",
+        marker="ENVIRONMENT_OVERRIDE_EXECUTED",
+    )
+    environment_pointer = environment_home / ".agent-supervisor" / "active-version.json"
+    _write_exact_v4_pointer(environment_pointer, active)
     env = os.environ.copy()
-    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"), "--version"],
+    env.pop("PYTHONPATH", None)
+    env.update({
+        "AGENT_SUPERVISOR_ACTIVE_POINTER": str(environment_pointer),
+        "AGENT_SUPERVISOR_HOME": str(environment_home / "environment supervisor"),
+        "AGENT_SUPERVISOR_INSTALL_HOME": str(environment_home),
+        "AGENT_SUPERVISOR_RELEASE_ROOT": str(
+            environment_home / ".agent-supervisor-releases"
+        ),
+        "HOME": str(environment_home),
+        "USERPROFILE": str(environment_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    return env
+
+
+def _run_physical_launcher(
+    launcher: Path,
+    cwd: Path,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(launcher), "--version"],
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
         check=False,
+        timeout=15,
     )
-    assert completed.returncode == 0
-    assert "UNTRUSTED_POINTER_EXECUTED" not in completed.stdout
-    assert completed.stdout.strip().startswith("3.")
 
 
-def test_launcher_safely_falls_back_when_active_path_resolve_reports_a_loop(
-    tmp_path, monkeypatch, capsys
-):
-    launcher = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
-    valid_release = tmp_path / "valid-release"
-    active = _write_release_root(valid_release, "3.1.0")
-    loop_candidate = tmp_path / "looped-release"
-    active["path"] = str(loop_candidate)
-    pointer = tmp_path / "active-version.json"
-    pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v4",
-        "active": active,
-        "previous": None,
-    }), encoding="utf-8")
-    monkeypatch.setenv("AGENT_SUPERVISOR_ACTIVE_POINTER", str(pointer))
+def test_physical_launcher_invalid_contract_exits_64_without_environment_fallback(
+    tmp_path: Path,
+) -> None:
+    launcher, physical_pointer, _releases = _stage_physical_launcher(
+        tmp_path / "physical install"
+    )
+    sentinel = tmp_path / "untrusted-pointer-executed.txt"
+    fake = tmp_path / "untrusted" / "supervisor_core"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "cli.py").write_text(
+        "from pathlib import Path\n\n"
+        "def main():\n"
+        f"    Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+        "    print('UNTRUSTED_POINTER_EXECUTED')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    physical_pointer.write_text(
+        json.dumps(
+            {
+                "contract": "WrongPointer/v0",
+                "active": {"version": "evil", "path": str(fake.parent)},
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    cwd = tmp_path / "arbitrary cwd"
+    cwd.mkdir()
+
+    completed = _run_physical_launcher(
+        launcher,
+        cwd,
+        _environment_override(tmp_path),
+    )
+
+    assert completed.returncode == 64
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert not sentinel.exists()
+
+
+def test_physical_launcher_path_resolve_loop_exits_64_without_environment_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_home = tmp_path / "physical install"
+    launcher, physical_pointer, releases = _stage_physical_launcher(install_home)
+    sentinel = tmp_path / "looped-release-executed.txt"
+    loop_candidate = releases / "looped-release"
+    active = _write_release_root(
+        loop_candidate,
+        "loop-v4",
+        marker="LOOPED_RELEASE_EXECUTED",
+        sentinel=sentinel,
+    )
+    _write_exact_v4_pointer(physical_pointer, active)
+    env = _environment_override(tmp_path)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     original_resolve = Path.resolve
 
     def resolve_with_loop(self, strict=False):
@@ -102,14 +212,21 @@ def test_launcher_safely_falls_back_when_active_path_resolve_reports_a_loop(
     with pytest.raises(SystemExit) as stopped:
         runpy.run_path(str(launcher), run_name="__main__")
 
-    assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip().startswith("3.")
+    captured = capsys.readouterr()
+    assert stopped.value.code == 64
+    assert captured.out == ""
+    assert captured.err == ""
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize("link_position", ["candidate", "ancestor"])
-def test_launcher_rejects_symlinked_release_directory(tmp_path, link_position):
-    launcher = Path(__file__).resolve().parents[1] / "bin" / "agent-supervisor.py"
-    releases = tmp_path / "releases"
+def test_physical_launcher_symlinked_release_path_exits_64_without_environment_fallback(
+    tmp_path: Path,
+    link_position: str,
+) -> None:
+    launcher, physical_pointer, releases = _stage_physical_launcher(
+        tmp_path / "physical install"
+    )
     if link_position == "candidate":
         real_release = releases / "real-release"
         link_target = real_release
@@ -120,12 +237,12 @@ def test_launcher_rejects_symlinked_release_directory(tmp_path, link_position):
         real_release = link_target / "release"
         linked_component = releases / "linked-parent"
         candidate = linked_component / "release"
-    active = _write_release_root(real_release, "3.1.0")
-    (real_release / "supervisor_core" / "cli.py").write_text(
-        "def main():\n"
-        "    print('SYMLINKED_RELEASE_EXECUTED')\n"
-        "    return 0\n",
-        encoding="utf-8",
+    sentinel = tmp_path / f"symlinked-{link_position}-release-executed.txt"
+    active = _write_release_root(
+        real_release,
+        "symlink-v4",
+        marker="SYMLINKED_RELEASE_EXECUTED",
+        sentinel=sentinel,
     )
     try:
         linked_component.symlink_to(link_target, target_is_directory=True)
@@ -158,27 +275,20 @@ def test_launcher_rejects_symlinked_release_directory(tmp_path, link_position):
             )
 
     active["path"] = str(candidate)
-    pointer = tmp_path / "active-version.json"
-    pointer.write_text(json.dumps({
-        "contract": "ActiveVersionPointer/v4",
-        "active": active,
-        "previous": None,
-    }), encoding="utf-8")
-    env = os.environ.copy()
-    env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
-    env["AGENT_SUPERVISOR_RELEASE_ROOT"] = str(releases)
-    completed = subprocess.run(
-        [sys.executable, str(launcher), "--version"],
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        check=False,
+    _write_exact_v4_pointer(physical_pointer, active)
+    cwd = tmp_path / "arbitrary cwd"
+    cwd.mkdir()
+
+    completed = _run_physical_launcher(
+        launcher,
+        cwd,
+        _environment_override(tmp_path),
     )
 
-    assert completed.returncode == 0
-    assert "SYMLINKED_RELEASE_EXECUTED" not in completed.stdout
-    assert completed.stdout.strip().startswith("3.")
+    assert completed.returncode == 64
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert not sentinel.exists()
 
 
 def observation(identifier: str, kind: str, **values):
