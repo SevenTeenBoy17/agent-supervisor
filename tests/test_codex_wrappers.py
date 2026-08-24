@@ -5,10 +5,13 @@ import copy
 import json
 import hashlib
 import os
+import re
 import runpy
 import shutil
+import site
 import subprocess
 import sys
+import sysconfig
 import textwrap
 from pathlib import Path
 
@@ -1908,17 +1911,144 @@ def test_posix_hook_real_executable_selection_rejects_missing_or_wrong_digest(
     failure: str,
     tmp_path: Path,
 ) -> None:
-    hook, _home, _pwsh, _python = _write_posix_hook_fixture(
+    hook, home, _pwsh, _python = _write_posix_hook_fixture(
         tmp_path,
         include_pwsh=failure != "missing-pwsh",
         pwsh_digest_valid=failure != "digest-mismatch",
     )
     with pytest.raises(FileNotFoundError):
-        hook["_forward"](
-            "SessionStart",
-            {"session_id": failure, "cwd": str(tmp_path)},
-            False,
+        hook["_select_posix_executable"](
+            home,
+            registry_names=("pwsh", "powershell"),
+            allowed_names=frozenset({"pwsh"}),
+            fixed_candidates=(),
+            require_running_python=False,
         )
+
+
+def test_posix_real_executable_selection_accepts_an_explicit_fixed_candidate(
+    tmp_path: Path,
+) -> None:
+    hook, home, pwsh, _python = _write_posix_hook_fixture(
+        tmp_path,
+        include_pwsh=False,
+    )
+    selected = hook["_select_posix_executable"](
+        home,
+        registry_names=("pwsh", "powershell"),
+        allowed_names=frozenset({"pwsh"}),
+        fixed_candidates=(pwsh,),
+        require_running_python=False,
+    )
+    assert selected == (pwsh, pwsh, None)
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("wsl.exe") is None,
+    reason="Windows-hosted WSL integration requires Windows and wsl.exe",
+)
+def test_wsl_posix_production_selection_covers_versioned_python_and_pwsh_branches() -> None:
+    wsl = shutil.which("wsl.exe")
+    assert wsl is not None
+    translated = subprocess.run(
+        [wsl, "-e", "wslpath", "-a", str(CODEX_SCRIPTS / "codex-supervisor-hook.py")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=10,
+    )
+    assert translated.returncode == 0
+    hook_path = translated.stdout.strip()
+    assert hook_path.startswith("/")
+    source = textwrap.dedent(
+        """
+        import json, pathlib, runpy, shutil, tempfile
+
+        hook = runpy.run_path(__import__('sys').argv[1], run_name='wsl_posix_contract')
+        python = pathlib.Path('/usr/bin/python3')
+        direct = hook['_posix_executable_paths'](
+            python,
+            allowed_names=frozenset({'python', 'python3'}),
+            allowed_roots=(pathlib.Path('/usr'),),
+            require_root_owner=True,
+        )
+        selected_python = hook['_select_posix_executable'](
+            pathlib.Path('/root'),
+            registry_names=(),
+            allowed_names=frozenset({'python', 'python3'}),
+            fixed_candidates=(python,),
+            require_running_python=True,
+        )
+        config_rejected = hook['_posix_executable_paths'](
+            pathlib.Path('/usr/bin/python3-config'),
+            allowed_names=frozenset({'python', 'python3'}),
+            allowed_roots=(pathlib.Path('/usr'),),
+            require_root_owner=True,
+        ) is None
+        install_home = pathlib.Path(tempfile.mkdtemp(prefix='agent-supervisor-posix-', dir='/root'))
+        try:
+            missing = False
+            try:
+                hook['_select_posix_executable'](
+                    install_home,
+                    registry_names=('pwsh', 'powershell'),
+                    allowed_names=frozenset({'pwsh'}),
+                    fixed_candidates=(),
+                    require_running_python=False,
+                )
+            except FileNotFoundError:
+                missing = True
+            fixed_pwsh = install_home / '.pyenv' / 'versions' / 'test' / 'bin' / 'pwsh'
+            fixed_pwsh.parent.mkdir(parents=True)
+            fixed_pwsh.write_bytes(b'#!/bin/sh\\nexit 0\\n')
+            fixed_pwsh.chmod(0o755)
+            fixed = hook['_select_posix_executable'](
+                install_home,
+                registry_names=(),
+                allowed_names=frozenset({'pwsh'}),
+                fixed_candidates=(fixed_pwsh,),
+                require_running_python=False,
+            )
+            with hook['_trusted_posix_python'](install_home) as trusted_python:
+                trusted_lexical = str(trusted_python[0])
+            result = {
+                'directLexical': str(direct[0]),
+                'directResolvedLeaf': direct[1].name,
+                'selectedLexical': str(selected_python[0]),
+                'selectedResolvedLeaf': selected_python[1].name,
+                'configRejected': config_rejected,
+                'missingWithEmptyFixedCandidates': missing,
+                'fixedPwsh': str(fixed[0]),
+                'fixedExpectedDigest': fixed[2],
+                'trustedPythonLexical': trusted_lexical,
+                'nativePwshAvailable': shutil.which('pwsh') is not None,
+            }
+            print(json.dumps(result, separators=(',', ':')))
+        finally:
+            shutil.rmtree(install_home)
+        """
+    )
+    completed = subprocess.run(
+        [wsl, "-e", "python3", "-I", "-S", "-X", "utf8", "-c", source, hook_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["directLexical"] == "/usr/bin/python3"
+    assert re.fullmatch(r"python3\.\d+", observed["directResolvedLeaf"])
+    assert observed["selectedLexical"] == "/usr/bin/python3"
+    assert re.fullmatch(r"python3\.\d+", observed["selectedResolvedLeaf"])
+    assert observed["configRejected"] is True
+    assert observed["missingWithEmptyFixedCandidates"] is True
+    assert observed["fixedPwsh"].endswith("/.pyenv/versions/test/bin/pwsh")
+    assert observed["fixedExpectedDigest"] is None
+    assert observed["trustedPythonLexical"] == "/usr/bin/python3"
+    assert isinstance(observed["nativePwshAvailable"], bool)
 
 
 def test_posix_executable_selection_rejects_python_config_leaf_with_real_helper(
@@ -2158,3 +2288,58 @@ def test_powershell_python_command_executes_dependency_root_policy(tmp_path: Pat
     assert observed["results"]["zero"]["accepted"] is False
     assert observed["windowsCandidate"] == str(python_path)
     assert observed["windowsConfig"] is None
+
+
+def test_powershell_python_command_runs_real_production_identity_probe(
+    tmp_path: Path,
+) -> None:
+    python_path = _trusted_python_path()
+    harness = tmp_path / "real-python-identity-probe.ps1"
+    harness.write_text(textwrap.dedent(
+        """
+        param([string]$Core, [string]$PythonPath)
+        . $Core
+        function Get-Command { @() }
+        function Get-AgentSupervisorPythonAllowedRoots {
+            return @((Split-Path -Parent $PythonPath))
+        }
+        function Get-AgentSupervisorTrustedRegistryPythonPath { return $PythonPath }
+        $resolved = Get-AgentSupervisorPythonCommand
+        $accepted = $null -ne $resolved
+        $command = if ($accepted) { [string]$resolved.Command } else { '' }
+        $dependencies = @($script:AgentSupervisorVerifiedDependencyRoots)
+
+        function Get-AgentSupervisorPythonAllowedRoots { return @() }
+        function Get-AgentSupervisorTrustedRegistryPythonPath { return $null }
+        $zero = Get-AgentSupervisorPythonCommand
+        @{
+            accepted = $accepted
+            command = $command
+            dependencies = $dependencies
+            zeroAccepted = $null -ne $zero
+        } | ConvertTo-Json -Compress -Depth 8
+        """
+    ).strip() + "\n", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            _powershell(), "-NoLogo", "-NoProfile", "-File", str(harness),
+            str(CODEX_SCRIPTS / "supervisor-core.ps1"), str(python_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["accepted"] is True
+    assert Path(observed["command"]) == python_path
+    dependencies = {Path(value).resolve() for value in observed["dependencies"]}
+    expected_system_site = Path(sysconfig.get_paths()["purelib"]).resolve()
+    expected_user_site = Path(site.getusersitepackages()).resolve()
+    assert expected_system_site in dependencies
+    if expected_user_site.is_dir():
+        assert expected_user_site in dependencies
+    assert all(path.name in {"site-packages", "dist-packages"} for path in dependencies)
+    assert observed["zeroAccepted"] is False
