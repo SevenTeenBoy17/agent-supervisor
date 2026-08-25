@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
-from datetime import timedelta
 import json
 import os
 import re
@@ -33,6 +32,7 @@ from .discovery import (
     write_baseline,
 )
 from .executable_trust import (
+    authorize_trusted_command,
     ExecutableTrustError,
     load_trusted_executable_registry,
     registry_public_record,
@@ -62,8 +62,6 @@ from .rollout import (
     active_version_snapshot,
     apply_observation,
     promote,
-    reset_rollback_cycle,
-    rollback_active_version,
 )
 from .storage import StateContext, atomic_write_bytes, atomic_write_json, default_round, default_session, prune_old_state
 from .util import canonical_sha256, json_load, parse_time, redact, redact_for_persistence, sha256_bytes, sha256_file, sha256_text, stable_id, utc_now
@@ -92,6 +90,51 @@ from .workspace import (
 
 class InvalidState(ValueError):
     pass
+
+
+_MAX_HOOK_STDIN_BYTES = 4 * 1024 * 1024
+_MAX_HOOK_JSON_NODES = 50_000
+_MAX_HOOK_JSON_DEPTH = 64
+
+
+def _reject_hook_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise InvalidState("hook stdin contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _bounded_hook_payload(stream: Any, *, maximum: int = _MAX_HOOK_STDIN_BYTES) -> Any:
+    binary = getattr(stream, "buffer", stream)
+    raw = binary.read(maximum + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, (bytes, bytearray)):
+        raise InvalidState("hook stdin is unreadable")
+    if len(raw) > maximum:
+        raise InvalidState("hook stdin exceeds size limit")
+    try:
+        value = json.loads(
+            bytes(raw).decode("utf-8"),
+            object_pairs_hook=_reject_hook_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidState("hook stdin is not valid UTF-8 JSON") from exc
+    nodes = 0
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_HOOK_JSON_NODES or depth > _MAX_HOOK_JSON_DEPTH:
+            raise InvalidState("hook stdin exceeds complexity limit")
+        if isinstance(item, dict):
+            pending.extend((key, depth + 1) for key in item)
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+    return value
 
 
 class SupervisorSourceSnapshotMismatch(RuntimeError):
@@ -1170,10 +1213,16 @@ def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_ty
         record = _record_from_payload(payload, event_type)
         apply_observation(state.setdefault("rollout", {}), record)
         if state["rollout"].get("rollback", {}).get("required") and not state["rollout"].get("rollback", {}).get("performed"):
-            rollback = rollback_active_version(expected_active=_execution_release_identity())
-            state["rollout"]["rollback"].update(rollback)
-            if not rollback.get("performed"):
-                state["health"] = "degraded"
+            # Observations may be repository-triggered.  They can establish
+            # that rollback is required, but must never mutate the user-wide
+            # active-version pointer without a separate exact T3 approval.
+            state["rollout"]["rollback"].update({
+                "attempted": False,
+                "performed": False,
+                "claim_status": "approval_required",
+                "reason": "explicit-human-approval-required",
+            })
+            state["health"] = "degraded"
         return str(record.get("observation_id"))
     if event_type == "rollout_promote":
         record = _record_from_payload(payload, event_type)
@@ -1646,12 +1695,19 @@ def _resolve_gate_command(
     *,
     cwd: str,
     trusted_registry: dict[str, Any],
+    require_argv_approval: bool = True,
 ) -> tuple[list[str], str, str]:
-    """Resolve argv[0] only through the round-bound machine trust registry."""
+    """Resolve one gate command through the round-bound machine policy."""
     if not command or not str(command[0]).strip():
         raise FileNotFoundError("registered gate command is empty")
     token = str(command[0])
     try:
+        if require_argv_approval:
+            return authorize_trusted_command(
+                [str(item) for item in command],
+                trusted_registry,
+                cwd=cwd,
+            )
         resolved, executable_hash = resolve_trusted_executable(
             token, trusted_registry, cwd=cwd
         )
@@ -2241,7 +2297,7 @@ def _run_registered_gate(
         and redact(precondition_command) != precondition_command
     ):
         raise InvalidState(
-            "registered gate command contains inline sensitive data; use a credential-free wrapper or environment indirection"
+            "registered gate command contains inline sensitive data; use a credential-free, machine-approved wrapper"
         )
     execution_id = stable_id("execution")
     evidence_id = str(request.get("evidence_id") or stable_id("evidence"))
@@ -2318,15 +2374,11 @@ def _run_registered_gate(
                 step_command,
                 cwd=str(state.get("workspace") or ctx.workspace),
                 trusted_registry=executable_registry,
+                require_argv_approval=not isolated_environment,
             )
-            execution_env = (
-                _isolated_review_environment(executable_registry, gate_extra_env)
-                if isolated_environment
-                else {
-                    **dict(gate_extra_env or {}),
-                    "PATH": trusted_path(executable_registry),
-                    "NoDefaultCurrentDirectoryInExePath": "1",
-                }
+            execution_env = _isolated_review_environment(
+                executable_registry,
+                gate_extra_env,
             )
             completed = _run_gate_subprocess_bounded(
                 resolved_command,
@@ -2334,7 +2386,7 @@ def _run_registered_gate(
                 timeout_seconds=gate_timeout,
                 extra_env=execution_env,
                 input_bytes=input_bytes,
-                replace_env=isolated_environment,
+                replace_env=True,
             )
             step_exit = int(completed["exit_code"])
             step_stdout = str(completed["stdout"] or "")
@@ -2578,103 +2630,44 @@ def _run_registered_gate(
             }
             observation["attestation"] = sign_record(observation)
 
-            claim_started_at = utc_now()
-            lease_seconds = _rollback_claim_lease_seconds()
-            claim_expires_at = (
-                parse_time(claim_started_at) + timedelta(seconds=lease_seconds)
-            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            rollback_claim_id = stable_id("rollback-claim", f"{observation['observation_id']}:{claim_started_at}")
-            claimed: dict[str, Any] = {"value": False, "expected_active": None, "recovery": False}
-
             def update_rollout(current: dict[str, Any]) -> dict[str, Any]:
                 target = copy.deepcopy(current or latest.get("rollout", {}))
                 apply_observation(target, observation)
                 row = target.setdefault("rollback", {})
-                claim_status = str(row.get("claim_status") or "")
-                expired = False
-                if claim_status == "in_progress":
-                    try:
-                        expired = parse_time(str(row.get("claim_expires_at") or "")) <= parse_time(claim_started_at)
-                    except ValueError:
-                        expired = True
-                legacy_incomplete = row.get("attempted") is True and row.get("performed") is not True and not claim_status
-                recovery = claim_status == "retriable" or (claim_status == "in_progress" and expired) or legacy_incomplete
-                first_claim = row.get("attempted") is not True
-                bound_expected = target.get("metrics", {}).get("global_gate_active_identity")
-                original_expected = row.get("expected_active") if recovery else bound_expected
-                concrete_expected = (
-                    isinstance(original_expected, dict)
-                    and bool(str(original_expected.get("version") or "").strip())
-                    and bool(str(original_expected.get("path") or "").strip())
-                )
                 if (
                     row.get("required") is True
                     and row.get("performed") is not True
-                    and (first_claim or recovery)
-                    and concrete_expected
                 ):
+                    bound_expected = target.get("metrics", {}).get("global_gate_active_identity")
                     row.update({
-                        "attempted": True,
+                        "attempted": False,
                         "performed": False,
-                        "claim_id": rollback_claim_id,
-                        "claim_status": "in_progress",
-                        "expected_active": copy.deepcopy(original_expected),
-                        "attempt_count": int(row.get("attempt_count", 0)) + 1,
-                        "recovery_count": int(row.get("recovery_count", 0)) + (1 if recovery else 0),
-                        "attempted_at": claim_started_at,
-                        "claim_expires_at": claim_expires_at,
+                        "claim_status": "approval_required",
+                        "expected_active": copy.deepcopy(bound_expected),
+                        "reason": "explicit-human-approval-required",
                     })
-                    claimed["value"] = True
-                    claimed["expected_active"] = copy.deepcopy(original_expected)
-                    claimed["recovery"] = recovery
                 return target
 
             project_rollout = ctx.update_project_rollout(update_rollout)
-            rollback_result: dict[str, Any] | None = None
-            if claimed["value"]:
-                try:
-                    rollback_result = rollback_active_version(expected_active=claimed["expected_active"])
-                except Exception as exc:  # Claim is made retriable below; pointer CAS keeps replay safe.
-                    rollback_result = {
-                        "performed": False,
-                        "reason": f"{type(exc).__name__}-before-pointer-confirmation",
-                        "target": None,
-                    }
-
-                def record_rollback(current: dict[str, Any]) -> dict[str, Any]:
-                    row = current.setdefault("rollback", {})
-                    if row.get("claim_id") != rollback_claim_id:
-                        return current
-                    performed = rollback_result.get("performed") is True
-                    row.update({
-                        "performed": performed,
-                        "claim_status": "completed" if performed else "retriable",
-                        "target": rollback_result.get("target"),
-                        "target_active": copy.deepcopy(rollback_result.get("target_active")),
-                        "reason": rollback_result.get("reason"),
-                        "completed_at": utc_now(),
-                    })
-                    if rollback_result.get("reason") == "active-version-cas-mismatch":
-                        reset_rollback_cycle(current, "claim-active-version-cas-mismatch")
-                        return current
-                    if not performed:
-                        row["claim_expires_at"] = utc_now()
-                    return current
-
-                project_rollout = ctx.update_project_rollout(record_rollback)
-            ctx.update(lambda state_value: state_value.update({"rollout": copy.deepcopy(project_rollout), "updated_at": utc_now()}))
+            rollback_required = (
+                project_rollout.get("rollback", {}).get("required") is True
+                and project_rollout.get("rollback", {}).get("performed") is not True
+            )
+            ctx.update(lambda state_value: state_value.update({
+                "rollout": copy.deepcopy(project_rollout),
+                "health": "degraded" if rollback_required else state_value.get("health", "healthy"),
+                "updated_at": utc_now(),
+            }))
             ctx.append_event(observation)
-            if rollback_result is not None:
+            if rollback_required:
                 ctx.append_event({
-                    "event_type": "rollout_auto_rollback",
-                    "status": "performed" if rollback_result.get("performed") else "retriable",
-                    "target": rollback_result.get("target"),
-                    "reason": rollback_result.get("reason"),
-                    "claim_id": rollback_claim_id,
-                    "recovery": claimed.get("recovery") is True,
+                    "event_type": "rollout_rollback_required",
+                    "status": "approval_required",
+                    "reason": "explicit-human-approval-required",
+                    "expected_active": copy.deepcopy(
+                        project_rollout.get("rollback", {}).get("expected_active")
+                    ),
                 })
-                if rollback_result.get("performed") is not True:
-                    ctx.update(lambda state_value: state_value.update({"health": "degraded", "updated_at": utc_now()}))
     except Exception as exc:
         ctx.update(lambda state_value: state_value.update({"health": "degraded", "updated_at": utc_now()}))
         ctx.append_event({"event_type": "rollout_gate_degraded", "status": "degraded", "summary": type(exc).__name__})
@@ -3657,6 +3650,10 @@ def _execute_selftest(
         path.relative_to(tests_root).as_posix()
         for path in tests_root.rglob("test_*.py")
         if path.is_file()
+        and not any(
+            part.startswith(".") or part == "__pycache__"
+            for part in path.relative_to(tests_root).parts[:-1]
+        )
     )
     collect_command = [
         sys.executable, "-m", "pytest", "--collect-only", "-q",
@@ -3950,7 +3947,7 @@ def _privacy_safe_prompt_contract(
         atomic_intents if atomic_intents is not None else split_intents(prompt),
         prompt,
     )
-    if privacy.get("persist_raw_prompts") is not False:
+    if privacy.get("persist_raw_prompts") is True:
         return {}, atomic, False
 
     request_sha256 = sha256_text(prompt)
@@ -4331,6 +4328,21 @@ def _evaluate_pretool_policy(
             "status": "denied",
             "reason": patch_parse_error,
         }
+    marker = _normalized_tool_marker(tool_name)
+    if not write_paths and marker in {
+        "execcommand", "bash", "shell", "pwsh", "powershell", "cmd",
+    }:
+        # A raw command may write anywhere or spawn an unbounded child.  The
+        # host has supplied no authenticated effect/sandbox contract, so
+        # enforcement mode must fail closed.  Warn/observe modes keep their
+        # existing advisory semantics in the caller.
+        return {
+            "deny": True,
+            "hard_deny": False,
+            "category": "native-command-effects",
+            "status": "denied",
+            "reason": "native-command-effects-unproven",
+        }
     if not write_paths:
         return {"deny": False, "hard_deny": False, "category": None, "status": "not-applicable"}
     workspace = str(state.get("workspace") or "")
@@ -4500,7 +4512,7 @@ def _persist_hook_degraded(payload: Any, args: argparse.Namespace, exc: Exceptio
 def command_hook(args: argparse.Namespace) -> int:
     payload: Any = {}
     try:
-        payload = json.load(sys.stdin)
+        payload = _bounded_hook_payload(sys.stdin)
         if not isinstance(payload, dict):
             raise InvalidState("hook stdin must be an object")
         ns = _hook_context(payload, args.runtime, args.event, getattr(args, "state_root", None))
@@ -4931,7 +4943,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.1.5")
+    parser.add_argument("--version", action="version", version="3.1.6")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

@@ -127,11 +127,15 @@ def test_workspace_snapshot_returns_explicit_degraded_state_when_git_times_out(t
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    def timeout(*args, **kwargs):
-        assert kwargs["timeout"] == workspace_module._GIT_TIMEOUT_SECONDS
-        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    def timeout_result(*args):
+        return subprocess.CompletedProcess(
+            ["git", *args],
+            124,
+            b"",
+            b"agent-supervisor:git-timeout",
+        )
 
-    monkeypatch.setattr(workspace_module.subprocess, "run", timeout)
+    monkeypatch.setattr(workspace_module, "_git", timeout_result)
 
     snapshot = capture_workspace_snapshot(str(workspace))
 

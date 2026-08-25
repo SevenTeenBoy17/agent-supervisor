@@ -1,6 +1,27 @@
-# Agent Supervisor v3
+# Agent Supervisor v3.1.6
 
 Runtime-neutral goal and quality supervision for Claude Code and Codex. The shared core owns contracts, isolated state, evidence validation, capability discovery/routing, lifecycle finalization, and migration. Host integrations are deliberately thin adapters.
+
+Licensed under Apache-2.0. This release is designed to be installed side by side,
+fail closed at security-sensitive boundaries, and keep prompts, machine trust policy,
+state, and credentials out of the repository and external review inputs.
+
+## Quick start
+
+```powershell
+git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
+Set-Location agent-supervisor
+git checkout v3.1.6
+python bin/install-agent-supervisor.py
+python bin/install-agent-supervisor.py --apply
+python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
+```
+
+The first installer call is a read-only plan. `--apply` builds and verifies a
+deterministic runtime bundle, installs the core and thin adapters, backs up changed
+managed files, and publishes the v4 active pointer last. It never edits Codex
+`AGENTS.md`/hooks, Claude settings, or the machine-local executable trust registry.
+Complete those explicit activation steps in [the installation guide](docs/INSTALL.md).
 
 ## Stable entry points
 
@@ -18,7 +39,10 @@ $SupervisorRoot = Join-Path $HOME ".agent-supervisor"
 python (Join-Path $SupervisorRoot "bin/agent-supervisor.py") --version
 ```
 
-An editable install (`python -m pip install -e $SupervisorRoot`) also makes `python -m supervisor_core` and `agent-supervisor` available from arbitrary working directories. Adapters may instead prepend this directory to `PYTHONPATH` without installation.
+For source development, an editable install (`python -m pip install -e .`) makes
+`python -m supervisor_core` and `agent-supervisor` available from arbitrary working
+directories. Production adapters execute only a verified `ActiveVersionPointer/v4`
+bundle and do not use mutable `PYTHONPATH` fallback.
 
 The public commands are `discover`, `route`, `start`, `event`, `validate`, `finalize`, `query`, `selftest`, and `migrate`. `hook` is the lifecycle adapter boundary. Exit codes are fixed: `0` success/complete, `2` incomplete, `3` blocked, `4` degraded, `64` invalid state or invocation.
 
@@ -65,7 +89,13 @@ Projects select `observe`, `warn`, or `enforce` in `.agent-supervisor/project.js
 2. `warn`: run real rounds while measuring critical misses and false blocks.
 3. `enforce`: enable per project only after zero critical misses and at most 2% false blocks. Other projects remain in `warn` until 20 non-trivial rounds meet the same bar.
 
-Two consecutive failures open that capability's breaker and retain its configured `fallback_id`. Two consecutive global-gate failures bound to the same concrete active-release identity atomically swap `active-version.json` to the previous side-by-side release when that release exists; unbound failures and failures observed across different active versions do not combine into a rollback streak. The first v3 release deliberately has no fabricated rollback target, so it degrades with `previous-version-unavailable` until a later release registers a real predecessor. State and migrated legacy snapshots are append-only and are not deleted.
+Two consecutive failures open that capability's breaker and retain its configured
+`fallback_id`. Two consecutive global-gate failures bound to the same concrete
+active-release identity mark rollback as `approval_required`; they never mutate the
+user-wide pointer automatically. A separately invoked, explicitly authorized rollback
+may compare-and-swap to a validated previous side-by-side release. Unbound failures and
+failures observed across different active versions do not combine into a rollback
+streak. State and migrated legacy snapshots are append-only and are not deleted.
 
 `ActiveVersionPointer/v4` binds the complete `SupervisorReleaseIdentity/v1`: version, canonical release path, runtime-bundle path, bundle hash, manifest hash, and source-tree hash. The pointer has exactly `contract`, `active`, and `previous`; rollback is compare-and-swap and records audit metadata only in the ledger. A release is built as a deterministic, uncompressed runtime ZIP whose manifest covers every executable core module, schema, launcher, CodeRabbit runner, and selftest module. Codex freezes the pointer and bundle once, creates the Windows kill-on-close Job Object, then sends a bounded binary frame over stdin. A deny-disk-fallback importer verifies every member and loads `supervisor_core.*` from those frozen bytes; a pointer or module swap can affect only a later invocation. Bound selftests extract their exact bundled test payload to a temporary data-root directory and never write into the immutable release. The CodeRabbit runner and complete reviewed core are likewise taken from the bound bundle and executed from a bounded stdin frame instead of reopening mutable core scripts from disk.
 
@@ -73,7 +103,13 @@ Registered command gates must be executed through the core's `gate_run` event (o
 
 The completion-eligible CodeRabbit runner is shipped inside the immutable active core and included in the Supervisor source snapshot. Its binding covers the exact workspace diff, the full bundled review source, and the selected Codex and Claude adapter manifests. The external review process receives a minimal allowlisted environment and pinned executable registry; product secrets and the ambient process environment are not inherited. A strictly validated `ReviewOutputArtifact/v1` with authenticated context, complete findings, exact source/diff bindings, and no blocking findings lets the core issue an automated external ReviewRecord. Test changes require a second, separately executed `review.coderabbit.test-integrity` record; the general review cannot stand in for it. Manual Codex reviewer/sub-agent claims remain audit-only unless the host supplies an independently verifiable identity primitive.
 
-External commands are resolved only through a machine-local, ignored `TrustedExecutableRegistry/v1`. Each entry binds a canonical absolute path and streamed SHA-256; discovery through the ambient `PATH`, implicit current-directory lookup, symlink/reparse indirection, registry drift, and oversized/unreadable binaries fail closed. The registry is never shipped as a portable release artifact. Execution keeps `shell=False`; signed execution and evidence bind both the unchanged QualityProfile argv and the verified executable identity. WSL CodeRabbit additionally pins the Windows `wsl.exe`, the exact Linux CLI path, and its Linux-side digest.
+External commands are resolved only through a machine-local, ignored
+`TrustedExecutableRegistry/v1`. Each entry binds a canonical absolute path, streamed
+SHA-256, and machine-owner-approved hashes for each exact argument-bearing argv. Ambient
+`PATH` discovery, implicit current-directory lookup, symlink/reparse indirection,
+registry drift, unknown native-command effects, and oversized/unreadable binaries fail
+closed. External gates use a credential-minimal environment with `shell=False`; the
+registry is never shipped as a release artifact. See [Installation](docs/INSTALL.md).
 
 Workspace evidence excludes Supervisor runtime state (`.agent-supervisor/handoffs`, state/log/cache/spool files, `.codex-supervisor`) and test caches. Required handoff/timeline maintenance therefore cannot manufacture an implementation diff, while versioned Supervisor contracts, fixtures, adapters, and scripts remain in scope.
 
@@ -89,5 +125,13 @@ Codex's supported thin-adapter flow lives under `~/.codex/skills/dev-supervisor/
 python -m supervisor_core start --runtime codex --workspace . --session $env:CODEX_THREAD_ID --round r1 --message "Audit routing" --change-mode replace --execution-mode warn --project-file .agent-supervisor/project.json
 python -m supervisor_core event --runtime codex --workspace . --session $env:CODEX_THREAD_ID --round r1 --event-type invocation_result --invocation-id inv-1 --capability code-review --result success --actor reviewer
 python -m supervisor_core validate --runtime codex --workspace . --session $env:CODEX_THREAD_ID --round r1 --project-file .agent-supervisor/project.json --json
-python -m supervisor_core query --runtime codex --workspace . --session $env:CODEX_THREAD_ID --round r1 --format handoff --output handoff.md
+python -m supervisor_core query --runtime codex --workspace . --session $env:CODEX_THREAD_ID --round r1 --format handoff
 ```
+
+## Project documentation
+
+- [Installation and activation](docs/INSTALL.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Maintainer release procedure](docs/RELEASING.md)
+- [Changelog](CHANGELOG.md)

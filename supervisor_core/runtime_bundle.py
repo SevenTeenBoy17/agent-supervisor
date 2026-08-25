@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
@@ -19,6 +20,18 @@ MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_MEMBERS = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TRANSIENT_DIRECTORY_NAMES = {
+    ".pytest_cache",
+    ".tmp",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "htmlcov",
+    "temp",
+    "tmp",
+    "venv",
+}
 
 
 class RuntimeBundleError(ValueError):
@@ -107,6 +120,16 @@ def _is_link_or_reparse(path: Path) -> bool:
     return stat.S_ISLNK(details.st_mode) or bool(reparse_flag and attributes & reparse_flag)
 
 
+def _is_transient_runtime_path(path: PurePosixPath) -> bool:
+    parts = tuple(part.casefold() for part in path.parts)
+    return any(
+        part in _TRANSIENT_DIRECTORY_NAMES
+        or part.startswith(".pytest-tmp-")
+        or part.endswith(".egg-info")
+        for part in parts
+    )
+
+
 def _read_stable_file(root: Path, relative: PurePosixPath) -> bytes:
     candidate = root.joinpath(*relative.parts)
     current = root
@@ -153,22 +176,31 @@ def _runtime_paths(root: Path) -> list[PurePosixPath]:
         if not candidate.is_file() or _is_link_or_reparse(candidate):
             continue
         relative = PurePosixPath(candidate.relative_to(root).as_posix())
-        if relative.suffix in {".py", ".json"} and "__pycache__" not in relative.parts:
+        if (
+            relative.suffix in {".py", ".json"}
+            and not _is_transient_runtime_path(relative)
+        ):
             paths.add(relative)
     schema_root = root / "schemas"
     if schema_root.is_dir() and not _is_link_or_reparse(schema_root):
         for candidate in schema_root.rglob("*.json"):
-            if candidate.is_file() and not _is_link_or_reparse(candidate):
-                paths.add(PurePosixPath(candidate.relative_to(root).as_posix()))
-    tests_root = root / "tests"
-    if tests_root.is_dir() and not _is_link_or_reparse(tests_root):
-        for candidate in tests_root.rglob("*.py"):
+            relative = PurePosixPath(candidate.relative_to(root).as_posix())
             if (
                 candidate.is_file()
                 and not _is_link_or_reparse(candidate)
-                and "__pycache__" not in candidate.parts
+                and not _is_transient_runtime_path(relative)
             ):
-                paths.add(PurePosixPath(candidate.relative_to(root).as_posix()))
+                paths.add(relative)
+    tests_root = root / "tests"
+    if tests_root.is_dir() and not _is_link_or_reparse(tests_root):
+        for candidate in tests_root.rglob("*.py"):
+            relative = PurePosixPath(candidate.relative_to(root).as_posix())
+            if (
+                candidate.is_file()
+                and not _is_link_or_reparse(candidate)
+                and not _is_transient_runtime_path(relative)
+            ):
+                paths.add(relative)
     return sorted(paths, key=lambda item: item.as_posix())
 
 
@@ -190,17 +222,25 @@ def _member_kind(path: PurePosixPath) -> tuple[str, str | None]:
 
 def build_runtime_bundle(root: Path, version: str) -> bytes:
     root = Path(root).expanduser()
-    if not root.is_absolute() or not version or not isinstance(version, str):
+    if (
+        not root.is_absolute()
+        or not isinstance(version, str)
+        or not version.strip()
+    ):
         raise RuntimeBundleError("invalid-build-input")
     root = root.resolve(strict=True)
     if _is_link_or_reparse(root):
         raise RuntimeBundleError("source-root-link-or-reparse")
 
+    runtime_paths = _runtime_paths(root)
+    if len(runtime_paths) + 1 > MAX_MEMBERS:
+        raise RuntimeBundleError("runtime-member-count-invalid")
+
     files: list[dict[str, Any]] = []
     contents: dict[str, bytes] = {}
     casefolded: set[str] = set()
     total = 0
-    for relative in _runtime_paths(root):
+    for relative in runtime_paths:
         path = _safe_relative_path(relative.as_posix())
         folded = path.as_posix().casefold()
         if folded in casefolded:
@@ -295,9 +335,10 @@ def inspect_runtime_bundle(
             or manifest.get("contract") != MANIFEST_CONTRACT
             or manifest_bytes != _canonical_json_bytes(manifest)
             or not isinstance(manifest.get("version"), str)
-            or not manifest["version"]
+            or not manifest["version"].strip()
             or not _SHA256.fullmatch(str(manifest.get("source_tree_sha256") or ""))
             or not isinstance(manifest.get("files"), list)
+            or len(manifest["files"]) + 1 > MAX_MEMBERS
         ):
             raise RuntimeBundleError("manifest-contract-invalid")
 
@@ -318,6 +359,7 @@ def inspect_runtime_bundle(
             if (
                 not isinstance(row.get("kind"), str)
                 or not isinstance(row.get("size"), int)
+                or isinstance(row.get("size"), bool)
                 or row["size"] < 1
                 or not _SHA256.fullmatch(str(row.get("sha256") or ""))
                 or (
@@ -360,10 +402,51 @@ def inspect_runtime_bundle(
             "contract", "version", "path", "bundle_relpath", "bundle_sha256",
             "manifest_sha256", "source_tree_sha256",
         }
+        identity_path = (
+            expected_identity.get("path")
+            if isinstance(expected_identity, dict)
+            else None
+        )
+        bundle_relpath = (
+            expected_identity.get("bundle_relpath")
+            if isinstance(expected_identity, dict)
+            else None
+        )
+        identity_paths_valid = False
+        if (
+            isinstance(identity_path, str)
+            and identity_path
+            and "\x00" not in identity_path
+            and isinstance(bundle_relpath, str)
+        ):
+            try:
+                identity_root = Path(identity_path)
+                canonical_root = Path(os.path.abspath(os.fspath(identity_root)))
+                canonical_relative = _safe_relative_path(bundle_relpath).as_posix()
+                identity_paths_valid = (
+                    identity_root.is_absolute()
+                    and os.path.normcase(str(canonical_root))
+                    == os.path.normcase(identity_path)
+                    and canonical_relative == bundle_relpath
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                identity_paths_valid = False
         if (
             not isinstance(expected_identity, dict)
             or set(expected_identity) != required
             or expected_identity.get("contract") != IDENTITY_CONTRACT
+            or not isinstance(expected_identity.get("version"), str)
+            or not str(expected_identity["version"]).strip()
+            or not identity_paths_valid
+            or any(
+                not isinstance(expected_identity.get(field), str)
+                or not _SHA256.fullmatch(expected_identity[field])
+                for field in (
+                    "bundle_sha256",
+                    "manifest_sha256",
+                    "source_tree_sha256",
+                )
+            )
             or expected_identity.get("version") != manifest["version"]
             or expected_identity.get("bundle_sha256") != bundle_sha256
             or expected_identity.get("manifest_sha256") != manifest_sha256
@@ -382,7 +465,7 @@ def inspect_runtime_bundle(
 def release_identity(root: Path, version: str, bundle_relpath: str, bundle: bytes) -> dict[str, str]:
     inspected = inspect_runtime_bundle(bundle)
     relative = _safe_relative_path(bundle_relpath).as_posix()
-    return {
+    identity = {
         "bundle_relpath": relative,
         "bundle_sha256": inspected["bundle_sha256"],
         "contract": IDENTITY_CONTRACT,
@@ -391,3 +474,5 @@ def release_identity(root: Path, version: str, bundle_relpath: str, bundle: byte
         "source_tree_sha256": inspected["source_tree_sha256"],
         "version": version,
     }
+    inspect_runtime_bundle(bundle, expected_identity=identity)
+    return identity

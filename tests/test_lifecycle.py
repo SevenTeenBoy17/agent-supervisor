@@ -601,9 +601,13 @@ def test_unresolved_criteria_and_intents_survive_continue_and_replace_forces_new
         intents_supplied=[{"intent_id": "intent-a", "text": "finish B", "status": "deferred", "reason": "new work"}],
     )
     assert second["goal"]["goal_id"] == first["goal"]["goal_id"]
-    assert second["goal"]["objective"] == "Finish requirement A"
+    assert second["goal"]["objective"].startswith("Legacy objective sha256:")
+    assert "Finish requirement A" not in second["goal"]["objective"]
     assert {row["criterion_id"] for row in second["goal"]["acceptance_criteria"]} == {"criterion-a", "criterion-b"}
-    assert {row["text"] for row in second["intents"]} == {"finish A", "finish B"}
+    intent_texts = {row["text"] for row in second["intents"]}
+    assert "finish B" in intent_texts
+    assert "finish A" not in intent_texts
+    assert any(text.startswith("Legacy intent sha256:") for text in intent_texts)
     assert len({row["intent_id"] for row in second["intents"]}) == 2
 
     replacement_ctx = context(tmp_path, "carry-r3")

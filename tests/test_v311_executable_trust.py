@@ -11,7 +11,13 @@ from supervisor_core import cli as cli_module
 from supervisor_core import executable_trust as trust_module
 
 
-def _write_registry(root: Path, executable: Path, digest: str) -> Path:
+def _write_registry(
+    root: Path,
+    executable: Path,
+    digest: str,
+    *,
+    allowed_commands: list[list[str]] | None = None,
+) -> Path:
     registry = root / ".agent-supervisor" / "trusted-executables.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text(
@@ -22,6 +28,10 @@ def _write_registry(root: Path, executable: Path, digest: str) -> Path:
                     "kind": "local",
                     "path": str(executable.resolve()),
                     "sha256": digest,
+                    "allowed_argv_sha256": [
+                        trust_module.trusted_command_approval_sha256(command)
+                        for command in (allowed_commands or [])
+                    ],
                 }
             },
             "generated_at": "2026-08-24T00:00:00Z",
@@ -86,7 +96,10 @@ def test_path_poisoning_is_ignored_and_unregistered_alias_fails(
     trusted.write_bytes(b"trusted-runner\n")
     poisoned.write_bytes(b"poisoned-runner\n")
     registry_path = _write_registry(
-        tmp_path, trusted, hashlib.sha256(trusted.read_bytes()).hexdigest()
+        tmp_path,
+        trusted,
+        hashlib.sha256(trusted.read_bytes()).hexdigest(),
+        allowed_commands=[[str(trusted.resolve()), "--safe"]],
     )
     registry = trust_module.load_trusted_executable_registry(registry_path)
     monkeypatch.setenv("PATH", str(poisoned.parent) + os.pathsep + os.environ.get("PATH", ""))

@@ -10,11 +10,13 @@ import pytest
 
 from supervisor_core.attestation import sign_record
 from supervisor_core import cli as cli_module
+from supervisor_core import executable_trust as trust_module
 from supervisor_core import workspace as workspace_module
 from supervisor_core.contracts import invocation_event
 from supervisor_core.executable_trust import (
     load_trusted_executable_registry,
     registry_public_record,
+    trusted_command_approval_sha256,
 )
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
@@ -88,10 +90,41 @@ def _resign(event: dict) -> None:
     event["attestation"] = sign_record(event)
 
 
-def _gate_context(tmp_path: Path) -> StateContext:
+def _gate_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> StateContext:
+    trusted_python = Path(sys.executable).resolve(strict=True)
+    command = [str(trusted_python), "-c", "print('registered')"]
+    registry_path = tmp_path / "machine-policy" / "trusted-executables.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "contract": "TrustedExecutableRegistry/v1",
+                "entries": {
+                    "python": {
+                        "kind": "local",
+                        "path": str(trusted_python),
+                        "sha256": sha256_file(trusted_python),
+                        "allowed_argv_sha256": [
+                            trusted_command_approval_sha256(command)
+                        ],
+                    }
+                },
+                "generated_at": "2026-08-25T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        trust_module,
+        "trusted_executable_registry_path",
+        lambda: registry_path,
+    )
     registry = load_trusted_executable_registry()
     public_registry = registry_public_record(registry)
-    trusted_python = public_registry["entries"]["python"]["path"]
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     ctx = StateContext.build(
@@ -111,7 +144,7 @@ def _gate_context(tmp_path: Path) -> StateContext:
             "common_gates": [
                 {
                     "id": "gate.safe",
-                    "command": [trusted_python, "-c", "print('registered')"],
+                    "command": command,
                 }
             ]
         },
@@ -417,7 +450,7 @@ def test_locally_audited_codex_skill_never_establishes_actor_or_group_identity(
 def test_codex_gate_run_mints_fixed_core_collector_and_uses_registered_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ctx = _gate_context(tmp_path)
+    ctx = _gate_context(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli_module,
         "_verify_current_source_snapshot",
@@ -485,9 +518,11 @@ def test_codex_gate_run_mints_fixed_core_collector_and_uses_registered_argv(
     ids=["actor", "group", "invocation", "command", "timeout"],
 )
 def test_codex_gate_run_caller_cannot_choose_execution_identity_or_command(
-    tmp_path: Path, forbidden: dict
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden: dict,
 ) -> None:
-    ctx = _gate_context(tmp_path)
+    ctx = _gate_context(tmp_path, monkeypatch)
     request = {
         "gate_id": "gate.safe",
         "criterion_id": "criterion-gate",
@@ -560,7 +595,7 @@ def test_codex_core_gate_failure_and_timeout_fail_closed(
     expected_status: str,
     expected_health: str,
 ) -> None:
-    ctx = _gate_context(tmp_path)
+    ctx = _gate_context(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli_module,
         "_verify_current_source_snapshot",

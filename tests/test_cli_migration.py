@@ -10,12 +10,14 @@ from pathlib import Path
 import pytest
 
 from supervisor_core.cli import _classify_goal_change, main
+from supervisor_core.executable_trust import trusted_command_approval_sha256
 from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.util import canonical_sha256, sha256_file
 from supervisor_core.validation import validate_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
 CODEX_ADAPTER_FILES = (
     "codex-supervisor-hook.py",
     "supervisor-bootstrap.ps1",
@@ -64,6 +66,15 @@ def _write_trusted_executable_registry(home: Path) -> None:
                         "kind": "local",
                         "path": str(path),
                         "sha256": sha256_file(path),
+                        **({
+                            "allowed_argv_sha256": [
+                                trusted_command_approval_sha256([
+                                    str(path),
+                                    "-c",
+                                    "raise SystemExit(99)",
+                                ])
+                            ],
+                        } if name == "python" else {}),
                     }
                     for name, path in executables.items()
                 },
@@ -114,31 +125,36 @@ def _validate_adapter_roots(
     return None
 
 
-def _resolve_adapter_roots() -> tuple[tuple[Path, Path], str | None]:
+def _resolve_adapter_roots() -> tuple[Path, Path]:
     review_bundle = ROOT.parent
     review_bundle_mode = (review_bundle / "REVIEW_MANIFEST.json").is_file()
+    installed_opt_in = os.environ.get(INSTALLED_ADAPTER_TEST_ENV)
+    if installed_opt_in not in {None, "1"}:
+        raise RuntimeError(f"{INSTALLED_ADAPTER_TEST_ENV} must be exactly '1' when set")
     configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
     if review_bundle_mode:
         roots = (review_bundle / "global-codex", review_bundle / "global-claude")
-    else:
-        if configured:
-            install_home = Path(configured).resolve()
-        elif ROOT.name == ".agent-supervisor":
-            install_home = ROOT.parent
-        else:
-            install_home = Path.home()
+    elif installed_opt_in == "1":
+        install_home = Path(configured).resolve() if configured else Path.home().resolve()
         roots = (
             install_home / ".codex" / "skills" / "dev-supervisor",
             install_home / ".claude" / "skills" / "supervisor",
         )
+    else:
+        roots = (
+            ROOT / "integrations" / "codex",
+            ROOT / "integrations" / "claude",
+        )
     skip_reason = _validate_adapter_roots(
         roots,
-        installation_expected=review_bundle_mode or bool(configured),
+        installation_expected=True,
     )
-    return roots, skip_reason
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    return roots
 
 
-(CODEX_ROOT, CLAUDE_ROOT), _ADAPTER_SKIP_REASON = _resolve_adapter_roots()
+CODEX_ROOT, CLAUDE_ROOT = _resolve_adapter_roots()
 
 
 def test_adapter_roots_skip_only_when_both_are_genuinely_absent(tmp_path: Path) -> None:
@@ -598,7 +614,6 @@ def test_bin_bootstrap_runs_from_arbitrary_cwd(tmp_path):
     assert completed.stderr == ""
 
 
-@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_hook_session_start_handles_unicode_space_path(tmp_path):
     workspace = tmp_path / "中文 path"
     workspace.mkdir()
@@ -620,7 +635,6 @@ def test_hook_session_start_handles_unicode_space_path(tmp_path):
     assert "ready" in result["hookSpecificOutput"]["additionalContext"]
 
 
-@pytest.mark.skipif(_ADAPTER_SKIP_REASON is not None, reason=_ADAPTER_SKIP_REASON or "")
 def test_session_start_does_not_claim_recovery_before_a_goal_round_acknowledges_degraded_state(tmp_path):
     workspace = tmp_path / "degraded 中文 path"
     workspace.mkdir()

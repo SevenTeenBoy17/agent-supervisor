@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-ADAPTER_VERSION = "3.1.5"
+ADAPTER_VERSION = "3.1.6"
 POINTER_CONTRACT = "ActiveVersionPointer/v4"
 IDENTITY_CONTRACT = "SupervisorReleaseIdentity/v1"
 TRUSTED_EXECUTABLE_REGISTRY_CONTRACT = "TrustedExecutableRegistry/v1"
@@ -35,8 +35,8 @@ RELEASE_IDENTITY_FIELDS = frozenset({
     "bundle_relpath", "bundle_sha256", "contract", "manifest_sha256",
     "path", "source_tree_sha256", "version",
 })
-CORE_BRIDGE_LENGTH = 86256
-CORE_BRIDGE_SHA256 = "834c92fc24f1557c326f9a89825b6b16782134243ade0249c6aaafea3ab7d214"
+CORE_BRIDGE_LENGTH = 87824
+CORE_BRIDGE_SHA256 = "25f8e081b8f96bd101ad1e1fd023c666d834a4d9ace14a4eac681eaa704c9a4b"
 HOOK_BRIDGE_LENGTH = 2858
 HOOK_BRIDGE_SHA256 = "ccc5543ee12a3e8693dd5d5dcb12ce21589eb2f6f3ab1159ce15511a870a5784"
 KNOWN_CORE_CODES = {0, 2, 3, 4, 64}
@@ -47,6 +47,8 @@ MARKER_PERSISTENCE_WARNING = (
 )
 MAX_SPOOL_BYTES = 64 * 1024
 MAX_SPOOL_RECORDS = 64
+MAX_STDIN_BYTES = 4 * 1024 * 1024
+MAX_APPROVED_COMMANDS = 256
 RETENTION_SECONDS = 14 * 86400
 MAX_MARKERS = 200
 MARKER_LOCK_RETRY_SECONDS = 1.5
@@ -349,21 +351,16 @@ def _posix_executable_paths(
     return None
 
 
-def _read_trusted_executable_registry(install_home: Path) -> dict[str, Any]:
-    registry_path = _canonical_existing(
-        install_home / ".agent-supervisor" / "trusted-executables.json",
-        directory=False,
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
-    if registry_path is None:
-        raise FileNotFoundError("trusted_executable_registry_missing")
-    with registry_path.open("rb") as stream:
-        before = _posix_identity_from_stream(stream)
-        content = stream.read(1024 * 1024 + 1)
-    if (
-        len(content) > 1024 * 1024
-        or _posix_identity_from_path(registry_path) != before
-    ):
-        raise FileNotFoundError("trusted_executable_registry_changed")
+
+
+def _parse_trusted_executable_registry(content: bytes) -> dict[str, Any]:
+    """Parse the machine registry without accepting ambiguous or extra fields."""
 
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
@@ -383,10 +380,67 @@ def _read_trusted_executable_registry(install_home: Path) -> dict[str, Any]:
         not isinstance(registry, dict)
         or set(registry) != {"contract", "entries", "generated_at"}
         or registry.get("contract") != TRUSTED_EXECUTABLE_REGISTRY_CONTRACT
+        or not isinstance(registry.get("generated_at"), str)
         or not isinstance(registry.get("entries"), dict)
+        or not registry["entries"]
     ):
         raise FileNotFoundError("trusted_executable_registry_invalid")
+
+    required_fields = {"kind", "path", "sha256"}
+    optional_fields = {"allowed_argv_sha256"}
+    for name, entry in registry["entries"].items():
+        if (
+            not isinstance(name, str)
+            or name != name.casefold()
+            or not 1 <= len(name) <= 64
+            or not name[0].isalnum()
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for character in name)
+            or not isinstance(entry, dict)
+            or not required_fields <= set(entry)
+            or bool(set(entry) - required_fields - optional_fields)
+            or entry.get("kind") not in {"local", "wsl"}
+            or not isinstance(entry.get("path"), str)
+            or not entry["path"]
+            or not _is_sha256(entry.get("sha256"))
+        ):
+            raise FileNotFoundError("trusted_executable_registry_invalid")
+        approvals = entry.get("allowed_argv_sha256", [])
+        if (
+            not isinstance(approvals, list)
+            or len(approvals) > MAX_APPROVED_COMMANDS
+            or any(not _is_sha256(approval) for approval in approvals)
+            or len(set(approvals)) != len(approvals)
+        ):
+            raise FileNotFoundError("trusted_executable_registry_invalid")
+        if entry["kind"] == "local":
+            if not Path(entry["path"]).is_absolute():
+                raise FileNotFoundError("trusted_executable_registry_invalid")
+        elif (
+            not entry["path"].startswith("/")
+            or "\\" in entry["path"]
+            or ".." in Path(entry["path"]).parts
+        ):
+            raise FileNotFoundError("trusted_executable_registry_invalid")
     return registry["entries"]
+
+
+def _read_trusted_executable_registry(install_home: Path) -> dict[str, Any]:
+    registry_path = _canonical_existing(
+        install_home / ".agent-supervisor" / "trusted-executables.json",
+        directory=False,
+    )
+    if registry_path is None:
+        raise FileNotFoundError("trusted_executable_registry_missing")
+    with registry_path.open("rb") as stream:
+        before = _posix_identity_from_stream(stream)
+        content = stream.read(1024 * 1024 + 1)
+    if (
+        len(content) > 1024 * 1024
+        or _posix_identity_from_path(registry_path) != before
+    ):
+        raise FileNotFoundError("trusted_executable_registry_changed")
+
+    return _parse_trusted_executable_registry(content)
 
 
 def _select_posix_executable(
@@ -414,13 +468,12 @@ def _select_posix_executable(
         entry = entries.get(registry_name)
         if (
             not isinstance(entry, dict)
-            or set(entry) != {"kind", "path", "sha256"}
+            or not {"kind", "path", "sha256"} <= set(entry)
+            or bool(set(entry) - {"kind", "path", "sha256", "allowed_argv_sha256"})
             or entry.get("kind") != "local"
             or not isinstance(entry.get("path"), str)
             or not Path(entry["path"]).is_absolute()
-            or not isinstance(entry.get("sha256"), str)
-            or len(entry["sha256"]) != 64
-            or any(character not in "0123456789abcdef" for character in entry["sha256"])
+            or not _is_sha256(entry.get("sha256"))
         ):
             continue
         candidates.append((Path(entry["path"]), entry["sha256"], False))
@@ -754,37 +807,16 @@ def _trusted_registry_python(install_home: Path) -> tuple[Path, str]:
     ):
         raise FileNotFoundError("trusted_executable_registry_changed")
 
-    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        value: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("duplicate_registry_key")
-            value[key] = item
-        return value
-
-    try:
-        registry = json.loads(
-            content.decode("utf-8"), object_pairs_hook=reject_duplicates
-        )
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        raise FileNotFoundError("trusted_executable_registry_invalid") from None
-    if (
-        not isinstance(registry, dict)
-        or set(registry) != {"contract", "entries", "generated_at"}
-        or registry.get("contract") != TRUSTED_EXECUTABLE_REGISTRY_CONTRACT
-        or not isinstance(registry.get("entries"), dict)
-    ):
-        raise FileNotFoundError("trusted_executable_registry_invalid")
-    entry = registry["entries"].get("python")
+    entries = _parse_trusted_executable_registry(content)
+    entry = entries.get("python")
     if (
         not isinstance(entry, dict)
-        or set(entry) != {"kind", "path", "sha256"}
+        or not {"kind", "path", "sha256"} <= set(entry)
+        or bool(set(entry) - {"kind", "path", "sha256", "allowed_argv_sha256"})
         or entry.get("kind") != "local"
         or not isinstance(entry.get("path"), str)
         or not Path(entry["path"]).is_absolute()
-        or not isinstance(entry.get("sha256"), str)
-        or len(entry["sha256"]) != 64
-        or any(character not in "0123456789abcdef" for character in entry["sha256"])
+        or not _is_sha256(entry.get("sha256"))
     ):
         raise FileNotFoundError("trusted_python_registry_entry_invalid")
     candidate = _canonical_existing(Path(entry["path"]), directory=False)
@@ -1183,6 +1215,18 @@ def _parse_payload(raw: bytes) -> dict[str, Any]:
     return decoded
 
 
+def _read_bounded_stdin(stream: Any, *, maximum: int = MAX_STDIN_BYTES) -> bytes:
+    """Read at most one byte beyond the hook contract, then fail closed."""
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or not 0 <= maximum <= MAX_STDIN_BYTES:
+        raise ValueError("stdin-limit-invalid")
+    raw = stream.read(maximum + 1)
+    if not isinstance(raw, bytes):
+        raise TypeError("stdin-must-be-bytes")
+    if len(raw) > maximum:
+        raise ValueError("stdin-too-large")
+    return raw
+
+
 def _hook_timeout(event: str) -> float:
     defaults = {"SessionEnd": 2.0, "Stop": 25.0, "UserPromptSubmit": 20.0}
     raw = os.environ.get("AGENT_SUPERVISOR_HOOK_TIMEOUT")
@@ -1460,6 +1504,13 @@ def _forward(event: str, payload: dict[str, Any], degraded_prior: bool) -> tuple
         "adapter_version": ADAPTER_VERSION,
         "degraded_prior": degraded_prior,
     }
+    payload_bytes = json.dumps(
+        forwarded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload_bytes) > MAX_STDIN_BYTES:
+        raise ValueError("forwarded-stdin-too-large")
     install_home = _adapter_install_home()
     env = _minimal_hook_environment()
     inner_timeout = _hook_timeout(event)
@@ -1467,11 +1518,6 @@ def _forward(event: str, payload: dict[str, Any], degraded_prior: bool) -> tuple
     env["AGENT_SUPERVISOR_HOOK_TIMEOUT_SECONDS"] = format(inner_timeout, ".6g")
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    payload_bytes = json.dumps(
-        forwarded,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
     if not _supported_posix_platform():
         if os.name != "nt" or sys.platform != "win32":
             raise FileNotFoundError("hook_platform_rejected")
@@ -1584,9 +1630,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--event")
     args, _ = parser.parse_known_args(argv)
 
-    raw = sys.stdin.buffer.read()
     payload: dict[str, Any] = {}
     explicit_event = args.event or args.legacy_event
+    try:
+        raw = _read_bounded_stdin(sys.stdin.buffer)
+    except ValueError:
+        event = EVENT_ALIASES.get(str(explicit_event or ""), str(explicit_event or ""))
+        marker_recorded = _record_degraded(
+            event, payload, "invalid_input", MAX_STDIN_BYTES + 1
+        )
+        _emit_fail_open(marker_recorded)
+        return 0
+    except (OSError, TypeError):
+        event = EVENT_ALIASES.get(str(explicit_event or ""), str(explicit_event or ""))
+        marker_recorded = _record_degraded(event, payload, "invalid_input", 0)
+        _emit_fail_open(marker_recorded)
+        return 0
     try:
         payload = _parse_payload(raw)
     except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
@@ -1605,6 +1664,10 @@ def main(argv: list[str] | None = None) -> int:
     degraded_prior = _has_degraded_marker(session_id)
     try:
         returncode, stdout = _forward(event, payload, degraded_prior)
+    except (TypeError, ValueError):
+        marker_recorded = _record_degraded(event, payload, "invalid_input", len(raw))
+        _emit_fail_open(marker_recorded)
+        return 0
     except FileNotFoundError:
         marker_recorded = _record_degraded(event, payload, "core_missing_or_rejected", len(raw))
         _emit_fail_open(marker_recorded)

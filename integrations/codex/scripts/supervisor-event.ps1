@@ -53,6 +53,7 @@ if (-not [string]::IsNullOrWhiteSpace($DataFile)) {
         exit 64
     }
     $DataFile = (Resolve-Path -LiteralPath $DataFile -ErrorAction Stop).Path
+    $DataJson = Get-Content -Raw -LiteralPath $DataFile
 }
 $projectResolution = Resolve-AgentSupervisorProjectFile -Workspace $workspacePath -ProjectFile $ProjectFile -Explicit:($PSBoundParameters.ContainsKey('ProjectFile'))
 if (-not $projectResolution.Valid) {
@@ -88,8 +89,7 @@ if (-not $isCoreOwnedGateEvent -and $ResponsibilityGroup) {
     $argsList += @('--responsibility-group', $ResponsibilityGroup)
 }
 if ($Result) { $argsList += @('--result', $Result) }
-if ($DataFile) { $argsList += @('--data-json', $DataFile) }
-elseif ($DataJson) { $argsList += @('--data-json', $DataJson) }
+if ($DataJson) { $argsList += @('--data-json', $DataJson) }
 if ($projectResolution.Present) { $argsList += @('--project-file', $ProjectFile) }
 $invocation = Invoke-AgentSupervisorPython -Command $pythonCommand -PrefixArgs $pythonPrefix -Arguments (@('-E', '-P', '-X', 'utf8', $launcherPath) + $argsList) -Operation 'event' -WorkingDirectory $coreRoot -IsolatedEnvironment
 $code = [int]$invocation.ExitCode

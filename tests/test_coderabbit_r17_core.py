@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 import supervisor_core.attestation as attestation_module
 import supervisor_core.cli as cli_module
+import supervisor_core.executable_trust as trust_module
 import supervisor_core.lifecycle as lifecycle_module
 import supervisor_core.rollout as rollout_module
 from supervisor_core.attestation import sign_record, verify_record
@@ -15,10 +17,12 @@ from supervisor_core.discovery import baseline_report, write_baseline
 from supervisor_core.executable_trust import (
     load_trusted_executable_registry,
     registry_public_record,
+    trusted_command_approval_sha256,
 )
 from supervisor_core.lifecycle import read_project_config, read_quality_profile, start_round
 from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.storage import StateContext
+from supervisor_core.util import sha256_file
 
 
 def _context(tmp_path: Path, round_id: str = "round-1") -> StateContext:
@@ -34,10 +38,41 @@ def _context(tmp_path: Path, round_id: str = "round-1") -> StateContext:
     )
 
 
-def _gate_context(tmp_path: Path) -> StateContext:
+def _gate_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> StateContext:
     ctx = _context(tmp_path)
+    trusted_python = Path(sys.executable).resolve(strict=True)
+    command = [str(trusted_python), "-c", "raise SystemExit(0)"]
+    registry_path = tmp_path / "machine-policy" / "trusted-executables.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "contract": "TrustedExecutableRegistry/v1",
+                "entries": {
+                    "python": {
+                        "kind": "local",
+                        "path": str(trusted_python),
+                        "sha256": sha256_file(trusted_python),
+                        "allowed_argv_sha256": [
+                            trusted_command_approval_sha256(command)
+                        ],
+                    }
+                },
+                "generated_at": "2026-08-25T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        trust_module,
+        "trusted_executable_registry_path",
+        lambda: registry_path,
+    )
     registry = load_trusted_executable_registry()
-    trusted_python = registry["entries"]["python"]["path"]
     start_round(
         ctx,
         message="run one registered gate",
@@ -47,7 +82,7 @@ def _gate_context(tmp_path: Path) -> StateContext:
             "common_gates": [
                 {
                     "id": "gate.atomic",
-                    "command": [trusted_python, "-c", "raise SystemExit(0)"],
+                    "command": command,
                 }
             ]
         },
@@ -73,7 +108,7 @@ def test_gate_evidence_and_execution_use_one_state_event_transaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = _gate_context(tmp_path)
+    ctx = _gate_context(tmp_path, monkeypatch)
     original_transact = StateContext.transact
     original_append_event = StateContext.append_event
     transaction_calls: list[str] = []
@@ -114,7 +149,7 @@ def test_gate_event_failure_cannot_commit_unaudited_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = _gate_context(tmp_path)
+    ctx = _gate_context(tmp_path, monkeypatch)
     before_state = ctx.state_file.read_bytes()
     before_events = ctx.events()
     original_append = StateContext._append_event_locked

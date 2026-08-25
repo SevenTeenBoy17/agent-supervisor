@@ -253,9 +253,11 @@ def test_workspace_parent_walk_terminates_for_entry_outside_root(tmp_path: Path)
     root.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("outside", encoding="utf-8")
-    assert _hash_workspace_entry(root, outside, "outside.txt") == sha256_text(
+    digest, observed_bytes = _hash_workspace_entry(root, outside, "outside.txt")
+    assert digest == sha256_text(
         "unsafe-or-unreadable-entry:outside.txt"
     )
+    assert observed_bytes == 0
 
 
 def test_path_globs_are_case_sensitive_on_every_platform() -> None:

@@ -14,6 +14,7 @@ from supervisor_core import lifecycle as lifecycle_module
 from supervisor_core import workspace as workspace_module
 from supervisor_core.cli import _evaluate_builtin_gate, main
 from supervisor_core.contracts import build_goal
+from supervisor_core.executable_trust import trusted_command_approval_sha256
 from supervisor_core.routing import split_intents
 from supervisor_core.util import sha256_file, sha256_text
 
@@ -201,6 +202,7 @@ def test_gate_binds_source_snapshot_and_source_change_blocks_old_evidence(tmp_pa
     registry_path = install_home / ".agent-supervisor" / "trusted-executables.json"
     registry_path.parent.mkdir(parents=True)
     trusted_python = Path(sys.executable).resolve(strict=True)
+    gate_command = [str(trusted_python), "-c", "print('ok')"]
     registry_path.write_text(
         json.dumps({
             "contract": "TrustedExecutableRegistry/v1",
@@ -209,6 +211,9 @@ def test_gate_binds_source_snapshot_and_source_change_blocks_old_evidence(tmp_pa
                     "kind": "local",
                     "path": str(trusted_python),
                     "sha256": sha256_file(trusted_python),
+                    "allowed_argv_sha256": [
+                        trusted_command_approval_sha256(gate_command)
+                    ],
                 }
             },
             "generated_at": "2026-08-24T00:00:00Z",
@@ -222,7 +227,7 @@ def test_gate_binds_source_snapshot_and_source_change_blocks_old_evidence(tmp_pa
     state["supervisor_source_snapshot"] = first_snapshot
     state["quality_profile"] = {
         "global_gates": [],
-        "common_gates": [{"id": "gate.source", "command": [str(trusted_python), "-c", "print('ok')"]}],
+        "common_gates": [{"id": "gate.source", "command": gate_command}],
     }
     state_file.write_text(json.dumps(state), encoding="utf-8")
     request = json.dumps({"record": {

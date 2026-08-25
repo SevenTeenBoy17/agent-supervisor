@@ -20,12 +20,18 @@ def test_malformed_hook_without_session_returns_degraded_and_persists_marker(
     assert command_hook(args) == 4
 
     response = json.loads(capsys.readouterr().out)
-    assert response["agent_supervisor"]["health"] == "degraded"
-    marker = json.loads(
-        (tmp_path / ".agent-supervisor" / "adapter-health.json").read_text(encoding="utf-8")
+    assert response["agent_supervisor"] == {
+        "health": "degraded",
+        "error": "InvalidState",
+        "fail_open": True,
+    }
+    marker_text = (tmp_path / ".agent-supervisor" / "adapter-health.json").read_text(
+        encoding="utf-8"
     )
+    marker = json.loads(marker_text)
     assert marker["health"] == "degraded"
-    assert marker["error_type"] == "JSONDecodeError"
+    assert marker["error_type"] == "InvalidState"
+    assert "not-json" not in marker_text
 
 
 def test_active_lease_cannot_expand_goal_or_project_write_scope(tmp_path) -> None:

@@ -503,16 +503,21 @@ def _event_kind(row: dict[str, Any]) -> str:
 
 
 @pytest.mark.parametrize(
-    "tool_name,tool_input",
+    "tool_name,tool_input,should_deny",
     [
-        ("exec_command", {"cmd": "python -c \"print('ok')\""}),
-        ("apply_patch", {"command": _NATIVE_PATCH}),
-        ("apply_patch_v2", {"command": _NATIVE_PATCH}),
-        ("Bash", {"command": "python -c \"print('ok')\""}),
+        ("exec_command", {"cmd": "python -c \"print('ok')\""}, True),
+        ("apply_patch", {"command": _NATIVE_PATCH}, False),
+        ("apply_patch_v2", {"command": _NATIVE_PATCH}, False),
+        ("Bash", {"command": "python -c \"print('ok')\""}, True),
     ],
 )
 def test_posttool_native_tools_persist_native_command_kind(
-    codex_round, monkeypatch, capsys, tool_name: str, tool_input: dict[str, str]
+    codex_round,
+    monkeypatch,
+    capsys,
+    tool_name: str,
+    tool_input: dict[str, str],
+    should_deny: bool,
 ) -> None:
     _, state_root, common, ctx = codex_round
     invocation_id = f"native-{tool_name}"
@@ -522,7 +527,36 @@ def test_posttool_native_tools_persist_native_command_kind(
         "tool_name": tool_name,
         "tool_input": tool_input,
     }
-    assert _run_hook(monkeypatch, capsys, state_root=state_root, event="PreToolUse", payload=payload)[0] == 0
+    pre_code, pre_output = _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="PreToolUse",
+        payload=payload,
+    )
+    assert pre_code == 0
+    if should_deny:
+        assert pre_output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert (
+            "native-command-effects"
+            in pre_output["hookSpecificOutput"]["permissionDecisionReason"]
+        )
+        invocation_rows = [
+            row
+            for row in ctx.events()
+            if row.get("invocation_id") == invocation_id
+            and row.get("event_type") in {"invocation_attempt", "invocation_result"}
+        ]
+        assert invocation_rows == []
+        summary = build_round_process_summary(ctx.load(), ctx.events())
+        assert not any(
+            isinstance(row, dict) and row.get("canonical_id") == tool_name
+            for row in summary["timeline"]
+        )
+        assert f"Command｜{tool_name}｜" not in render_round_process_summary(summary)
+        return
+
+    assert pre_output == {}
     assert _run_hook(
         monkeypatch,
         capsys,
@@ -564,10 +598,16 @@ def test_posttool_native_failure_keeps_native_command_kind(
     payload = {
         **common,
         "tool_use_id": "native-fail",
-        "tool_name": "exec_command",
-        "tool_input": {"cmd": "python -c \"print('ok')\""},
+        "tool_name": "apply_patch",
+        "tool_input": {"command": _NATIVE_PATCH},
     }
-    assert _run_hook(monkeypatch, capsys, state_root=state_root, event="PreToolUse", payload=payload)[0] == 0
+    assert _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="PreToolUse",
+        payload=payload,
+    ) == (0, {})
     assert _run_hook(
         monkeypatch,
         capsys,
@@ -586,12 +626,12 @@ def test_posttool_native_failure_keeps_native_command_kind(
     native_row = next(
         row
         for row in summary["timeline"]
-        if isinstance(row, dict) and row.get("canonical_id") == "exec_command"
+        if isinstance(row, dict) and row.get("canonical_id") == "apply_patch"
     )
     assert native_row["kind"] == "native_command"
     assert native_row["status"] == "failed"
     view = render_round_process_summary(summary)
-    assert "Command｜exec_command｜failed" in view
+    assert "Command｜apply_patch｜failed" in view
 
 
 def test_skill_and_unknown_tools_are_not_forced_native(

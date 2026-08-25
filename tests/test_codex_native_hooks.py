@@ -514,7 +514,7 @@ def test_write_lease_policy_observes_warns_then_blocks_by_rollout_mode(
     assert "no-lease-enforce" not in attempted
 
 
-def test_codex_shell_t3_and_failed_posttool_response_are_not_success(
+def test_codex_shell_t3_and_unproven_native_command_are_denied_without_invocation(
     codex_round, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _, state_root, common, ctx = codex_round
@@ -532,32 +532,36 @@ def test_codex_shell_t3_and_failed_posttool_response_are_not_success(
     )
     assert t3_code == 0
     assert t3_output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "force-push" in t3_output["hookSpecificOutput"]["permissionDecisionReason"]
 
-    safe_payload = {
+    unproven_payload = {
         **common,
         "tool_use_id": "shell-1",
         "tool_name": "exec_command",
         "tool_input": {"cmd": "python -c \"print('safe')\""},
     }
-    assert _run_hook(
-        monkeypatch, capsys, state_root=state_root, event="PreToolUse", payload=safe_payload
-    ) == (0, {})
-    assert _run_hook(
+    shell_code, shell_output = _run_hook(
         monkeypatch,
         capsys,
         state_root=state_root,
-        event="PostToolUse",
-        payload={**safe_payload, "tool_response": {"exitCode": "2", "status": "completed"}},
-    ) == (0, {})
-    result = next(
+        event="PreToolUse",
+        payload=unproven_payload,
+    )
+    assert shell_code == 0
+    assert shell_output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        "native-command-effects"
+        in shell_output["hookSpecificOutput"]["permissionDecisionReason"]
+    )
+
+    denied_invocation_ids = {"t3-1", "shell-1"}
+    invocation_rows = [
         row
         for row in ctx.events()
-        if row.get("invocation_id") == "shell-1" and row.get("event_type") == "invocation_result"
-    )
-    assert result["result"] == "failed"
-    assert not _trusted_invocation_for_runtime(
-        ctx.events(), "shell-1", actor="codex", state=ctx.load()
-    )
+        if row.get("invocation_id") in denied_invocation_ids
+        and row.get("event_type") in {"invocation_attempt", "invocation_result"}
+    ]
+    assert invocation_rows == []
 
 
 def test_codex_subagent_and_stop_lifecycle_never_force_success(

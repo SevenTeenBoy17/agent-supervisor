@@ -28,6 +28,10 @@ _CORE_SCHEMA_RESOURCES = {
     "quality": "supervisor_core/schemas/quality-profile.schema.json",
 }
 _MAX_INLINE_PRIOR_ROUNDS = 20
+_MAX_METADATA_BYTES = 1024 * 1024
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 100_000
+_MAX_JSON_STRING_BYTES = 256 * 1024
 _PRIVACY_SAFE_TEXT = re.compile(
     r"^(?:Complete host request|Host intent \d+ \([^\r\n]*\)|Legacy [A-Za-z0-9_.-]+) "
     r"sha256:[0-9a-f]{64}$"
@@ -93,15 +97,24 @@ def _read_stable_json_object(path: Path, *, label: str) -> dict[str, Any]:
         before = path.lstat()
         if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"{label} must be a regular file")
+        if before.st_size < 2 or before.st_size > _MAX_METADATA_BYTES:
+            raise ValueError(f"{label} exceeds the metadata size limit")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
             opened_before = os.fstat(descriptor)
             chunks: list[bytes] = []
+            observed = 0
             while True:
-                chunk = os.read(descriptor, 1024 * 1024)
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, _MAX_METADATA_BYTES + 1 - observed),
+                )
                 if not chunk:
                     break
+                observed += len(chunk)
+                if observed > _MAX_METADATA_BYTES:
+                    raise ValueError(f"{label} exceeds the metadata size limit")
                 chunks.append(chunk)
             opened_after = os.fstat(descriptor)
         finally:
@@ -119,12 +132,45 @@ def _read_stable_json_object(path: Path, *, label: str) -> dict[str, Any]:
     ):
         raise ValueError(f"{label} changed during validation or became a symlink/reparse point")
     try:
-        value = json.loads(b"".join(chunks).decode("utf-8"))
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} must contain valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
+    _validate_json_complexity(value, label=label)
     return value
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _validate_json_complexity(value: Any, *, label: str) -> None:
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES:
+            raise ValueError(f"{label} exceeds the JSON node limit")
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError(f"{label} exceeds the JSON depth limit")
+        if isinstance(current, str):
+            if len(current.encode("utf-8")) > _MAX_JSON_STRING_BYTES:
+                raise ValueError(f"{label} exceeds the JSON string limit")
+        elif isinstance(current, dict):
+            stack.extend((key, depth + 1) for key in current)
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
 
 
 def _read_core_schema(kind: str, *, label: str) -> dict[str, Any]:
@@ -196,6 +242,50 @@ def _reject_external_schema_refs(schema: Any, *, label: str) -> None:
             _reject_external_schema_refs(value, label=label)
 
 
+def _schema_pattern_allowlist(schema: Any) -> set[str]:
+    patterns: set[str] = set()
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "pattern" and isinstance(value, str):
+                patterns.add(value)
+            patterns.update(_schema_pattern_allowlist(value))
+    elif isinstance(schema, list):
+        for value in schema:
+            patterns.update(_schema_pattern_allowlist(value))
+    return patterns
+
+
+def _reject_unsafe_schema_keywords(
+    schema: Any,
+    *,
+    label: str,
+    allowed_patterns: set[str] | None = None,
+) -> None:
+    """Permit only immutable-core regexes in repository-controlled schemas."""
+    permitted = allowed_patterns or set()
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "patternProperties" or (
+                key == "pattern"
+                and (not isinstance(value, str) or value not in permitted)
+            ):
+                raise ValueError(
+                    f"{label} repository schema keyword {key} is forbidden"
+                )
+            _reject_unsafe_schema_keywords(
+                value,
+                label=label,
+                allowed_patterns=permitted,
+            )
+    elif isinstance(schema, list):
+        for value in schema:
+            _reject_unsafe_schema_keywords(
+                value,
+                label=label,
+                allowed_patterns=permitted,
+            )
+
+
 def _validate_project_contract(value: dict[str, Any], *, label: str) -> None:
     scope = value.get("supervisor_scope", {})
     for key in ("allowed_change_globs", "out_of_scope_globs"):
@@ -260,6 +350,11 @@ def _validated_json_document(path: Path, *, label: str, kind: str) -> dict[str, 
     schema = _read_stable_json_object(schema_path, label=f"{label} $schema")
     _reject_external_schema_refs(schema, label=label)
     core_schema = _read_core_schema(kind, label=f"{label} core schema")
+    _reject_unsafe_schema_keywords(
+        schema,
+        label=label,
+        allowed_patterns=_schema_pattern_allowlist(core_schema),
+    )
     try:
         from jsonschema import Draft202012Validator
         from jsonschema.exceptions import SchemaError, ValidationError
@@ -421,7 +516,7 @@ def _privacy_safe_previous_for_carry(
         else {}
     )
     carried = copy.deepcopy(previous)
-    if privacy.get("persist_raw_prompts") is not False:
+    if privacy.get("persist_raw_prompts") is True:
         return carried
 
     def opaque(label: str, value: str) -> str:

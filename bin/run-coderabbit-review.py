@@ -14,8 +14,17 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 from typing import Any, Iterable
+
+
+MAX_REVIEW_FILES = 512
+MAX_REVIEW_FILE_BYTES = 4 * 1024 * 1024
+MAX_REVIEW_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_REVIEW_DEPTH = 32
+MAX_SUBPROCESS_STREAM_BYTES = 4 * 1024 * 1024
+_SUBPROCESS_READ_CHUNK = 64 * 1024
 
 
 _BOUND_REVIEW_SOURCE = sys.modules.get("_agent_supervisor_review_source")
@@ -44,6 +53,8 @@ if (
     observed_manifest: dict[str, str] = {}
     total_size = 0
     for raw_name, content in sorted(resources.items()):
+        if len(observed_manifest) >= MAX_REVIEW_FILES:
+            raise RuntimeError("bound review source has too many entries")
         if not isinstance(raw_name, str) or not isinstance(content, bytes):
             raise RuntimeError("bound review source entry invalid")
         relative = PurePosixPath(raw_name)
@@ -80,6 +91,15 @@ else:
         PROFILE_ROOT = CORE_ROOT.parent
     elif CORE_ROOT.parent.name == ".agent-supervisor-releases":
         PROFILE_ROOT = CORE_ROOT.parent.parent
+    elif (
+        (CORE_ROOT / "pyproject.toml").is_file()
+        and (CORE_ROOT / "supervisor_core").is_dir()
+        and (CORE_ROOT / "integrations").is_dir()
+    ):
+        # A source checkout is a supported local-review layout.  Its exact
+        # files are copied and hashed into the disposable review repository
+        # before any external process is launched.
+        PROFILE_ROOT = CORE_ROOT
     else:
         raise RuntimeError("unsupported immutable Supervisor core layout")
 SUPERVISOR_DATA_ROOT = PROFILE_ROOT / ".agent-supervisor"
@@ -210,6 +230,7 @@ def strict_json_loads(raw: str) -> Any:
 
 _TRUST_REGISTRY_CACHE: dict[str, Any] | None = None
 _TRUST_ENTRY_FIELDS = {"kind", "path", "sha256"}
+_TRUST_ENTRY_OPTIONAL_FIELDS = {"allowed_argv_sha256"}
 _TRUST_REGISTRY_FIELDS = {"contract", "entries", "generated_at"}
 _SAFE_ENV_NAMES = {
     "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
@@ -290,12 +311,21 @@ def _load_machine_trust_registry() -> dict[str, Any]:
             or name != name.casefold()
             or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name)
             or not isinstance(entry, dict)
-            or set(entry) != _TRUST_ENTRY_FIELDS
+            or not _TRUST_ENTRY_FIELDS <= set(entry)
+            or bool(set(entry) - _TRUST_ENTRY_FIELDS - _TRUST_ENTRY_OPTIONAL_FIELDS)
             or entry.get("kind") not in {"local", "wsl"}
             or not isinstance(entry.get("path"), str)
             or not entry["path"]
             or not isinstance(entry.get("sha256"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            or not isinstance(entry.get("allowed_argv_sha256", []), list)
+            or len(entry.get("allowed_argv_sha256", [])) > 256
+            or any(
+                not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+                for item in entry.get("allowed_argv_sha256", [])
+            )
+            or len(set(entry.get("allowed_argv_sha256", [])))
+            != len(entry.get("allowed_argv_sha256", []))
         ):
             raise RuntimeError("trusted executable registry invalid")
     _TRUST_REGISTRY_CACHE = value
@@ -474,8 +504,23 @@ def credential_finding(content: bytes) -> str | None:
     """Return only a finding category; never return or log credential material."""
     text = content.decode("utf-8", errors="ignore")
     for category, pattern in _KNOWN_CREDENTIAL_PATTERNS:
-        if pattern.search(text):
-            return category
+        for match in pattern.finditer(text):
+            matched = match.group(0).casefold()
+            synthetic = (
+                category != "private-key"
+                and (
+                    any(marker in matched for marker in _PLACEHOLDER_MARKERS)
+                    or (
+                        category in {
+                            "credentialed-url", "slack-webhook", "discord-webhook",
+                            "wecom-webhook",
+                        }
+                        and ".invalid" in matched
+                    )
+                )
+            )
+            if not synthetic:
+                return category
     for pattern, minimum_length, minimum_classes, category in (
         (_PASSWORD_LITERAL, 10, 3, "password-literal"),
         (_SECRET_ASSIGNMENT, 16, 2, "secret-assignment"),
@@ -535,10 +580,20 @@ def excluded(path: Path) -> bool:
 def files_under(root: Path) -> list[Path]:
     root = Path(os.path.abspath(root))
     result: list[Path] = []
+    visited = 0
     for current, directories, files in os.walk(root):
         current_path = Path(current)
+        try:
+            depth = len(current_path.relative_to(root).parts)
+        except ValueError as exc:
+            raise ReviewScopeError("root-escape") from exc
+        if depth > MAX_REVIEW_DEPTH:
+            raise ReviewScopeError("review-source-depth-limit")
         retained_directories: list[str] = []
         for name in directories:
+            visited += 1
+            if visited > MAX_REVIEW_FILES * 8:
+                raise ReviewScopeError("review-source-entry-limit")
             candidate = current_path / name
             if excluded(candidate.relative_to(root)):
                 continue
@@ -548,9 +603,14 @@ def files_under(root: Path) -> list[Path]:
                 retained_directories.append(name)
         directories[:] = retained_directories
         for name in files:
+            visited += 1
+            if visited > MAX_REVIEW_FILES * 8:
+                raise ReviewScopeError("review-source-entry-limit")
             candidate = current_path / name
             if not excluded(candidate.relative_to(root)):
                 result.append(candidate)
+                if len(result) > MAX_REVIEW_FILES:
+                    raise ReviewScopeError("review-source-file-count-limit")
     return result
 
 
@@ -584,26 +644,9 @@ def _configured_agent_paths(configured: dict[str, Any]) -> list[Path]:
 
 
 def source_groups(project_root: Path = PROJECT_ROOT, profile_root: Path = PROFILE_ROOT, core_root: Path = CORE_ROOT) -> list[tuple[str, Path, Iterable[Path]]]:
-    project_candidates: list[Path] = []
-    for relative in (
-        ".agent-supervisor", ".claude/hooks/supervisor", ".claude/rules/supervisor-contract.md",
-        ".claude/settings.json", ".codex/hooks.json", ".gitignore", "skills/dev-supervisor", "AGENTS.md",
-    ):
-        candidate = project_root / relative
-        if candidate.is_dir():
-            project_candidates.extend(files_under(candidate))
-        elif candidate.is_file():
-            project_candidates.append(candidate)
-    project_manifest = project_root / ".agent-supervisor" / "project.json"
-    if project_manifest.is_file():
-        try:
-            configured = strict_json_loads(project_manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, DuplicateKeyEvent) as exc:
-            raise RuntimeError("project Supervisor manifest is not strict JSON") from exc
-        if not isinstance(configured, dict):
-            raise ReviewScopeError("invalid-agent-role-manifest")
-        project_candidates.extend(project_root / path for path in _configured_agent_paths(configured))
-
+    # Never externalize user settings, hook registries, project manifests, or
+    # prompt-bearing state. The immutable workspace binding carries only hashes
+    # and paths; externally reviewed source comes from the release snapshot.
     core_candidates: list[Path] = []
     for relative in (
         "supervisor_core",
@@ -621,28 +664,17 @@ def source_groups(project_root: Path = PROJECT_ROOT, profile_root: Path = PROFIL
         elif candidate.is_file():
             core_candidates.append(candidate)
 
-    claude_root = profile_root / ".claude" / "skills" / "supervisor"
-    claude_candidates = [
-        claude_root / "SKILL.md",
-        claude_root / "scripts" / "sup-v3-hook.py",
-        claude_root / "scripts" / "sup-selftest.py",
-        claude_root / "scripts" / "sup-discover.py",
-        claude_root / "scripts" / "sup-log.py",
-        claude_root / "scripts" / "sup-plan.py",
-        claude_root / "scripts" / "configure-v3-hooks.py",
-        claude_root / "tests" / "test_dispatch_ledger.py",
-        claude_root / "tests" / "test_precision.py",
-        claude_root / "tests" / "test_retrieval.py",
-        claude_root / "tests" / "test_v3_adapter.py",
-        claude_root / "tests" / "test_verifier.py",
-    ]
-    codex_root = profile_root / ".codex" / "skills" / "dev-supervisor"
+    # Bind adapters to the same release snapshot as the core.  Reading the
+    # user's installed skill trees would both review different bytes and risk
+    # externalizing machine-local configuration accidentally placed there.
+    claude_root = core_root / "integrations" / "claude"
+    claude_candidates = files_under(claude_root) if claude_root.is_dir() else []
+    codex_root = core_root / "integrations" / "codex"
     codex_candidates = files_under(codex_root) if codex_root.is_dir() else []
     return [
-        ("project", project_root, project_candidates),
         ("global-core", core_root, core_candidates),
-        ("global-claude", claude_root, claude_candidates),
-        ("global-codex", codex_root, codex_candidates),
+        ("release-claude", claude_root, claude_candidates),
+        ("release-codex", codex_root, codex_candidates),
     ]
 
 
@@ -652,11 +684,11 @@ def _review_category_instructions(category: str) -> bytes:
             "CodeRabbit independent test-integrity review. Review only whether this diff deletes tests, "
             "adds skip/only/todo, relaxes thresholds, weakens assertions, or changes assertions alongside "
             "implementation in a way that can hide regressions. Treat any unresolved instance as a major "
-            "blocking finding. Inspect project/AGENTS.md and the complete immutable snapshot.\n"
+            "blocking finding. Inspect the complete immutable Supervisor snapshot.\n"
         )
     else:
         text = (
-            "CodeRabbit independent implementation review. Inspect project/AGENTS.md and the complete "
+            "CodeRabbit independent implementation review. Inspect the complete "
             "immutable snapshot. Report every correctness, security, goal-alignment, portability, and "
             "quality issue; unresolved critical or major findings block approval.\n"
         )
@@ -666,6 +698,7 @@ def _review_category_instructions(category: str) -> bytes:
 def prepare_review_tree(destination: Path, groups: list[tuple[str, Path, Iterable[Path]]] | None = None, *, review_category: str = "independent") -> list[dict[str, str]]:
     prepared: list[tuple[str, Path, bytes]] = []
     manifest: list[dict[str, str]] = []
+    total_bytes = 0
     for label, source_root, candidates in groups or source_groups():
         for source in sorted(set(candidates)):
             if not source.exists() and not source.is_symlink():
@@ -674,7 +707,12 @@ def prepare_review_tree(destination: Path, groups: list[tuple[str, Path, Iterabl
             if excluded(relative):
                 continue
             before = os.stat(source_resolved, follow_symlinks=False)
-            content = source_resolved.read_bytes()
+            if before.st_size < 1 or before.st_size > MAX_REVIEW_FILE_BYTES:
+                raise ReviewScopeError("review-source-file-size-limit")
+            with source_resolved.open("rb") as handle:
+                content = handle.read(MAX_REVIEW_FILE_BYTES + 1)
+            if len(content) > MAX_REVIEW_FILE_BYTES:
+                raise ReviewScopeError("review-source-file-size-limit")
             after = os.stat(source_resolved, follow_symlinks=False)
             identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
@@ -682,6 +720,11 @@ def prepare_review_tree(destination: Path, groups: list[tuple[str, Path, Iterabl
                 raise ReviewScopeError("source-mutated-during-scan")
             if credential_finding(content):
                 raise ReviewScopeError("credential-literal")
+            if len(prepared) >= MAX_REVIEW_FILES:
+                raise ReviewScopeError("review-source-file-count-limit")
+            total_bytes += len(content)
+            if total_bytes > MAX_REVIEW_TOTAL_BYTES:
+                raise ReviewScopeError("review-source-total-size-limit")
             prepared.append((label, relative, content))
 
     if review_category not in REVIEW_CATEGORIES:
@@ -1181,6 +1224,86 @@ def auth_is_ready(output: str) -> bool:
     return authenticated_seen
 
 
+def _run_process_bounded(
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout: int,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Drain child streams concurrently and stop at a hard per-stream limit."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        env=env,
+        bufsize=0,
+    )
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        raise OSError("subprocess-pipes-unavailable")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    digests = {"stdout": hashlib.sha256(), "stderr": hashlib.sha256()}
+    overflow = threading.Event()
+
+    def drain(name: str, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.read(_SUBPROCESS_READ_CHUNK)
+                if not chunk:
+                    break
+                digests[name].update(chunk)
+                target = buffers[name]
+                if len(target) + len(chunk) > MAX_SUBPROCESS_STREAM_BYTES:
+                    overflow.set()
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    break
+                target.extend(chunk)
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+        raise
+    for reader in readers:
+        reader.join(timeout=5)
+    if any(reader.is_alive() for reader in readers):
+        process.kill()
+        raise ReviewScopeError("subprocess-drain-timeout")
+    if overflow.is_set():
+        raise ReviewScopeError("subprocess-output-limit")
+    completed = subprocess.CompletedProcess(
+        command,
+        returncode,
+        bytes(buffers["stdout"]),
+        bytes(buffers["stderr"]),
+    )
+    completed.stdout_sha256 = digests["stdout"].hexdigest()
+    completed.stderr_sha256 = digests["stderr"].hexdigest()
+    return completed
+
+
 def _run(
     command: list[str],
     cwd: Path,
@@ -1191,36 +1314,22 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     resolved_command = _resolved_command(command)
     process_environment = env if env is not None else _minimal_environment()
-    if capture_stream_hashes:
-        raw = subprocess.run(
-            resolved_command,
-            cwd=cwd,
-            capture_output=True,
-            text=False,
-            check=False,
-            timeout=timeout,
-            env=process_environment,
-        )
-        completed = subprocess.CompletedProcess(
-            raw.args,
-            raw.returncode,
-            (raw.stdout or b"").decode("utf-8", errors="replace"),
-            (raw.stderr or b"").decode("utf-8", errors="replace"),
-        )
-        completed.stdout_sha256 = hashlib.sha256(raw.stdout or b"").hexdigest()
-        completed.stderr_sha256 = hashlib.sha256(raw.stderr or b"").hexdigest()
-        return completed
-    return subprocess.run(
+    raw = _run_process_bounded(
         resolved_command,
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
         timeout=timeout,
         env=process_environment,
     )
+    completed = subprocess.CompletedProcess(
+        raw.args,
+        raw.returncode,
+        (raw.stdout or b"").decode("utf-8", errors="replace"),
+        (raw.stderr or b"").decode("utf-8", errors="replace"),
+    )
+    if capture_stream_hashes:
+        completed.stdout_sha256 = getattr(raw, "stdout_sha256")
+        completed.stderr_sha256 = getattr(raw, "stderr_sha256")
+    return completed
 
 
 def _run_bytes(
@@ -1230,12 +1339,9 @@ def _run_bytes(
     timeout: int = 60,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
+    return _run_process_bounded(
         _resolved_command(command),
         cwd=cwd,
-        capture_output=True,
-        text=False,
-        check=False,
         timeout=timeout,
         env=env if env is not None else _minimal_environment(),
     )

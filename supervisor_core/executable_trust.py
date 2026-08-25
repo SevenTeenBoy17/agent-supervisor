@@ -11,11 +11,15 @@ from typing import Any
 
 REGISTRY_CONTRACT = "TrustedExecutableRegistry/v1"
 _ENTRY_FIELDS = {"kind", "path", "sha256"}
+_ENTRY_OPTIONAL_FIELDS = {"allowed_argv_sha256"}
 _ROOT_FIELDS = {"contract", "entries", "generated_at"}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
+_MAX_COMMAND_ARGUMENTS = 256
+_MAX_COMMAND_ARGUMENT_BYTES = 16 * 1024
+_MAX_APPROVED_COMMANDS = 256
 
 
 class ExecutableTrustError(ValueError):
@@ -148,7 +152,11 @@ def load_trusted_executable_registry(path: Path | None = None) -> dict[str, Any]
         name = str(raw_name).casefold()
         if name != raw_name or not _NAME.fullmatch(name):
             raise ExecutableTrustError("registry-entry-name-invalid")
-        if not isinstance(raw_entry, dict) or set(raw_entry) != _ENTRY_FIELDS:
+        if (
+            not isinstance(raw_entry, dict)
+            or not _ENTRY_FIELDS <= set(raw_entry)
+            or set(raw_entry) - _ENTRY_FIELDS - _ENTRY_OPTIONAL_FIELDS
+        ):
             raise ExecutableTrustError("registry-entry-shape-invalid")
         kind = raw_entry.get("kind")
         raw_path = raw_entry.get("path")
@@ -157,13 +165,32 @@ def load_trusted_executable_registry(path: Path | None = None) -> dict[str, Any]
             raise ExecutableTrustError("registry-entry-value-invalid")
         if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
             raise ExecutableTrustError("registry-entry-digest-invalid")
+        raw_approvals = raw_entry.get("allowed_argv_sha256", [])
+        if (
+            not isinstance(raw_approvals, list)
+            or len(raw_approvals) > _MAX_APPROVED_COMMANDS
+            or any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in raw_approvals)
+            or len(set(raw_approvals)) != len(raw_approvals)
+        ):
+            raise ExecutableTrustError("registry-entry-argv-approvals-invalid")
+        approvals = sorted(raw_approvals)
         if kind == "local":
             canonical_path, observed = _stable_local_executable(raw_path, digest)
-            normalized[name] = {"kind": kind, "path": canonical_path, "sha256": observed}
+            normalized[name] = {
+                "kind": kind,
+                "path": canonical_path,
+                "sha256": observed,
+                "allowed_argv_sha256": approvals,
+            }
         else:
             if not raw_path.startswith("/") or "\\" in raw_path or ".." in Path(raw_path).parts:
                 raise ExecutableTrustError("registry-wsl-path-invalid")
-            normalized[name] = {"kind": kind, "path": raw_path, "sha256": digest}
+            normalized[name] = {
+                "kind": kind,
+                "path": raw_path,
+                "sha256": digest,
+                "allowed_argv_sha256": approvals,
+            }
     return {
         "contract": REGISTRY_CONTRACT,
         "entries": normalized,
@@ -228,6 +255,65 @@ def resolve_trusted_executable(
         if not isinstance(entry, dict) or entry.get("kind") != "local":
             raise ExecutableTrustError("executable-alias-not-registered")
     return _stable_local_executable(str(entry["path"]), str(entry["sha256"]))
+
+
+def trusted_command_approval_sha256(command: list[str]) -> str:
+    """Return the machine-policy digest for one exact canonical argv vector."""
+    if (
+        not isinstance(command, list)
+        or not command
+        or len(command) > _MAX_COMMAND_ARGUMENTS
+        or any(
+            not isinstance(item, str)
+            or not item
+            or "\x00" in item
+            or len(item.encode("utf-8")) > _MAX_COMMAND_ARGUMENT_BYTES
+            for item in command
+        )
+    ):
+        raise ExecutableTrustError("trusted-command-argv-invalid")
+    encoded = json.dumps(
+        command,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def authorize_trusted_command(
+    command: list[str],
+    registry: dict[str, Any],
+    *,
+    cwd: str | None = None,
+) -> tuple[list[str], str, str]:
+    """Resolve argv[0] and require machine-owned approval of every argument."""
+    if not isinstance(command, list) or not command:
+        raise ExecutableTrustError("trusted-command-argv-invalid")
+    resolved, executable_sha256 = resolve_trusted_executable(
+        str(command[0]),
+        registry,
+        cwd=cwd,
+    )
+    canonical = [resolved, *[str(item) for item in command[1:]]]
+    approval = trusted_command_approval_sha256(canonical)
+    entries = registry.get("entries") if isinstance(registry, dict) else None
+    matching = [
+        entry
+        for entry in entries.values()
+        if isinstance(entry, dict)
+        and entry.get("kind") == "local"
+        and os.path.normcase(str(entry.get("path") or ""))
+        == os.path.normcase(resolved)
+    ] if isinstance(entries, dict) else []
+    if len(matching) != 1:
+        raise ExecutableTrustError("trusted-command-entry-ambiguous")
+    approvals = matching[0].get("allowed_argv_sha256", [])
+    # Executing a trusted binary without arguments does not let repository
+    # metadata select an interpreter grammar or a workspace script. Any
+    # argument-bearing command requires an exact machine-owned digest.
+    if len(canonical) > 1 and approval not in approvals:
+        raise ExecutableTrustError("trusted-command-argv-not-approved")
+    return canonical, resolved, executable_sha256
 
 
 def trusted_path(registry: dict[str, Any]) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -66,15 +67,30 @@ def test_git_uses_registry_and_ignores_workspace_path_poison(
 
     observed: dict[str, object] = {}
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        observed["command"] = command
-        observed["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, b"ok", b"")
+    class FakeProcess:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            observed["command"] = command
+            observed["kwargs"] = kwargs
+            self.stdout = io.BytesIO(b"ok")
+            self.stderr = io.BytesIO()
+            self.returncode: int | None = None
 
-    monkeypatch.setattr(workspace_module.subprocess, "run", fake_run)
+        def wait(self, timeout: float | None = None) -> int:
+            self.returncode = 0
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    monkeypatch.setattr(workspace_module.subprocess, "Popen", FakeProcess)
     result = workspace_module._git(workspace, "status", "--porcelain")
 
     assert result.returncode == 0
+    assert result.stdout == b"ok"
+    assert result.stderr == b""
     command = observed["command"]
     assert isinstance(command, list)
     assert Path(command[0]) == trusted_git
@@ -82,6 +98,11 @@ def test_git_uses_registry_and_ignores_workspace_path_poison(
     assert Path(command[0]) != workspace_fake.resolve(strict=True)
     kwargs = observed["kwargs"]
     assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.PIPE
+    assert kwargs["shell"] is False
+    assert kwargs["bufsize"] == 0
     environment = kwargs["env"]
     assert isinstance(environment, dict)
     assert environment["NoDefaultCurrentDirectoryInExePath"] == "1"

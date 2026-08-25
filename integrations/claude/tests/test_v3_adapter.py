@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,8 +26,10 @@ DISCOVER = HERE.parent / "scripts" / "sup-discover.py"
 CONFIGURE = HERE.parent / "scripts" / "configure-v3-hooks.py"
 PLAN = HERE.parent / "scripts" / "sup-plan.py"
 LOG = HERE.parent / "scripts" / "sup-log.py"
+CLAUDE_SKILL = HERE.parent / "SKILL.md"
 PRECISION = HERE / "test_precision.py"
 RETRIEVAL = HERE / "test_retrieval.py"
+RUNTIME_BUNDLE = HERE.parents[2] / "supervisor_core" / "runtime_bundle.py"
 
 
 def load_module(name: str, path: Path):
@@ -41,11 +44,58 @@ def load_module(name: str, path: Path):
 def write_core(root: Path, version: str = "9.9.9") -> None:
     package = root / "supervisor_core"
     package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "__main__.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (package / "__init__.py").write_text("# bundled fixture\n", encoding="utf-8")
+    (package / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "from .cli import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
     (package / "nested").mkdir()
     (package / "nested" / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
     (root / "VERSION").write_text(version + "\n", encoding="utf-8")
+
+
+def stage_runtime_pointer(
+    home: Path,
+    source_root: Path,
+    *,
+    version: str = "9.9.9",
+    pointer_contract: str = "ActiveVersionPointer/v4",
+    declared_version: str | None = None,
+) -> tuple[Path, Path, dict[str, str]]:
+    runtime_bundle = load_module(
+        "supervisor_v3_runtime_bundle_" + hashlib.sha256(str(source_root).encode()).hexdigest()[:12],
+        RUNTIME_BUNDLE,
+    )
+    bundle = runtime_bundle.build_runtime_bundle(source_root.resolve(), version)
+    release_root = home / ".agent-supervisor-releases"
+    release = release_root / ("v" + version)
+    bundle_path = release / "runtime" / "supervisor-runtime.zip"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(bundle)
+    identity = runtime_bundle.release_identity(
+        release.resolve(),
+        version,
+        "runtime/supervisor-runtime.zip",
+        bundle,
+    )
+    if declared_version is not None:
+        identity["version"] = declared_version
+    pointer = home / ".agent-supervisor" / "active-version.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_bytes(
+        json.dumps(
+            {
+                "contract": pointer_contract,
+                "active": identity,
+                "previous": None,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    return pointer, release_root, identity
 
 
 class CoreTrustResolver(unittest.TestCase):
@@ -61,17 +111,24 @@ class CoreTrustResolver(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _pointer(self, *, contract: str = "ActiveVersionPointer/v3", version: str = "9.9.9") -> Path:
-        pointer = self.default_core / "active-version.json"
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text(
-            json.dumps(
-                {
-                    "contract": contract,
-                    "active": {"version": version, "path": str(self.release_core)},
-                }
-            ),
-            encoding="utf-8",
+    def test_adapter_and_skill_release_metadata_are_3_1_6(self) -> None:
+        match = re.search(r"(?m)^\s*version:\s*([^\s]+)\s*$", CLAUDE_SKILL.read_text(encoding="utf-8"))
+        self.assertIsNotNone(match)
+        self.assertEqual(self.adapter.ADAPTER_VERSION, "3.1.6")
+        self.assertEqual(match.group(1), self.adapter.ADAPTER_VERSION)
+
+    def _pointer(
+        self,
+        *,
+        contract: str = "ActiveVersionPointer/v4",
+        version: str = "9.9.9",
+    ) -> Path:
+        pointer, _release_root, _identity = stage_runtime_pointer(
+            self.home,
+            self.release_core,
+            version="9.9.9",
+            pointer_contract=contract,
+            declared_version=version,
         )
         return pointer
 
@@ -175,17 +232,77 @@ class CoreTrustResolver(unittest.TestCase):
             os.environ.pop("AGENT_SUPERVISOR_CORE", None)
             resolved, identity = self.adapter._resolve_core_selection(require_active_pointer=True)
         self.assertEqual(resolved, self.release_core.resolve())
-        self.assertEqual(identity["source"], "active-pointer")
+        self.assertEqual(identity["source"], "active-pointer-v4-bundle")
         self.assertEqual(identity["declared_version"], "9.9.9")
 
-        bad_pointer = self._pointer(contract="WrongPointer/v3")
+        bad_pointer = self._pointer(contract="ActiveVersionPointer/v3")
         with mock.patch.dict(os.environ, self._resolver_env(bad_pointer), clear=False):
             os.environ.pop("AGENT_SUPERVISOR_HOME", None)
             os.environ.pop("AGENT_SUPERVISOR_CORE", None)
             with self.assertRaises(FileNotFoundError):
                 self.adapter._resolve_core_selection(require_active_pointer=True)
-            # Runtime hooks remain tolerant and may fall back to a trusted default.
-            self.assertEqual(self.adapter._core_root(), self.default_core.resolve())
+            with self.assertRaises(FileNotFoundError):
+                self.adapter._core_root()
+
+    def test_v4_requires_complete_identity_and_matching_bundle_bytes(self) -> None:
+        write_core(self.release_core)
+        pointer = self._pointer()
+        env = self._resolver_env(pointer)
+
+        document = json.loads(pointer.read_text(encoding="utf-8"))
+        document["active"].pop("manifest_sha256")
+        pointer.write_bytes(
+            json.dumps(
+                document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        )
+        with mock.patch.dict(os.environ, env, clear=False):
+            with self.assertRaises(FileNotFoundError):
+                self.adapter._load_active_runtime()
+
+        pointer = self._pointer()
+        document = json.loads(pointer.read_text(encoding="utf-8"))
+        bundle = Path(document["active"]["path"]) / document["active"]["bundle_relpath"]
+        bundle.write_bytes(bundle.read_bytes() + b"tampered")
+        with mock.patch.dict(os.environ, self._resolver_env(pointer), clear=False):
+            with self.assertRaises(FileNotFoundError):
+                self.adapter._load_active_runtime()
+
+    def test_v4_pointer_must_be_canonical_json(self) -> None:
+        write_core(self.release_core)
+        pointer = self._pointer()
+        document = json.loads(pointer.read_text(encoding="utf-8"))
+        pointer.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+        with mock.patch.dict(os.environ, self._resolver_env(pointer), clear=False):
+            with self.assertRaises(FileNotFoundError):
+                self.adapter._load_active_runtime()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX inode change-time semantics")
+    def test_pointer_hardlink_mutation_cannot_hide_behind_restored_mtime(self) -> None:
+        write_core(self.release_core)
+        pointer = self._pointer()
+        hardlink = pointer.with_name("active-version-hardlink.json")
+        os.link(pointer, hardlink)
+        original_read = self.adapter.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            content = original_read(descriptor, size)
+            if content and not mutated:
+                mutated = True
+                before = pointer.stat()
+                replacement = content.replace(b"9.9.9", b"9.9.8", 1)
+                self.assertEqual(len(replacement), len(content))
+                hardlink.write_bytes(replacement)
+                os.utime(hardlink, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return content
+
+        with mock.patch.object(self.adapter.os, "read", side_effect=mutate_after_read):
+            with self.assertRaises(self.adapter._BootstrapError):
+                self.adapter._stable_read(pointer, self.adapter.MAX_POINTER_BYTES)
+        self.assertTrue(mutated)
 
     def test_selftest_identity_uses_hook_resolver_and_version_mismatch_fails_closed(self) -> None:
         write_core(self.default_core, version="3.1.0")
@@ -198,13 +315,13 @@ class CoreTrustResolver(unittest.TestCase):
             core, version, identity = selftest._resolve_test_core()
         self.assertEqual(core, self.release_core.resolve())
         self.assertEqual(version, "9.9.9")
-        self.assertEqual(identity["source"], "active-pointer")
+        self.assertEqual(identity["source"], "active-pointer-v4-bundle")
 
         self._pointer(version="9.9.8")
         with mock.patch.dict(os.environ, self._resolver_env(pointer), clear=False):
             os.environ.pop("AGENT_SUPERVISOR_HOME", None)
             os.environ.pop("AGENT_SUPERVISOR_CORE", None)
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(FileNotFoundError):
                 selftest._resolve_test_core()
 
         self._pointer()
@@ -212,10 +329,12 @@ class CoreTrustResolver(unittest.TestCase):
         with mock.patch.dict(os.environ, self._resolver_env(pointer), clear=False):
             os.environ.pop("AGENT_SUPERVISOR_HOME", None)
             os.environ.pop("AGENT_SUPERVISOR_CORE", None)
-            with self.assertRaises(FileNotFoundError):
-                selftest._resolve_test_core()
+            core, version, identity = selftest._resolve_test_core()
+        self.assertEqual(core, self.release_core.resolve())
+        self.assertEqual(version, "9.9.9")
+        self.assertEqual(identity["source"], "active-pointer-v4-bundle")
 
-        bad_pointer = self._pointer(contract="WrongPointer/v3")
+        bad_pointer = self._pointer(contract="ActiveVersionPointer/v3")
         env = dict(os.environ)
         env.update(self._resolver_env(bad_pointer))
         env.pop("AGENT_SUPERVISOR_HOME", None)
@@ -232,6 +351,25 @@ class CoreTrustResolver(unittest.TestCase):
         expected_checks = selftest._expected_check_count()
         self.assertIn(f"RESULT passed=0 failed={expected_checks}".encode("ascii"), proc.stdout)
         self.assertEqual(proc.stderr, b"")
+
+    def test_selftest_materializes_only_frozen_bundle_bytes(self) -> None:
+        write_core(self.release_core)
+        pointer = self._pointer()
+        selftest = load_module("supervisor_v3_selftest_frozen_tree_probe", SELFTEST)
+        with mock.patch.dict(os.environ, self._resolver_env(pointer), clear=False):
+            _core, _version, identity = selftest._resolve_test_core()
+            frozen = selftest._freeze_test_runtime(identity)
+        original_cli = (self.release_core / "supervisor_core" / "cli.py").read_bytes()
+        (self.release_core / "supervisor_core" / "cli.py").write_text(
+            "raise RuntimeError('mutable source executed')\n", encoding="utf-8"
+        )
+
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-frozen-tree-") as temp:
+            materialized = selftest._materialize_test_core(frozen, Path(temp))
+            self.assertEqual(
+                (materialized / "supervisor_core" / "cli.py").read_bytes(),
+                original_cli,
+            )
 
     def test_selftest_early_failure_count_tracks_required_suite_count(self) -> None:
         selftest = load_module("supervisor_v3_selftest_count_probe", SELFTEST)
@@ -410,25 +548,32 @@ class AdapterHarness(unittest.TestCase):
         self.stub_core = Path(self.temp.name) / "stub-core"
         package = self.stub_core / "supervisor_core"
         package.mkdir(parents=True)
-        (package / "__init__.py").write_text("", encoding="utf-8")
-        (package / "__main__.py").write_text(
+        (package / "__init__.py").write_text("# bundled fixture\n", encoding="utf-8")
+        (package / "cli.py").write_text(
             """import json, os, pathlib, sys
-payload = json.loads(sys.stdin.read() or '{}')
-row = {'argv': sys.argv[1:], 'payload': payload}
-with pathlib.Path(os.environ['STUB_LOG']).open('a', encoding='utf-8') as handle:
-    handle.write(json.dumps(row, ensure_ascii=False) + '\\n')
-adapter = payload.get('_agent_supervisor_adapter') or {}
-if adapter.get('degraded_prior') is True and payload.get('hook_event_name') == 'SessionStart':
-    print(json.dumps({'agent_supervisor': {'health': 'degraded', 'durable_ack': True}}))
-    raise SystemExit(4)
-elif os.environ.get('STUB_DEGRADED') == '1':
-    print(json.dumps({'agent_supervisor': {'health': 'degraded', 'fail_open': True}}))
-elif 'Stop' in sys.argv:
-    print(json.dumps({'decision': 'block', 'reason': 'fixture incomplete'}))
-    raise SystemExit(2)
-else:
+
+def main():
+    payload = json.loads(sys.stdin.read() or '{}')
+    row = {'argv': sys.argv[1:], 'payload': payload}
+    with pathlib.Path(os.environ['STUB_LOG']).open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + '\\n')
+    adapter = payload.get('_agent_supervisor_adapter') or {}
+    if adapter.get('degraded_prior') is True and payload.get('hook_event_name') == 'SessionStart':
+        print(json.dumps({'agent_supervisor': {'health': 'degraded', 'durable_ack': True}}))
+        return 4
+    if os.environ.get('STUB_DEGRADED') == '1':
+        print(json.dumps({'agent_supervisor': {'health': 'degraded', 'fail_open': True}}))
+        return 0
+    if 'Stop' in sys.argv:
+        print(json.dumps({'decision': 'block', 'reason': 'fixture incomplete'}))
+        return 2
     print(json.dumps({'continue': True, 'suppressOutput': True}))
+    return 0
 """,
+            encoding="utf-8",
+        )
+        (package / "__main__.py").write_text(
+            "from .cli import main\nraise SystemExit(main())\n",
             encoding="utf-8",
         )
         self.stub_log = Path(self.temp.name) / "stub.jsonl"
@@ -446,11 +591,17 @@ else:
             "AGENT_SUPERVISOR_INSTALL_HOME",
         ):
             result.pop(name, None)
+        if core.is_dir():
+            pointer, release_root, _identity = stage_runtime_pointer(self.home, core)
+        else:
+            pointer = core / "active-version.json"
+            release_root = core / "releases"
         result.update(
             {
                 "USERPROFILE": str(self.home),
                 "HOME": str(self.home),
-                "AGENT_SUPERVISOR_CORE": str(core),
+                "AGENT_SUPERVISOR_ACTIVE_POINTER": str(pointer),
+                "AGENT_SUPERVISOR_RELEASE_ROOT": str(release_root),
                 "STUB_LOG": str(self.stub_log),
                 "PYTHONIOENCODING": "utf-8",
             }
@@ -473,9 +624,12 @@ else:
                 self.stub_core,
             )
 
-        self.assertEqual(isolated["AGENT_SUPERVISOR_CORE"], str(self.stub_core))
+        self.assertEqual(
+            isolated["AGENT_SUPERVISOR_ACTIVE_POINTER"],
+            str(self.home / ".agent-supervisor" / "active-version.json"),
+        )
         for name in hostile:
-            if name != "AGENT_SUPERVISOR_CORE":
+            if name not in {"AGENT_SUPERVISOR_ACTIVE_POINTER", "AGENT_SUPERVISOR_RELEASE_ROOT"}:
                 self.assertNotIn(name, isolated)
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stderr, b"")
@@ -516,7 +670,7 @@ else:
         self.assertNotIn("user_prompt\":\"token", text)
         row = json.loads(text)
         self.assertEqual(row["status"], "degraded")
-        self.assertEqual(row["reason_category"], "core_rejected")
+        self.assertEqual(row["reason_category"], "active_pointer_rejected")
 
     def test_file_not_found_reason_is_actionable_but_path_safe(self) -> None:
         adapter = load_module("supervisor_v3_missing_reason_probe", ADAPTER)
@@ -604,6 +758,59 @@ else:
         self.assertEqual(len(self.rows()), 1)
         self.assertEqual(self.rows()[0]["payload"]["hook_event_name"], "SessionStart")
 
+    def test_frozen_runtime_survives_bundle_and_source_swap_after_verification(self) -> None:
+        env = self.env(self.stub_core)
+        adapter = load_module("supervisor_v3_frozen_runtime_probe", ADAPTER)
+        with mock.patch.dict(os.environ, env, clear=False):
+            frozen = adapter._load_active_runtime()
+            Path(frozen["bundle_path"]).write_bytes(b"replaced-after-freeze")
+            (self.stub_core / "supervisor_core" / "cli.py").write_text(
+                "raise RuntimeError('mutable source executed')\n",
+                encoding="utf-8",
+            )
+            original_run = subprocess.run
+            with mock.patch.object(adapter.subprocess, "run", wraps=original_run) as launch:
+                returncode, stdout = adapter._run_frozen_runtime(
+                    frozen,
+                    "SessionStart",
+                    {
+                        "session_id": "frozen-session",
+                        "cwd": "D:/project",
+                        "hook_event_name": "SessionStart",
+                        "_agent_supervisor_adapter": {
+                            "adapter_version": adapter.ADAPTER_VERSION,
+                            "degraded_prior": False,
+                        },
+                    },
+                )
+
+        self.assertEqual(returncode, 0)
+        self.assertTrue(json.loads(stdout)["continue"])
+        self.assertEqual(self.rows()[0]["payload"]["session_id"], "frozen-session")
+        child_args = launch.call_args.args[0]
+        child_env = launch.call_args.kwargs["env"]
+        self.assertEqual(child_args[1:4], ["-I", "-S", "-c"])
+        self.assertNotIn("-m", child_args)
+        self.assertNotIn("pythonpath", {name.casefold() for name in child_env})
+
+    def test_mutable_core_environment_has_no_runtime_fallback(self) -> None:
+        env = self.env(self.missing_core)
+        env["AGENT_SUPERVISOR_CORE"] = str(self.stub_core)
+        env["AGENT_SUPERVISOR_HOME"] = str(self.stub_core)
+        proc = subprocess.run(
+            [sys.executable, str(ADAPTER), "--event", "SessionStart"],
+            input=json.dumps({"session_id": "no-core-fallback", "cwd": "D:/project"}).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertFalse(self.stub_log.exists())
+
     def test_prompt_and_stop_are_forwarded_even_without_file_changes(self) -> None:
         prompt = self.run_hook(
             "UserPromptSubmit",
@@ -666,7 +873,7 @@ else:
         self.assertTrue(forwarded[0]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
         self.assertTrue(forwarded[1]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
         self.assertFalse(forwarded[2]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
-        self.assertEqual(forwarded[0]["payload"]["_agent_supervisor_adapter"]["adapter_version"], "3.1.1")
+        self.assertEqual(forwarded[0]["payload"]["_agent_supervisor_adapter"]["adapter_version"], "3.1.6")
 
     def test_core_degraded_response_creates_marker(self) -> None:
         env = self.env(self.stub_core)
@@ -743,6 +950,29 @@ else:
             self.assertEqual(marker.read_bytes(), first)
             self.assertEqual(list(marker.parent.glob("*.fallback-*.tmp")), [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX owner mode semantics")
+    def test_degraded_spool_directories_and_files_are_owner_only(self) -> None:
+        adapter = load_module("supervisor_v3_degraded_private_mode_probe", ADAPTER)
+        payload = {"session_id": "private-mode-session", "cwd": "D:/project"}
+
+        with mock.patch.dict(os.environ, self.env(self.missing_core), clear=False):
+            log_path, marker_path = adapter._fallback_paths(payload["session_id"])
+            log_path.parent.mkdir(parents=True, mode=0o755)
+            log_path.write_text('{"existing":true}\n', encoding="utf-8")
+            log_path.chmod(0o644)
+            adapter._record_degraded("SessionStart", payload, "core_missing")
+
+        for directory in (
+            self.home / ".agent-supervisor",
+            self.home / ".agent-supervisor" / "fallback",
+            log_path.parent,
+            marker_path.parent,
+        ):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+        for path in (log_path, marker_path):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(len(log_path.read_text(encoding="utf-8").splitlines()), 2)
+
 
 class RealCoreIntegration(unittest.TestCase):
     def setUp(self) -> None:
@@ -789,11 +1019,20 @@ class RealCoreIntegration(unittest.TestCase):
             **(extra or {}),
         }
         env = dict(os.environ)
+        version = (self.core / "VERSION").read_text(encoding="utf-8").strip()
+        pointer, release_root, _identity = stage_runtime_pointer(
+            self.home,
+            self.core,
+            version=version,
+        )
+        env.pop("AGENT_SUPERVISOR_HOME", None)
+        env.pop("AGENT_SUPERVISOR_CORE", None)
         env.update(
             {
                 "USERPROFILE": str(self.home),
                 "HOME": str(self.home),
-                "AGENT_SUPERVISOR_CORE": str(self.core),
+                "AGENT_SUPERVISOR_ACTIVE_POINTER": str(pointer),
+                "AGENT_SUPERVISOR_RELEASE_ROOT": str(release_root),
                 "PYTHONIOENCODING": "utf-8",
             }
         )
@@ -1288,7 +1527,13 @@ class LegacyLogSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-transcript-cutoff-") as temp:
             home = Path(temp) / "home"
             with mock.patch.object(Path, "home", return_value=home):
-                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "SUP_DRYRUN": "0",
+                        "SUPERVISOR_LEGACY_PERSIST_PROMPTS": "1",
+                    },
+                ):
                     log = load_module("supervisor_v3_transcript_cutoff_probe", LOG)
 
             secret = "sk-" + "A" * 24
@@ -1353,7 +1598,13 @@ class LegacyLogSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-project-key-paths-") as temp:
             home = Path(temp) / "home"
             with mock.patch.object(Path, "home", return_value=home):
-                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "SUP_DRYRUN": "0",
+                        "SUPERVISOR_LEGACY_PERSIST_PROMPTS": "1",
+                    },
+                ):
                     log = load_module("supervisor_v3_project_key_paths_probe", LOG)
 
             transcript = Path(log.append_transcript("probe", "..", 1, True)).resolve()
@@ -1404,7 +1655,13 @@ class LegacyLogSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-transcript-race-") as temp:
             home = Path(temp) / "home"
             with mock.patch.object(Path, "home", return_value=home):
-                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "SUP_DRYRUN": "0",
+                        "SUPERVISOR_LEGACY_PERSIST_PROMPTS": "1",
+                    },
+                ):
                     log = load_module("supervisor_v3_transcript_race_probe", LOG)
 
             project = "D:/race-project"
@@ -1912,6 +2169,97 @@ class LegacyLogRollover(unittest.TestCase):
 
 
 class LegacyLogStorageFailure(unittest.TestCase):
+    def test_symlinked_event_log_and_transcript_are_rejected_without_target_write(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-link-") as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            with mock.patch.object(Path, "home", return_value=home):
+                with mock.patch.dict(
+                    os.environ,
+                    {"SUP_DRYRUN": "0", "SUPERVISOR_LEGACY_PERSIST_PROMPTS": "1"},
+                    clear=False,
+                ):
+                    log = load_module("supervisor_v3_log_link_probe", LOG)
+
+            outside_log = Path(temp) / "outside-log.txt"
+            outside_log.write_text("unchanged-log\n", encoding="utf-8")
+            log_path = log._current_log_file()
+            try:
+                log_path.symlink_to(outside_log)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            self.assertFalse(log.append_event({"event": "fixture"}))
+            self.assertEqual(outside_log.read_text(encoding="utf-8"), "unchanged-log\n")
+
+            project = "D:/linked-transcript"
+            project_dir = log.TRANSCRIPTS_DIR / log.project_key(project)
+            log._ensure_private_directory(project_dir)
+            transcript = project_dir / (datetime.now().strftime("%Y-%m") + ".md")
+            outside_transcript = Path(temp) / "outside-transcript.txt"
+            outside_transcript.write_text("unchanged-transcript\n", encoding="utf-8")
+            transcript.symlink_to(outside_transcript)
+            self.assertEqual(log.append_transcript("private prompt", project, 1, True), "")
+            self.assertEqual(
+                outside_transcript.read_text(encoding="utf-8"),
+                "unchanged-transcript\n",
+            )
+
+    def test_default_prompt_handling_persists_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-private-prompt-") as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            with mock.patch.object(Path, "home", return_value=home):
+                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}, clear=False):
+                    os.environ.pop("SUPERVISOR_LEGACY_PERSIST_PROMPTS", None)
+                    log = load_module("supervisor_v3_log_private_prompt_probe", LOG)
+
+            prompt = "private fixture words must never be stored"
+            log.set_session({"session_id": "private-prompt-session"})
+            with contextlib.redirect_stdout(io.StringIO()):
+                log.handle_prompt_submit(
+                    {"prompt": prompt, "cwd": "D:/project", "session_id": "private-prompt-session"}
+                )
+
+            persisted = b"\n".join(
+                path.read_bytes()
+                for path in log.SUP_HOME.rglob("*")
+                if path.is_file()
+            )
+            self.assertNotIn(prompt.encode("utf-8"), persisted)
+            self.assertEqual(list(log.TRANSCRIPTS_DIR.rglob("*.md")), [])
+            rows = [
+                json.loads(line)
+                for line in log._current_log_file().read_text(encoding="utf-8").splitlines()
+            ]
+            prompt_row = next(row for row in rows if row.get("event") == "prompt-submit")
+            self.assertNotIn("prompt_head", prompt_row)
+            self.assertEqual(prompt_row["prompt_len"], len(prompt))
+            self.assertFalse(prompt_row["transcript"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owner mode semantics")
+    def test_created_legacy_directories_and_files_are_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-private-mode-") as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            with mock.patch.object(Path, "home", return_value=home):
+                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}, clear=False):
+                    os.environ.pop("SUPERVISOR_LEGACY_PERSIST_PROMPTS", None)
+                    log = load_module("supervisor_v3_log_private_mode_probe", LOG)
+
+            log.set_session({"session_id": "private-mode-session"})
+            self.assertTrue(log.append_event({"event": "fixture"}))
+            self.assertTrue(log.write_turn_state({"turn": 1}))
+            for directory in (
+                log.SUP_HOME,
+                log.LOG_DIR,
+                log.STATE_DIR,
+                log.CONTEXTS_DIR,
+                log.TRANSCRIPTS_DIR,
+            ):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+            for path in (log._current_log_file(), log._state_file()):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_import_and_main_fail_open_without_claiming_failed_writes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-storage-") as temp:
             home = Path(temp) / "home"
@@ -1947,6 +2295,50 @@ class LegacyLogStorageFailure(unittest.TestCase):
 
 class SettingsMigration(unittest.TestCase):
     def test_only_supervisor_hooks_change_and_output_never_contains_values(self) -> None:
+        configure = load_module("supervisor_v3_settings_exact_owner_probe", CONFIGURE)
+        self.assertTrue(
+            configure.is_supervisor_hook(
+                {
+                    "type": "command",
+                    "command": (
+                        '"/opt/python3.12" "/home/user/.claude/skills/supervisor/'
+                        'scripts/sup-v3-hook.py" --event SessionStart'
+                    ),
+                }
+            )
+        )
+        self.assertTrue(
+            configure.is_supervisor_hook(
+                {
+                    "type": "command",
+                    "command": (
+                        'python -I -S "/home/user/.claude/skills/supervisor/'
+                        'scripts/sup-v3-hook.py" --event SessionStart   '
+                    ),
+                }
+            )
+        )
+        self.assertFalse(
+            configure.is_supervisor_hook(
+                {
+                    "type": "command",
+                    "command": (
+                        'python"/home/user/.claude/skills/supervisor/'
+                        'scripts/sup-v3-hook.py" --event SessionStart'
+                    ),
+                }
+            )
+        )
+        for command in (
+            'python "$(touch>/tmp/x)/.claude/skills/supervisor/scripts/sup-log.py" pre-tool',
+            'python "/home/user/.claude/skills/supervisor/scripts/sup-log.py"\npre-tool',
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(
+                    configure.is_supervisor_hook(
+                        {"type": "command", "command": command}
+                    )
+                )
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-settings-") as temp:
             home = Path(temp) / "home"
             settings_path = home / ".claude" / "settings.json"
@@ -1959,10 +2351,53 @@ class SettingsMigration(unittest.TestCase):
                     "PreToolUse": [
                         {"matcher": "Read", "hooks": [{"type": "command", "command": "python keep-me.py"}]},
                         {"matcher": "*", "hooks": [{"type": "command", "command": "python C:/old/.claude/skills/supervisor/scripts/sup-log.py pre-tool"}]},
-                    ]
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python C:/custom/sup-log.py pre-tool",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        'python "$(touch>/tmp/x)/.claude/skills/supervisor/'
+                                        'scripts/sup-log.py" pre-tool'
+                                    ),
+                                },
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        'python "/home/user/.claude/skills/supervisor/'
+                                        'scripts/sup-log.py"\npre-tool'
+                                    ),
+                                },
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "python C:/old/.claude/skills/supervisor/scripts/"
+                                        "sup-log.py pre-tool --user-extra"
+                                    ),
+                                },
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "python wrapper.py C:/old/.claude/skills/supervisor/"
+                                        "scripts/sup-v3-hook.py --event PreToolUse"
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                    "Stop": [
+                        {"matcher": "Never", "hooks": [], "note": "preserve-empty-user-group"}
+                    ],
+                    "CustomEmpty": [],
                 },
             }
             settings_path.write_text(json.dumps(original), encoding="utf-8")
+            if os.name == "posix":
+                settings_path.chmod(0o640)
             env = dict(os.environ, USERPROFILE=str(home), HOME=str(home), PYTHONIOENCODING="utf-8")
             first = subprocess.run(
                 [sys.executable, str(CONFIGURE)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1986,6 +2421,11 @@ class SettingsMigration(unittest.TestCase):
             migrated = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(migrated["opaque_private_setting"], fixture_secret)
             self.assertEqual(migrated["permissions"], original["permissions"])
+            self.assertIn(
+                {"matcher": "Never", "hooks": [], "note": "preserve-empty-user-group"},
+                migrated["hooks"]["Stop"],
+            )
+            self.assertEqual(migrated["hooks"]["CustomEmpty"], [])
             kept = [
                 entry
                 for group in migrated["hooks"]["PreToolUse"]
@@ -1993,15 +2433,47 @@ class SettingsMigration(unittest.TestCase):
                 if entry.get("command") == "python keep-me.py"
             ]
             self.assertEqual(len(kept), 1)
+            preserved_commands = {
+                entry.get("command")
+                for group in migrated["hooks"]["PreToolUse"]
+                for entry in group.get("hooks", [])
+            }
+            self.assertIn("python C:/custom/sup-log.py pre-tool", preserved_commands)
+            self.assertIn(
+                "python C:/old/.claude/skills/supervisor/scripts/sup-log.py pre-tool --user-extra",
+                preserved_commands,
+            )
+            self.assertIn(
+                "python wrapper.py C:/old/.claude/skills/supervisor/scripts/sup-v3-hook.py --event PreToolUse",
+                preserved_commands,
+            )
+            self.assertIn(
+                'python "$(touch>/tmp/x)/.claude/skills/supervisor/scripts/sup-log.py" pre-tool',
+                preserved_commands,
+            )
+            self.assertIn(
+                'python "/home/user/.claude/skills/supervisor/scripts/sup-log.py"\npre-tool',
+                preserved_commands,
+            )
             for event in expected_events:
                 supervisor_entries = [
                     entry
                     for group in migrated["hooks"].get(event, [])
                     for entry in group.get("hooks", [])
-                    if "sup-v3-hook.py" in entry.get("command", "")
+                    if configure.is_supervisor_hook(entry)
                 ]
                 self.assertEqual(len(supervisor_entries), 1, event)
-            self.assertNotIn("sup-log.py", settings_path.read_text(encoding="utf-8"))
+                self.assertIn(" -I -S ", supervisor_entries[0]["command"])
+            self.assertNotIn(
+                "python C:/old/.claude/skills/supervisor/scripts/sup-log.py pre-tool",
+                {
+                    command
+                    for command in preserved_commands
+                    if command and not command.endswith("--user-extra")
+                },
+            )
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(settings_path.stat().st_mode), 0o640)
             first_hash = hashlib.sha256(settings_path.read_bytes()).hexdigest()
             second = subprocess.run(
                 [sys.executable, str(CONFIGURE)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2009,6 +2481,48 @@ class SettingsMigration(unittest.TestCase):
             )
             self.assertEqual(second.returncode, 0)
             self.assertEqual(first_hash, hashlib.sha256(settings_path.read_bytes()).hexdigest())
+
+    def test_linked_settings_file_is_rejected_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-settings-link-") as temp:
+            base = Path(temp)
+            home = base / "home"
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            target = base / "actual-settings.json"
+            original = json.dumps({"permissions": {"allow": ["Read"]}}).encode("utf-8")
+            target.write_bytes(original)
+            if os.name == "posix":
+                target.chmod(0o600)
+            try:
+                settings_path.symlink_to(target)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            env = dict(
+                os.environ,
+                USERPROFILE=str(home),
+                HOME=str(home),
+                PYTHONIOENCODING="utf-8",
+            )
+
+            proc = subprocess.run(
+                [sys.executable, str(CONFIGURE)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(proc.returncode, 64)
+            self.assertEqual(proc.stderr, b"")
+            self.assertEqual(
+                json.loads(proc.stdout),
+                {"updated": False, "error": "settings_read_failed"},
+            )
+            self.assertTrue(settings_path.is_symlink())
+            self.assertEqual(target.read_bytes(), original)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
     def test_unreadable_settings_returns_stable_invalid_state(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-settings-read-") as temp:
@@ -2028,6 +2542,38 @@ class SettingsMigration(unittest.TestCase):
             json.loads(proc.stdout),
             {"updated": False, "error": "settings_read_failed"},
         )
+
+    def test_unrecognizable_emitted_command_is_rejected_before_settings_write(self) -> None:
+        configure = load_module("supervisor_v3_configure_emitter_probe", CONFIGURE)
+        for case in ("renamed-python", "expanding-path"):
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory(prefix="supervisor-v3-settings-emitter-") as temp:
+                    base = Path(temp)
+                    home = base / ("home$expanded" if case == "expanding-path" else "home")
+                    settings_path = home / ".claude" / "settings.json"
+                    settings_path.parent.mkdir(parents=True)
+                    original = json.dumps({"permissions": {"allow": ["Read"]}}).encode("utf-8")
+                    settings_path.write_bytes(original)
+                    executable = (
+                        base / "python-custom.exe" if case == "renamed-python" else Path(sys.executable)
+                    )
+                    output, errors = io.StringIO(), io.StringIO()
+                    with mock.patch.dict(
+                        os.environ, {"USERPROFILE": str(home), "HOME": str(home)}, clear=False
+                    ), mock.patch.object(configure.sys, "executable", str(executable)):
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                            rc = configure.main()
+
+                    self.assertEqual(rc, 64)
+                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(
+                        json.loads(output.getvalue()),
+                        {"updated": False, "error": "unsupported_hook_command"},
+                    )
+                    self.assertEqual(settings_path.read_bytes(), original)
+                    self.assertEqual(
+                        list(settings_path.parent.glob(".settings.json.*.*.tmp")), []
+                    )
 
     def test_non_list_event_hooks_are_rejected_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-settings-shape-") as temp:
@@ -2067,7 +2613,7 @@ class SettingsMigration(unittest.TestCase):
                     before = settings_path.read_bytes()
                     output, errors = io.StringIO(), io.StringIO()
                     patcher = (
-                        mock.patch.object(Path, "write_bytes", side_effect=OSError(secret))
+                        mock.patch.object(configure.tempfile, "mkstemp", side_effect=OSError(secret))
                         if failure == "write"
                         else mock.patch.object(configure.os, "replace", side_effect=OSError(secret))
                     )
@@ -2133,10 +2679,62 @@ class SelftestSettingsValidation(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-selftest-events-") as temp:
             settings = Path(temp) / "settings.json"
-            command = f'{sys.executable} {ADAPTER}'
+            adapter_path = (
+                Path(temp) / ".claude" / "skills" / "supervisor" / "scripts" / "sup-v3-hook.py"
+            )
+            adapter_path.parent.mkdir(parents=True)
+            adapter_path.write_text("# fixture\n", encoding="utf-8")
             hooks = {
-                event: [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]
+                event: [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    f'"{sys.executable}" -I -S "{adapter_path}" --event {event}'
+                                ),
+                                "timeout": 10,
+                            }
+                        ],
+                    }
+                ]
                 for event in expected_events
+            }
+            settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.object(selftest, "SETTINGS", settings), mock.patch.object(
+                selftest, "ADAPTER", adapter_path
+            ):
+                with contextlib.redirect_stdout(output):
+                    ok = selftest._settings_check()
+
+        self.assertTrue(ok)
+        self.assertIn("events=8, exactly_one=True", output.getvalue())
+
+    def test_legacy_unisolated_v3_hooks_do_not_pass_current_topology(self) -> None:
+        selftest = load_module("supervisor_v3_selftest_legacy_hooks_probe", SELFTEST)
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-selftest-legacy-") as temp:
+            settings = Path(temp) / "settings.json"
+            adapter_path = (
+                Path(temp) / ".claude" / "skills" / "supervisor" / "scripts" / "sup-v3-hook.py"
+            )
+            adapter_path.parent.mkdir(parents=True)
+            adapter_path.write_text("# fixture\n", encoding="utf-8")
+            hooks = {
+                event: [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f'"{sys.executable}" "{adapter_path}" --event {event}',
+                                "timeout": 10,
+                            }
+                        ],
+                    }
+                ]
+                for event in selftest.EVENTS
             }
             settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
             output = io.StringIO()
@@ -2144,8 +2742,51 @@ class SelftestSettingsValidation(unittest.TestCase):
                 with contextlib.redirect_stdout(output):
                     ok = selftest._settings_check()
 
-        self.assertTrue(ok)
-        self.assertIn("events=8, exactly_one=True", output.getvalue())
+        self.assertFalse(ok)
+        self.assertIn("exactly_one=False", output.getvalue())
+
+    def test_mixed_current_and_legacy_hooks_do_not_pass_current_topology(self) -> None:
+        selftest = load_module("supervisor_v3_selftest_mixed_hooks_probe", SELFTEST)
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-selftest-mixed-") as temp:
+            settings = Path(temp) / "settings.json"
+            adapter_path = (
+                Path(temp) / ".claude" / "skills" / "supervisor" / "scripts" / "sup-v3-hook.py"
+            )
+            adapter_path.parent.mkdir(parents=True)
+            adapter_path.write_text("# fixture\n", encoding="utf-8")
+            hooks = {
+                event: [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f'"{sys.executable}" -I -S "{adapter_path}" --event {event}',
+                                "timeout": 10,
+                            }
+                        ],
+                    },
+                    {
+                        "matcher": "Never",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f'"{sys.executable}" "{adapter_path}" --event {event}',
+                                "timeout": 10,
+                            }
+                        ],
+                    },
+                ]
+                for event in selftest.EVENTS
+            }
+            settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+            with mock.patch.object(selftest, "SETTINGS", settings), mock.patch.object(
+                selftest, "ADAPTER", adapter_path
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ok = selftest._settings_check()
+
+        self.assertFalse(ok)
 
     def test_malformed_hooks_type_returns_stable_fail_line(self) -> None:
         selftest = load_module("supervisor_v3_selftest_settings_probe", SELFTEST)
@@ -2207,7 +2848,7 @@ class SelftestSettingsValidation(unittest.TestCase):
                 core,
                 "9.9.9",
                 {
-                    "source": "active-pointer",
+                    "source": "active-pointer-v4-bundle",
                     "declared_version": "9.9.9",
                     "declared_path": str(core),
                 },
@@ -2222,13 +2863,15 @@ class SelftestSettingsValidation(unittest.TestCase):
             try:
                 os.chdir(ambient)
                 with mock.patch.object(selftest, "_resolve_test_core", return_value=resolved):
-                    with mock.patch.object(selftest, "_settings_check", return_value=True):
-                        with mock.patch.object(selftest, "_discover_import_check", return_value=True):
-                            with mock.patch.object(
-                                selftest.subprocess, "run", side_effect=record_run
-                            ):
-                                with contextlib.redirect_stdout(io.StringIO()):
-                                    rc = selftest.main()
+                    with mock.patch.object(selftest, "_freeze_test_runtime", return_value={}):
+                        with mock.patch.object(selftest, "_materialize_test_core", return_value=core):
+                            with mock.patch.object(selftest, "_settings_check", return_value=True):
+                                with mock.patch.object(selftest, "_discover_import_check", return_value=True):
+                                    with mock.patch.object(
+                                        selftest.subprocess, "run", side_effect=record_run
+                                    ):
+                                        with contextlib.redirect_stdout(io.StringIO()):
+                                            rc = selftest.main()
             finally:
                 os.chdir(original_cwd)
 

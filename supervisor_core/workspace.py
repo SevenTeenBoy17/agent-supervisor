@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import fnmatch
 import os
@@ -8,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,11 @@ from .util import (
 
 
 _GIT_TIMEOUT_SECONDS = 15
+_MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
+_MAX_WORKSPACE_FILES = 10_000
+_MAX_WORKSPACE_FILE_BYTES = 64 * 1024 * 1024
+_MAX_WORKSPACE_TOTAL_BYTES = 512 * 1024 * 1024
+_WORKSPACE_HASH_CHUNK_BYTES = 1024 * 1024
 _GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
 _GIT_REDIRECT_ENVIRONMENT = frozenset(
     {
@@ -403,15 +410,77 @@ def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
         )
     command = [str(executable), "-C", str(workspace), *args]
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
             env=_sanitized_git_environment(),
-            timeout=_GIT_TIMEOUT_SECONDS,
+            bufsize=0,
         )
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(command, 124, b"", b"agent-supervisor:git-timeout")
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            process.wait()
+            raise OSError("git-pipes-unavailable")
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        overflow = threading.Event()
+
+        def drain(name: str, stream: Any) -> None:
+            try:
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    target = buffers[name]
+                    if len(target) + len(chunk) > _MAX_GIT_OUTPUT_BYTES:
+                        overflow.set()
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        break
+                    target.extend(chunk)
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        readers = [
+            threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        try:
+            returncode = process.wait(timeout=_GIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            for reader in readers:
+                reader.join(timeout=2)
+            return subprocess.CompletedProcess(
+                command, 124, b"", b"agent-supervisor:git-timeout"
+            )
+        for reader in readers:
+            reader.join(timeout=2)
+        if overflow.is_set() or any(reader.is_alive() for reader in readers):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            return subprocess.CompletedProcess(
+                command,
+                125,
+                b"",
+                b"agent-supervisor:git-output-limit",
+            )
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bytes(buffers["stdout"]),
+            bytes(buffers["stderr"]),
+        )
     except OSError:
         return subprocess.CompletedProcess(command, 127, b"", b"agent-supervisor:git-unavailable")
 
@@ -421,6 +490,8 @@ def _git_runtime_failure(result: subprocess.CompletedProcess[bytes]) -> str | No
         return "git-timeout"
     if result.returncode == 127 and b"agent-supervisor:git-unavailable" in (result.stderr or b""):
         return "git-unavailable"
+    if result.returncode == 125 and b"agent-supervisor:git-output-limit" in (result.stderr or b""):
+        return "git-output-limit"
     return None
 
 
@@ -1209,12 +1280,12 @@ def resolve_handoff_output_path(workspace: str, session: str, output: str) -> Pa
     return candidate
 
 
-def _hash_workspace_entry(root: Path, path: Path, relative: str) -> str | None:
+def _hash_workspace_entry(root: Path, path: Path, relative: str) -> tuple[str | None, int]:
     current = path
     while current != root:
         parent = current.parent
         if parent == current:
-            return sha256_text(f"unsafe-or-unreadable-entry:{relative}")
+            return sha256_text(f"unsafe-or-unreadable-entry:{relative}"), 0
         if _is_reparse_point(current):
             try:
                 target = os.readlink(current)
@@ -1225,18 +1296,41 @@ def _hash_workspace_entry(root: Path, path: Path, relative: str) -> str | None:
                     current.relative_to(root).as_posix()
                 )
             except ValueError:
-                return sha256_text(f"unsafe-or-unreadable-entry:{relative}")
+                return sha256_text(f"unsafe-or-unreadable-entry:{relative}"), 0
             safe_target = _persistent_workspace_path(str(target))
-            return sha256_text(f"link-metadata:{link_name}:{safe_target}")
+            return sha256_text(f"link-metadata:{link_name}:{safe_target}"), 0
         current = parent
     try:
         resolved = path.resolve(strict=True)
         resolved.relative_to(root)
-        if not resolved.is_file():
-            return None
-        return sha256_bytes(resolved.read_bytes())
+        before = resolved.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            return None, 0
+        if before.st_size > _MAX_WORKSPACE_FILE_BYTES:
+            raise ValueError("workspace-file-size-limit")
+        digest = hashlib.sha256()
+        observed = 0
+        with resolved.open("rb") as handle:
+            while True:
+                chunk = handle.read(_WORKSPACE_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                observed += len(chunk)
+                if observed > _MAX_WORKSPACE_FILE_BYTES:
+                    raise ValueError("workspace-file-size-limit")
+                digest.update(chunk)
+        after = resolved.stat(follow_symlinks=False)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or observed != before.st_size
+        ):
+            return sha256_text(f"unsafe-or-unreadable-entry:{relative}"), 0
+        return digest.hexdigest(), observed
+    except ValueError:
+        raise
     except (OSError, ValueError):
-        return sha256_text(f"unsafe-or-unreadable-entry:{relative}")
+        return sha256_text(f"unsafe-or-unreadable-entry:{relative}"), 0
 
 
 def _persistent_workspace_path(relative: str) -> str:
@@ -1273,6 +1367,8 @@ def _relative_files(workspace: Path, extra_globs: list[str]) -> tuple[set[str], 
             # Preserve a literal backslash byte on POSIX instead of silently
             # conflating it with a directory separator.
             result.add(raw.decode("utf-8", errors="surrogateescape"))
+            if len(result) > _MAX_WORKSPACE_FILES:
+                return set(), "workspace-file-count-limit"
     for pattern in extra_globs:
         normalized = str(pattern).replace("\\", "/")
         if not normalized or normalized.startswith("/") or (len(normalized) > 2 and normalized[1] == ":"):
@@ -1281,6 +1377,8 @@ def _relative_files(workspace: Path, extra_globs: list[str]) -> tuple[set[str], 
             for path in workspace.glob(normalized):
                 if (path.is_file() or _is_reparse_point(path)) and ".git" not in path.relative_to(workspace).parts:
                     result.add(path.relative_to(workspace).as_posix())
+                    if len(result) > _MAX_WORKSPACE_FILES:
+                        return set(), "workspace-file-count-limit"
         except (OSError, ValueError):
             continue
     return {relative for relative in result if not _runtime_only_path(relative)}, None
@@ -1344,13 +1442,32 @@ def capture_workspace_snapshot(workspace: str, extra_globs: list[str] | None = N
     if format_error:
         return _degraded_workspace_snapshot(root, requested_globs, format_error)
     files: dict[str, str] = {}
+    total_bytes = 0
     relative_files, list_error = _relative_files(root, requested_globs)
     if list_error:
         return _degraded_workspace_snapshot(root, requested_globs, list_error)
     for relative in sorted(relative_files):
         path = root / Path(relative)
         persistent_relative = _persistent_workspace_path(relative)
-        digest = _hash_workspace_entry(root, path, persistent_relative)
+        try:
+            digest, observed_bytes = _hash_workspace_entry(
+                root,
+                path,
+                persistent_relative,
+            )
+        except ValueError as exc:
+            return _degraded_workspace_snapshot(
+                root,
+                requested_globs,
+                str(exc),
+            )
+        total_bytes += observed_bytes
+        if total_bytes > _MAX_WORKSPACE_TOTAL_BYTES:
+            return _degraded_workspace_snapshot(
+                root,
+                requested_globs,
+                "workspace-total-size-limit",
+            )
         if digest is not None:
             files[persistent_relative] = digest
     digest_payload = json.dumps({"head": head, "files": files}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

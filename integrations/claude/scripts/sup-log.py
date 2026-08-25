@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -45,10 +46,105 @@ LOG_DIR = SUP_HOME / "logs"
 STATE_DIR = SUP_HOME / "state"
 CONTEXTS_DIR = STATE_DIR / "contexts"   # v4: per-project context files
 TRANSCRIPTS_DIR = SUP_HOME / "transcripts"
-STORAGE_READY = True
-for d in (LOG_DIR, STATE_DIR, CONTEXTS_DIR):
+PROMPT_ARCHIVE_ENABLED = os.environ.get(
+    "SUPERVISOR_LEGACY_PERSIST_PROMPTS", ""
+).strip().casefold() in {"1", "true", "yes"}
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create one directory with owner-only access where POSIX modes apply."""
+    if path.is_symlink():
+        raise OSError("private-directory-link-rejected")
+    path.mkdir(mode=0o700, exist_ok=True)
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if (
+        path.is_symlink()
+        or not path.is_dir()
+        or os.path.normcase(os.path.realpath(os.fspath(absolute)))
+        != os.path.normcase(str(absolute))
+    ):
+        raise OSError("private-directory-link-rejected")
+    if os.name == "posix":
+        path.chmod(0o700)
+
+
+def _is_reparse_info(info: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISLNK(info.st_mode)
+        or (
+            hasattr(info, "st_file_attributes")
+            and bool(
+                info.st_file_attributes
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            )
+        )
+    )
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_mode),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns) if os.name == "posix" else 0,
+    )
+
+
+def _private_text_open(path: Path, flags: int, mode: str, *, newline=None):
+    """Open one link-free regular text file and constrain it to mode 0600."""
     try:
-        d.mkdir(parents=True, exist_ok=True)
+        before = path.lstat()
+    except FileNotFoundError:
+        before = None
+    if before is not None and (
+        _is_reparse_info(before) or not stat.S_ISREG(before.st_mode)
+    ):
+        raise OSError("private-file-link-rejected")
+    descriptor = os.open(
+        str(path),
+        flags | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("private-file-not-regular")
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            _is_reparse_info(current)
+            or not stat.S_ISREG(current.st_mode)
+            or _file_identity(opened) != _file_identity(current)
+        ):
+            raise OSError("private-file-path-changed")
+        return os.fdopen(
+            descriptor,
+            mode,
+            encoding="utf-8",
+            newline=newline,
+            closefd=True,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+STORAGE_READY = True
+try:
+    claude_home = SUP_HOME.parent
+    claude_home_created = not claude_home.exists()
+    claude_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if claude_home_created and os.name == "posix":
+        claude_home.chmod(0o700)
+except OSError:
+    STORAGE_READY = False
+for d in (SUP_HOME, LOG_DIR, STATE_DIR, CONTEXTS_DIR, TRANSCRIPTS_DIR):
+    try:
+        _ensure_private_directory(d)
     except OSError:
         # Legacy hooks are fail-open. Remember initialization failure so later
         # helpers neither raise nor claim that a write happened.
@@ -146,7 +242,11 @@ def append_event(event: dict) -> bool:
     if fd is None:
         return False
     try:
-        with log_file.open("a", encoding="utf-8") as f:
+        with _private_text_open(
+            log_file,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            "a",
+        ) as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
         return True
     except Exception:
@@ -238,7 +338,12 @@ def write_turn_state(state: dict) -> bool:
     try:
         if _current_sid:
             state["session_id"] = _current_sid   # makes render_ledger's filter live
-        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        with _private_text_open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            "w",
+        ) as handle:
+            handle.write(json.dumps(state, ensure_ascii=False))
         os.replace(temporary, target)
         return True
     except Exception:
@@ -269,7 +374,18 @@ def _acquire_state_lock(timeout_seconds: float = 1.5, lock_path: Path | None = N
         return None, lock
     while time.monotonic() < deadline:
         try:
-            return os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY), lock
+            descriptor = os.open(
+                str(lock),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            try:
+                if os.name == "posix":
+                    os.fchmod(descriptor, 0o600)
+            except OSError:
+                os.close(descriptor)
+                raise
+            return descriptor, lock
         except FileExistsError:
             try:
                 if time.time() - lock.stat().st_mtime > 30:
@@ -660,20 +776,20 @@ def _fence_for(body: str) -> str:
 
 
 def append_transcript(prompt: str, cwd: str, turn: int, dev: bool) -> str:
-    """把提示词**全文**追加到按项目分目录、按月分文件的 md 里。
+    """Optionally append a redacted prompt archive after explicit user opt-in.
 
-    此前只存 prompt[:80]，用户的原话被截断后永久丢失。全文存档让「这轮到底
-    要我做什么」在几周后还能复核，也让台账之外多一条独立证据链。
-    Never raises - a hook that throws breaks the user's session.
+    Prompt content is never persisted by default. The legacy archive remains
+    available only through ``SUPERVISOR_LEGACY_PERSIST_PROMPTS=1`` for users who
+    knowingly accept that local retention tradeoff.
     """
-    if not STORAGE_READY:
+    if not STORAGE_READY or not PROMPT_ARCHIVE_ENABLED:
         return ""
     try:
         key = project_key(cwd) if cwd else "unknown"
         d = _confined_direct_child(TRANSCRIPTS_DIR, key)
         if d is None:
             return ""
-        d.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(d)
         # Recheck after mkdir so an existing link cannot redirect the write.
         d = _confined_direct_child(TRANSCRIPTS_DIR, key)
         if d is None or not d.is_dir():
@@ -682,10 +798,14 @@ def append_transcript(prompt: str, cwd: str, turn: int, dev: bool) -> str:
         if f is None:
             return ""
         head = ("# 提示词全文存档 · " + key + chr(10) + chr(10)
-                + "> 由 supervisor 钩子自动追加，每条为用户原话全文（未截断）。" + chr(10)
+                + "> 已明确启用 legacy prompt archive；内容会先做凭据抹除。" + chr(10)
                 + "> 只增不改；需要检索用 `sup-query.py`。" + chr(10) + chr(10))
         try:
-            with f.open("x", encoding="utf-8") as fh:
+            with _private_text_open(
+                f,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                "w",
+            ) as fh:
                 fh.write(head)
         except FileExistsError:
             pass
@@ -710,7 +830,11 @@ def append_transcript(prompt: str, cwd: str, turn: int, dev: bool) -> str:
                      + ((" · 已抹除 " + str(redacted) + " 处疑似凭据") if redacted else ""))
         block = (head_line + chr(10) + chr(10)
                  + fence + "text" + chr(10) + body + chr(10) + fence + chr(10) + chr(10))
-        with f.open("a", encoding="utf-8") as fh:
+        with _private_text_open(
+            f,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            "a",
+        ) as fh:
             fh.write(block)
         return str(f)
     except Exception:
@@ -758,9 +882,8 @@ def handle_prompt_submit(stdin_data: dict) -> None:
     noise = is_harness_noise(prompt)
     dev = (not noise) and is_dev_prompt(prompt)
     tpath = append_transcript(prompt, cwd, state["turn"], dev)
-    safe_prompt, _redacted = redact_secrets(prompt)
     append_event({"event": "prompt-submit", "turn": state["turn"], "dev": dev,
-                  "cwd": cwd, "prompt_head": safe_prompt[:80],
+                  "cwd": cwd,
                   "prompt_len": len(prompt), "transcript": bool(tpath),
                   "noise": noise})
     if dev:

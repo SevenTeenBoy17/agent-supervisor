@@ -476,21 +476,56 @@ function Get-AgentSupervisorTrustedRegistryPythonPath {
         $registry = $strictUtf8.GetString([byte[]]$snapshot.Bytes) | ConvertFrom-Json -ErrorAction Stop
         $registryNames = @($registry.PSObject.Properties.Name | Sort-Object)
         if (
+            $registry -isnot [pscustomobject] -or
             ($registryNames -join '|') -cne 'contract|entries|generated_at' -or
+            $registry.contract -isnot [string] -or
             [string]$registry.contract -cne 'TrustedExecutableRegistry/v1' -or
-            $null -eq $registry.entries
+            (
+                $registry.generated_at -isnot [string] -and
+                $registry.generated_at -isnot [datetime]
+            ) -or
+            [string]::IsNullOrWhiteSpace([string]$registry.generated_at) -or
+            $registry.entries -isnot [pscustomobject] -or
+            @($registry.entries.PSObject.Properties).Count -eq 0
         ) {
             return $null
         }
         $entry = $registry.entries.python
         $entryNames = @($entry.PSObject.Properties.Name | Sort-Object)
+        $entryShape = $entryNames -join '|'
         if (
             $null -eq $entry -or
-            ($entryNames -join '|') -cne 'kind|path|sha256' -or
+            $entry -isnot [pscustomobject] -or
+            (
+                $entryShape -cne 'kind|path|sha256' -and
+                $entryShape -cne 'allowed_argv_sha256|kind|path|sha256'
+            ) -or
+            $entry.kind -isnot [string] -or
             [string]$entry.kind -cne 'local' -or
+            $entry.path -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$entry.path) -or
+            $entry.sha256 -isnot [string] -or
             [string]$entry.sha256 -cnotmatch '^[0-9a-f]{64}$'
         ) {
             return $null
+        }
+        $approvalProperty = $entry.PSObject.Properties['allowed_argv_sha256']
+        if ($null -ne $approvalProperty) {
+            $approvalValues = $approvalProperty.Value
+            if ($approvalValues -isnot [System.Array] -or $approvalValues.Count -gt 256) {
+                return $null
+            }
+            $observedApprovals = @{}
+            foreach ($approval in @($approvalValues)) {
+                if (
+                    $approval -isnot [string] -or
+                    [string]$approval -cnotmatch '^[0-9a-f]{64}$' -or
+                    $observedApprovals.ContainsKey([string]$approval)
+                ) {
+                    return $null
+                }
+                $observedApprovals[[string]$approval] = $true
+            }
         }
         $candidate = [string]$entry.path
         if (-not [IO.Path]::IsPathRooted($candidate)) { return $null }

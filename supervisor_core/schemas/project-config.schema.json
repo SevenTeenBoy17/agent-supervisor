@@ -29,6 +29,7 @@
     },
     "agent_roles": {
       "type": "array",
+      "maxItems": 128,
       "items": {"$ref": "#/$defs/capability"}
     },
     "capabilities": {
@@ -38,7 +39,7 @@
     "privacy": {
       "type": "object",
       "properties": {
-        "persist_raw_prompts": {"const": false},
+        "persist_raw_prompts": {"const": false, "default": false},
         "persist_raw_command_arguments": {"const": false},
         "redact_before_persist": {"const": true}
       },

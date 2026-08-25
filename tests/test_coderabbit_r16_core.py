@@ -12,12 +12,14 @@ from pathlib import Path
 import pytest
 
 from supervisor_core import cli as cli_module
+from supervisor_core import executable_trust as trust_module
 from supervisor_core import lifecycle as lifecycle_module
 from supervisor_core.contracts import invocation_event
 from supervisor_core.discovery import _version_key
 from supervisor_core.executable_trust import (
     load_trusted_executable_registry,
     registry_public_record,
+    trusted_command_approval_sha256,
 )
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
@@ -42,14 +44,47 @@ def _messages(state: dict, events: list[dict]) -> list[str]:
     return validate_state(state, events)["errors"]
 
 
-def _trusted_python_registry_record() -> dict:
+def _trusted_python_registry_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> dict:
     executable = Path(sys.executable).resolve(strict=True)
+    canonical_command = [str(executable), *command[1:]]
+    assert command == canonical_command
+    approval = trusted_command_approval_sha256(canonical_command)
+    registry_path = tmp_path / "machine-policy" / "trusted-executables.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "contract": "TrustedExecutableRegistry/v1",
+                "entries": {
+                    "python": {
+                        "kind": "local",
+                        "path": str(executable),
+                        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                        "allowed_argv_sha256": [approval],
+                    }
+                },
+                "generated_at": "2026-08-25T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        trust_module,
+        "trusted_executable_registry_path",
+        lambda: registry_path,
+    )
     record = registry_public_record(load_trusted_executable_registry())
     python_entry = record["entries"]["python"]
     assert python_entry == {
         "kind": "local",
         "path": str(executable),
         "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "allowed_argv_sha256": [approval],
     }
     return record
 
@@ -222,10 +257,23 @@ def test_gate_evidence_retains_hashes_without_persisting_captured_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sentinel = "sk-R16-SENTINEL-7F29"
-    monkeypatch.setenv("R16_GATE_SENTINEL", sentinel)
     monkeypatch.setattr(cli_module, "_MAX_GATE_CAPTURE_BYTES", 32)
     assert len(sentinel.encode("utf-8")) < cli_module._MAX_GATE_CAPTURE_BYTES
-    trusted_registry = _trusted_python_registry_record()
+    gate_command = [
+        str(Path(sys.executable).resolve(strict=True)),
+        "-B",
+        "-c",
+        (
+            "import sys; "
+            "sys.stdout.write('x'*200000); "
+            "sys.stderr.write('sk-' + 'R16-SENTINEL-7F29')"
+        ),
+    ]
+    trusted_registry = _trusted_python_registry_record(
+        tmp_path,
+        monkeypatch,
+        gate_command,
+    )
     ctx = _context(tmp_path, "gate")
     state = start_round(
         ctx,
@@ -237,16 +285,7 @@ def test_gate_evidence_retains_hashes_without_persisting_captured_secret(
             "common_gates": [
                 {
                     "id": "gate.r16",
-                    "command": [
-                        sys.executable,
-                        "-B",
-                        "-c",
-                        (
-                            "import os,sys; "
-                            "sys.stdout.write('x'*200000); "
-                            "sys.stderr.write(os.environ['R16_GATE_SENTINEL'])"
-                        ),
-                    ],
+                    "command": gate_command,
                 }
             ]
         },

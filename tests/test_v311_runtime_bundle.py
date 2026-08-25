@@ -18,13 +18,37 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ADAPTER_SCRIPTS = (
-    Path(os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME", Path.home()))
-    / ".codex"
-    / "skills"
-    / "dev-supervisor"
-    / "scripts"
-)
+INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
+
+
+def _resolve_adapter_scripts() -> Path:
+    review_bundle = ROOT.parent
+    if (review_bundle / "REVIEW_MANIFEST.json").is_file():
+        scripts = review_bundle / "global-codex" / "scripts"
+    else:
+        installed_opt_in = os.environ.get(INSTALLED_ADAPTER_TEST_ENV)
+        if installed_opt_in not in {None, "1"}:
+            raise RuntimeError(f"{INSTALLED_ADAPTER_TEST_ENV} must be exactly '1' when set")
+        if installed_opt_in == "1":
+            configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
+            install_home = Path(configured).resolve() if configured else Path.home().resolve()
+            scripts = install_home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+        else:
+            scripts = ROOT / "integrations" / "codex" / "scripts"
+    required = {
+        "codex-supervisor-hook.py",
+        "supervisor-core.ps1",
+        "supervisor-process-job.py",
+    }
+    missing = sorted(name for name in required if not (scripts / name).is_file())
+    if missing:
+        raise RuntimeError(
+            f"Codex adapter sources under test are incomplete at {scripts}: {', '.join(missing)}"
+        )
+    return scripts
+
+
+ADAPTER_SCRIPTS = _resolve_adapter_scripts()
 MANIFEST_MEMBER = "SUPERVISOR-RUNTIME-MANIFEST.json"
 POINTER_CONTRACT = "ActiveVersionPointer/v4"
 IDENTITY_CONTRACT = "SupervisorReleaseIdentity/v1"
@@ -824,7 +848,20 @@ def test_pointer_bundle_and_frame_contracts_are_wired_through_all_native_entrypo
 
 
 def test_current_install_pointer_uses_full_v4_release_identity() -> None:
-    pointer = json.loads((ROOT / "active-version.json").read_text(encoding="utf-8"))
+    review_bundle_mode = (ROOT.parent / "REVIEW_MANIFEST.json").is_file()
+    if review_bundle_mode:
+        pointer_path = ROOT / "active-version.json"
+    else:
+        if os.environ.get(INSTALLED_ADAPTER_TEST_ENV) != "1":
+            pytest.skip(
+                f"installed-adapter-only check requires explicit {INSTALLED_ADAPTER_TEST_ENV}=1"
+            )
+        configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
+        install_home = Path(configured).resolve() if configured else Path.home().resolve()
+        pointer_path = install_home / ".agent-supervisor" / "active-version.json"
+    if not pointer_path.is_file():
+        pytest.fail(f"explicit installed adapter pointer is unavailable: {pointer_path}")
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     assert pointer["contract"] == POINTER_CONTRACT
     assert set(pointer) == {"contract", "active", "previous"}
     for name in ("active", "previous"):

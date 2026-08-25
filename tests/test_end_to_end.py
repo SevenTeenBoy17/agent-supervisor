@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,7 @@ import supervisor_core.workspace as workspace_module
 from supervisor_core.executable_trust import (
     load_trusted_executable_registry,
     registry_public_record,
+    trusted_command_approval_sha256,
 )
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
@@ -28,8 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _trusted_python_path() -> Path:
-    registry = json.loads((ROOT / "trusted-executables.json").read_text(encoding="utf-8"))
-    return Path(registry["entries"]["python"]["path"]).resolve(strict=True)
+    return Path(sys.executable).resolve(strict=True)
 
 
 def _git_fixture_env() -> dict[str, str]:
@@ -56,15 +57,25 @@ def _write_install_source_fixture(home: Path) -> None:
 def _write_trusted_executable_registry(
     install_home: Path,
     entries: dict[str, Path] | None = None,
+    approved_commands: list[list[str]] | None = None,
 ) -> None:
+    _write_install_source_fixture(install_home)
     if entries is None:
-        source = json.loads((ROOT / "trusted-executables.json").read_text(encoding="utf-8"))
-        selected = {
-            name: Path(source["entries"][name]["path"])
-            for name in ("git", "python")
-        }
+        git_path = shutil.which("git")
+        if not git_path:
+            raise AssertionError("git executable unavailable for test fixture")
+        selected = {"git": Path(git_path), "python": _trusted_python_path()}
     else:
         selected = entries
+    approvals_by_path: dict[str, list[str]] = {}
+    for raw_command in approved_commands or []:
+        canonical = [
+            str(Path(raw_command[0]).resolve(strict=True)),
+            *[str(item) for item in raw_command[1:]],
+        ]
+        approvals_by_path.setdefault(os.path.normcase(canonical[0]), []).append(
+            trusted_command_approval_sha256(canonical)
+        )
     registry = {
         "contract": "TrustedExecutableRegistry/v1",
         "entries": {
@@ -72,6 +83,9 @@ def _write_trusted_executable_registry(
                 "kind": "local",
                 "path": str(path.resolve(strict=True)),
                 "sha256": sha256_file(path.resolve(strict=True)),
+                "allowed_argv_sha256": sorted(set(approvals_by_path.get(
+                    os.path.normcase(str(path.resolve(strict=True))), []
+                ))),
             }
             for name, path in selected.items()
         },
@@ -82,7 +96,11 @@ def _write_trusted_executable_registry(
     target.write_text(json.dumps(registry, sort_keys=True), encoding="utf-8")
 
 
-def _write_healthy_skill_fixture(home: Path) -> None:
+def _write_healthy_skill_fixture(
+    home: Path,
+    *,
+    approved_commands: list[list[str]] | None = None,
+) -> None:
     contents = (
         "---\n"
         "name: dev-supervisor\n"
@@ -95,7 +113,7 @@ def _write_healthy_skill_fixture(home: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(contents, encoding="utf-8")
     _write_install_source_fixture(home)
-    _write_trusted_executable_registry(home)
+    _write_trusted_executable_registry(home, approved_commands=approved_commands)
 
 
 def _write_release_root_fixture(path: Path, version: str) -> dict[str, str]:
@@ -230,7 +248,8 @@ def run_hook(event: str, payload: dict, env: dict[str, str], expected: int = 0) 
 
 
 def _run_authorized_gate(ctx: StateContext, payload: dict):
-    if not isinstance(ctx.load().get("trusted_executable_registry"), dict):
+    current = ctx.load()
+    if not isinstance(current.get("trusted_executable_registry"), dict):
         ctx.update(
             lambda current: current.update({
                 "trusted_executable_registry": registry_public_record(
@@ -238,6 +257,9 @@ def _run_authorized_gate(ctx: StateContext, payload: dict):
                 )
             })
         )
+        current = ctx.load()
+    if not isinstance(current.get("supervisor_source_snapshot"), dict):
+        cli_module._initialize_cli_source_snapshot(ctx, current, shadow=False)
     request = {
         key: payload["record"][key]
         for key in ("gate_id", "criterion_id", "evidence_id")
@@ -251,7 +273,9 @@ def _run_authorized_gate(ctx: StateContext, payload: dict):
     return result
 
 
-def test_gate_runner_attests_registered_argv_and_resolved_executable(tmp_path):
+def test_gate_runner_attests_registered_argv_and_resolved_executable(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / "Windows shim workspace"
     workspace.mkdir()
     ctx = StateContext.build(
@@ -264,6 +288,12 @@ def test_gate_runner_attests_registered_argv_and_resolved_executable(tmp_path):
     )
     trusted_python = _trusted_python_path()
     registered = [str(trusted_python), "-c", "print('executable attested')"]
+    install_home = tmp_path / "trusted-machine-policy"
+    _write_trusted_executable_registry(
+        install_home,
+        approved_commands=[registered],
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
     start_round(
         ctx,
         message="run registered shim gate",
@@ -298,7 +328,9 @@ def test_gate_runner_attests_registered_argv_and_resolved_executable(tmp_path):
     assert any("does not match the locally attested core execution" in error for error in errors)
 
 
-def test_gate_precondition_is_attested_and_failure_prevents_main_command(tmp_path):
+def test_gate_precondition_is_attested_and_failure_prevents_main_command(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / "precondition workspace"
     workspace.mkdir()
     marker = workspace / "main-command-ran"
@@ -317,6 +349,12 @@ def test_gate_precondition_is_attested_and_failure_prevents_main_command(tmp_pat
         "-c",
         f"from pathlib import Path; Path({str(marker)!r}).write_text('unsafe')",
     ]
+    install_home = tmp_path / "trusted-machine-policy"
+    _write_trusted_executable_registry(
+        install_home,
+        approved_commands=[precondition, command],
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
     start_round(
         ctx,
         message="prove ordered gate setup",
@@ -347,7 +385,7 @@ def test_gate_precondition_is_attested_and_failure_prevents_main_command(tmp_pat
     assert ctx.load()["evidence"] == []
 
 
-def test_gate_success_attests_precondition_and_main_command(tmp_path):
+def test_gate_success_attests_precondition_and_main_command(tmp_path, monkeypatch):
     workspace = tmp_path / "successful precondition workspace"
     workspace.mkdir()
     ctx = StateContext.build(
@@ -361,6 +399,12 @@ def test_gate_success_attests_precondition_and_main_command(tmp_path):
     trusted_python = str(_trusted_python_path())
     precondition = [trusted_python, "-c", "print('SETUP_PASS')"]
     command = [trusted_python, "-c", "print('MAIN_PASS')"]
+    install_home = tmp_path / "trusted-machine-policy"
+    _write_trusted_executable_registry(
+        install_home,
+        approved_commands=[precondition, command],
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
     start_round(
         ctx,
         message="prove ordered successful gate",
@@ -415,6 +459,10 @@ def test_windows_gate_resolution_never_prefers_workspace_local_cmd(
     _write_trusted_executable_registry(
         install_home,
         {Path(registered[0]).name.casefold(): trusted_shim},
+        approved_commands=[[
+            str(trusted_shim.resolve(strict=True)),
+            *registered[1:],
+        ]],
     )
     monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
 
@@ -460,6 +508,7 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
     project_schema, quality_schema = _write_config_schemas(supervisor_dir)
+    gate_command = [str(_trusted_python_path()), "-c", "print('E2E_GATE_PASS')"]
     project_file.write_text(json.dumps({
         "$schema": project_schema,
         "project_id": "e2e",
@@ -470,7 +519,7 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
         "$schema": quality_schema,
         **_trusted_quality_controls(),
         "global_gates": ["gate.e2e"],
-        "common_gates": [{"id": "gate.e2e", "command": [str(_trusted_python_path()), "-c", "print('E2E_GATE_PASS')"]}],
+        "common_gates": [{"id": "gate.e2e", "command": gate_command}],
         "domains": {"config/agent": {"required_gates": ["gate.e2e"]}},
         "profiles": {"config_agent": {"applies_to": ["config.json"], "gates": []}},
     }), encoding="utf-8")
@@ -488,7 +537,10 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
     isolated_home.mkdir()
     _write_healthy_skill_fixture(isolated_home)
     _write_install_source_fixture(install_home)
-    _write_trusted_executable_registry(install_home)
+    _write_trusted_executable_registry(
+        install_home,
+        approved_commands=[gate_command],
+    )
     env["AGENT_SUPERVISOR_ATTESTATION_KEY_FILE"] = str(tmp_path / "attestation.key")
     env["USERPROFILE"] = str(isolated_home)
     env["HOME"] = str(isolated_home)
@@ -505,7 +557,10 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
     intents = [{"intent_id": "intent-e2e", "text": "implement and verify", "domain": "config-agent", "status": "deferred", "reason": "awaiting verified builder result", "capability_ids": ["builder"], "phase": 1}]
     started = run_cli(["start", *common, "--message", "implement and verify", "--change-mode", "replace", "--execution-mode", "enforce", "--goal-json", json.dumps(goal), "--intents-json", json.dumps(intents)], env)
     state_file = Path(started["state_file"])
-    baseline = json.loads(state_file.read_text(encoding="utf-8"))["workspace_baseline"]
+    started_state = json.loads(state_file.read_text(encoding="utf-8"))
+    baseline = started_state["workspace_baseline"]
+    active_goal_id = started_state["goal"]["goal_id"]
+    active_criterion_id = started_state["goal"]["acceptance_criteria"][0]["criterion_id"]
     hook_common = {"session_id": "e2e-session", "cwd": str(workspace)}
     run_hook("PreToolUse", {
         **hook_common, "tool_use_id": "invocation-e2e", "tool_name": "builder",
@@ -548,11 +603,16 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
         },
     }, env)
     gate = event("gate_run", {
-        "gate_id": "gate.e2e", "criterion_id": "criterion-e2e", "evidence_id": "evidence-e2e",
+        "gate_id": "gate.e2e", "criterion_id": active_criterion_id, "evidence_id": "evidence-e2e",
         "collector_responsibility_group": "independent-quality-review",
         "collector_invocation_id": "gate-invocation-e2e",
     }, actor="gate-runner")
     assert gate["exit_code"] == 0
+    event("intent_disposition", {
+        "intent_id": "intent-e2e", "status": "covered",
+        "reason": "bound core-collected gate evidence", "capability_ids": ["builder"],
+        "method": "capability", "phase": 1, "evidence_ids": ["evidence-e2e"],
+    })
     run_hook("PostToolUse", {
         **hook_common, "tool_use_id": "gate-invocation-e2e", "tool_name": "independent-gate-runner",
         "agent_id": "gate-runner", "tool_input": {
@@ -561,8 +621,8 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
         }, "success": True,
     }, env)
     event("task_record", {
-        "task_id": "task-e2e", "goal_id": "goal-e2e", "goal_version": 1,
-        "criterion_ids": ["criterion-e2e"], "allowed_paths": ["config.json"],
+        "task_id": "task-e2e", "goal_id": active_goal_id, "goal_version": 1,
+        "criterion_ids": [active_criterion_id], "allowed_paths": ["config.json"],
         "expected_evidence": ["gate.e2e"], "status": "done", "evidence_ids": ["evidence-e2e"],
     })
     event("spec_record", {"status": "approved", "hash": "a" * 64, "path": "spec.md", "content": "Exact e2e contract"})
@@ -581,7 +641,7 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
         }, "success": True,
     }, env)
     event("review_finalize", {
-        "contract": "ReviewRecord/v3", "review_id": "review-e2e", "goal_id": "goal-e2e", "goal_version": 1,
+        "contract": "ReviewRecord/v3", "review_id": "review-e2e", "goal_id": active_goal_id, "goal_version": 1,
         "reviewer": "reviewer", "reviewer_responsibility_group": "independent-quality-reviewer",
         "implementer": "worker", "implementer_responsibility_group": "implementation",
         "gate_collector": "gate-runner", "gate_collector_responsibility_group": "independent-quality-review",
@@ -604,13 +664,18 @@ def test_real_cli_round_reaches_complete_only_with_signed_gate_and_independent_r
     assert persisted["evidence"][0]["execution_id"]
 
 
-def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(tmp_path):
+def test_public_gate_cli_requires_approval_after_two_global_failures(tmp_path):
     workspace = tmp_path / "rollback workspace"
     supervisor_dir = workspace / ".agent-supervisor"
     supervisor_dir.mkdir(parents=True)
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
     project_schema, quality_schema = _write_config_schemas(supervisor_dir)
+    gate_command = [
+        str(_trusted_python_path()),
+        "-c",
+        "import time; time.sleep(0.15); raise SystemExit(1)",
+    ]
     project_file.write_text(json.dumps({
         "$schema": project_schema,
         "project_id": "rollback-e2e", "quality_profile": "quality.json",
@@ -622,7 +687,7 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
         "global_gates": ["gate.fail"],
         "common_gates": [{
             "id": "gate.fail",
-            "command": [str(_trusted_python_path()), "-c", "import time; time.sleep(0.15); raise SystemExit(1)"],
+            "command": gate_command,
         }],
     }), encoding="utf-8")
 
@@ -638,7 +703,10 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
     }), encoding="utf-8")
     env = _git_fixture_env()
     isolated_home = tmp_path / "home"
-    _write_healthy_skill_fixture(isolated_home)
+    _write_healthy_skill_fixture(
+        isolated_home,
+        approved_commands=[gate_command],
+    )
     env["USERPROFILE"] = str(isolated_home)
     env["HOME"] = str(isolated_home)
     env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
@@ -660,12 +728,16 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
         ))
     assert len(concurrent_results) == 2
     active = json.loads(pointer.read_text(encoding="utf-8"))["active"]
-    assert active["version"] == "3.0.0"
+    assert active["version"] == "3.1.0"
     state = run_cli(["query", *common], env)
-    assert state["rollout"]["rollback"]["performed"] is True
-    assert state["rollout"]["rollback"]["attempted"] is True
-    assert state["rollout"]["rollback"]["attempt_count"] == 1
-    assert state["rollout"]["rollback"]["expected_active"]["version"] == "3.1.0"
+    rollback = state["rollout"]["rollback"]
+    assert rollback["required"] is True
+    assert rollback["performed"] is False
+    assert rollback["attempted"] is False
+    assert rollback["claim_status"] == "approval_required"
+    assert rollback["reason"] == "explicit-human-approval-required"
+    assert rollback["expected_active"]["version"] == "3.1.0"
+    assert state["health"] == "degraded"
     assert set(json.loads(pointer.read_text(encoding="utf-8"))) == {
         "contract", "active", "previous",
     }
@@ -682,15 +754,15 @@ def test_public_gate_cli_performs_automatic_rollback_after_two_global_failures(t
     run_cli_authorized_gate(common, env, invocation_id="rollback-gate-replay", actor="reviewer", record=gate_record, expected=2)
     replayed_state = run_cli(["query", *common], env)
     replayed_pointer = json.loads(pointer.read_text(encoding="utf-8"))
-    assert replayed_pointer["active"]["version"] == "3.0.0"
-    assert replayed_pointer["previous"]["version"] == "3.1.0"
-    assert replayed_state["rollout"]["rollback"]["performed"] is True
-    assert replayed_state["rollout"]["rollback"]["attempt_count"] == 1
+    assert replayed_pointer["active"]["version"] == "3.1.0"
+    assert replayed_pointer["previous"]["version"] == "3.0.0"
+    assert replayed_state["rollout"]["rollback"]["required"] is True
+    assert replayed_state["rollout"]["rollback"]["performed"] is False
+    assert replayed_state["rollout"]["rollback"]["claim_status"] == "approval_required"
 
 
-@pytest.mark.parametrize("pointer_effect_before_recovery", [False, True])
-def test_stale_rollback_claim_recovers_before_or_after_pointer_effect(
-    tmp_path, monkeypatch, pointer_effect_before_recovery
+def test_repeated_failed_gate_observations_require_approval_and_preserve_pointer(
+    tmp_path, monkeypatch
 ):
     workspace = tmp_path / "rollback recovery workspace"
     workspace.mkdir()
@@ -706,6 +778,13 @@ def test_stale_rollback_claim_recovers_before_or_after_pointer_effect(
     }), encoding="utf-8")
     monkeypatch.setenv("AGENT_SUPERVISOR_ACTIVE_POINTER", str(pointer))
     monkeypatch.setenv("AGENT_SUPERVISOR_ATTESTATION_KEY_FILE", str(tmp_path / "recovery-attestation.key"))
+    gate_command = [str(_trusted_python_path()), "-c", "raise SystemExit(1)"]
+    install_home = tmp_path / "trusted-machine-policy"
+    _write_trusted_executable_registry(
+        install_home,
+        approved_commands=[gate_command],
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
 
     ctx = StateContext.build(
         runtime="codex",
@@ -717,11 +796,11 @@ def test_stale_rollback_claim_recovers_before_or_after_pointer_effect(
     )
     quality = {
         "global_gates": ["gate.fail"],
-        "common_gates": [{"id": "gate.fail", "command": [str(_trusted_python_path()), "-c", "raise SystemExit(1)"]}],
+        "common_gates": [{"id": "gate.fail", "command": gate_command}],
     }
     start_round(
         ctx,
-        message="recover a claimed rollback",
+        message="require explicit approval for rollback",
         change_mode="replace",
         execution_mode="warn",
         project_config={
@@ -739,47 +818,18 @@ def test_stale_rollback_claim_recovers_before_or_after_pointer_effect(
             "collector_responsibility_group": "quality",
         },
     }
-    assert _run_authorized_gate(ctx, payload)[2] == 2
-    real_rollback = cli_module.rollback_active_version
-
-    def crash_before_effect(*, expected_active=None):
-        raise SystemExit("simulated process crash after claim")
-
-    monkeypatch.setattr(cli_module, "rollback_active_version", crash_before_effect)
-    with pytest.raises(SystemExit, match="simulated process crash"):
-        _run_authorized_gate(ctx, payload)
-    claimed = ctx.load_project_rollout()["rollback"]
-    assert claimed["claim_status"] == "in_progress"
-    assert claimed["attempt_count"] == 1
-    assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "3.1.0"
-    if pointer_effect_before_recovery:
-        effect = real_rollback(expected_active=claimed["expected_active"])
-        assert effect["performed"] is True
-        assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "3.0.0"
-
-    def expire_claim(current_rollout):
-        current_rollout["rollback"]["claim_expires_at"] = "2000-01-01T00:00:00.000Z"
-        return current_rollout
-
-    ctx.update_project_rollout(expire_claim)
-    monkeypatch.setattr(cli_module, "rollback_active_version", real_rollback)
-    assert _run_authorized_gate(ctx, payload)[2] == 2
-    recovered = ctx.load_project_rollout()["rollback"]
+    for _ in range(3):
+        assert _run_authorized_gate(ctx, payload)[2] == 2
+    rollback = ctx.load_project_rollout()["rollback"]
     recovered_pointer = json.loads(pointer.read_text(encoding="utf-8"))
-    assert recovered_pointer["active"]["version"] == "3.0.0"
-    if pointer_effect_before_recovery:
-        assert recovered == {"required": False, "performed": False, "target": None}
-        archived = ctx.load_project_rollout()["rollback_history"][-1]
-        assert archived["claim_status"] == "retriable"
-        assert archived["reason"] == "active-version-cas-mismatch"
-        assert archived["attempt_count"] == 2
-        assert archived["recovery_count"] == 1
-        assert archived["reset_reason"] == "claim-active-version-cas-mismatch"
-    else:
-        assert recovered["claim_status"] == "completed"
-        assert recovered["performed"] is True
-        assert recovered["attempt_count"] == 2
-        assert recovered["recovery_count"] == 1
+    assert recovered_pointer["active"]["version"] == "3.1.0"
+    assert recovered_pointer["previous"]["version"] == "3.0.0"
+    assert rollback["required"] is True
+    assert rollback["performed"] is False
+    assert rollback["attempted"] is False
+    assert rollback["claim_status"] == "approval_required"
+    assert rollback["reason"] == "explicit-human-approval-required"
+    assert not hasattr(cli_module, "rollback_active_version")
 
 
 def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(tmp_path):
@@ -789,6 +839,7 @@ def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(t
     project_file = supervisor_dir / "project.json"
     quality_file = supervisor_dir / "quality.json"
     project_schema, quality_schema = _write_config_schemas(supervisor_dir)
+    gate_command = [str(_trusted_python_path()), "-c", "raise SystemExit(1)"]
     project_file.write_text(json.dumps({
         "$schema": project_schema,
         "project_id": "identity-bound-rollback",
@@ -799,12 +850,15 @@ def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(t
         "$schema": quality_schema,
         **_trusted_quality_controls(),
         "global_gates": ["gate.fail"],
-        "common_gates": [{"id": "gate.fail", "command": [str(_trusted_python_path()), "-c", "raise SystemExit(1)"]}],
+        "common_gates": [{"id": "gate.fail", "command": gate_command}],
     }), encoding="utf-8")
     pointer = tmp_path / "active-version.json"
     env = _git_fixture_env()
     isolated_home = tmp_path / "home"
-    _write_healthy_skill_fixture(isolated_home)
+    _write_healthy_skill_fixture(
+        isolated_home,
+        approved_commands=[gate_command],
+    )
     env["USERPROFILE"] = str(isolated_home)
     env["HOME"] = str(isolated_home)
     env["AGENT_SUPERVISOR_ACTIVE_POINTER"] = str(pointer)
@@ -846,6 +900,9 @@ def test_unbound_failures_do_not_roll_back_new_release_until_its_own_threshold(t
 
     run_cli_authorized_gate(common, env, invocation_id="identity-gate-4", actor="reviewer", record=gate_record, expected=2)
     after_threshold = run_cli(["query", *common], env)["rollout"]
-    assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "3.0.1"
-    assert after_threshold["rollback"]["performed"] is True
+    assert json.loads(pointer.read_text(encoding="utf-8"))["active"]["version"] == "4.0.0"
+    assert after_threshold["rollback"]["required"] is True
+    assert after_threshold["rollback"]["performed"] is False
+    assert after_threshold["rollback"]["attempted"] is False
+    assert after_threshold["rollback"]["claim_status"] == "approval_required"
     assert after_threshold["rollback"]["expected_active"]["version"] == "4.0.0"

@@ -9,6 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
 
 
 def test_both_adapter_roots_absent_are_reported_unavailable(tmp_path: Path) -> None:
@@ -38,40 +39,38 @@ def _validate_adapter_roots(
     return None
 
 
-def _resolve_script() -> tuple[Path | None, str | None]:
+def _resolve_script() -> Path:
     review_bundle = ROOT.parent
     review_bundle_mode = (review_bundle / "REVIEW_MANIFEST.json").is_file()
+    installed_opt_in = os.environ.get(INSTALLED_ADAPTER_TEST_ENV)
+    if installed_opt_in not in {None, "1"}:
+        raise RuntimeError(f"{INSTALLED_ADAPTER_TEST_ENV} must be exactly '1' when set")
     configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
     if review_bundle_mode:
         codex_root = review_bundle / "global-codex"
         claude_root = review_bundle / "global-claude"
-    else:
-        if configured:
-            install_home = Path(configured).resolve()
-        elif ROOT.name == ".agent-supervisor":
-            install_home = ROOT.parent
-        else:
-            install_home = Path.home()
+    elif installed_opt_in == "1":
+        install_home = Path(configured).resolve() if configured else Path.home().resolve()
         codex_root = install_home / ".codex" / "skills" / "dev-supervisor"
         claude_root = install_home / ".claude" / "skills" / "supervisor"
-    installation_expected = review_bundle_mode or bool(configured)
+    else:
+        codex_root = ROOT / "integrations" / "codex"
+        claude_root = ROOT / "integrations" / "claude"
     unavailable = _validate_adapter_roots(
-        (codex_root, claude_root), installation_expected=installation_expected
+        (codex_root, claude_root), installation_expected=True
     )
     if unavailable:
-        return None, unavailable
+        raise RuntimeError(unavailable)
     candidate = claude_root / "scripts" / "sup-discover.py"
     if not candidate.is_file():
         raise RuntimeError(f"sup-discover adapter under test is missing: {candidate}")
-    return candidate, None
+    return candidate
 
 
-SCRIPT, _ADAPTER_SKIP_REASON = _resolve_script()
+SCRIPT = _resolve_script()
 
 
 def _load_module():
-    if SCRIPT is None:
-        pytest.skip(_ADAPTER_SKIP_REASON or "legacy discovery adapter is unavailable")
     spec = importlib.util.spec_from_file_location("legacy_sup_discover_under_test", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

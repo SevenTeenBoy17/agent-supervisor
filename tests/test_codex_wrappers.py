@@ -4,6 +4,7 @@ import base64
 import copy
 import json
 import hashlib
+import io
 import os
 import re
 import runpy
@@ -18,17 +19,24 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
+from supervisor_core.executable_trust import trusted_command_approval_sha256
 from supervisor_core import workspace as workspace_module
 from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.workspace import capture_workspace_snapshot, workspace_delta
 
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
 
 
 def _trusted_python_path() -> Path:
-    registry = json.loads((ROOT / "trusted-executables.json").read_text(encoding="utf-8"))
-    return Path(registry["entries"]["python"]["path"]).resolve(strict=True)
+    return Path(sys.executable).resolve(strict=True)
+
+
+def _host_executable_path(name: str) -> Path:
+    candidate = sys.executable if name == "python" else shutil.which(name)
+    assert candidate is not None, f"required host executable is unavailable: {name}"
+    return Path(candidate).resolve(strict=True)
 
 
 def _write_trusted_executable_registry(
@@ -37,28 +45,31 @@ def _write_trusted_executable_registry(
     names: tuple[str, ...] = ("git", "python"),
 ) -> Path:
     """Create a strict fixture registry from executables verified on this host."""
-    source = json.loads(
-        (ROOT / "trusted-executables.json").read_text(encoding="utf-8")
-    )
-    entries: dict[str, dict[str, str]] = {}
+    entries: dict[str, dict[str, object]] = {}
     for name in names:
-        source_entry = source["entries"][name]
-        assert source_entry["kind"] == "local"
-        executable = Path(source_entry["path"]).resolve(strict=True)
+        executable = _host_executable_path(name)
         hasher = hashlib.sha256()
         with executable.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
                 hasher.update(chunk)
-        assert hasher.hexdigest() == source_entry["sha256"]
-        entries[name] = {
+        entry: dict[str, object] = {
             "kind": "local",
             "path": str(executable),
             "sha256": hasher.hexdigest(),
         }
+        if name == "python":
+            entry["allowed_argv_sha256"] = [
+                trusted_command_approval_sha256([
+                    str(executable),
+                    "-c",
+                    "print('WRAPPER_GATE_PASS')",
+                ])
+            ]
+        entries[name] = entry
     registry = {
         "contract": "TrustedExecutableRegistry/v1",
         "entries": entries,
-        "generated_at": source["generated_at"],
+        "generated_at": "2026-08-25T00:00:00Z",
     }
     target = home / ".agent-supervisor" / "trusted-executables.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,29 +83,24 @@ def _write_trusted_executable_registry(
 def _resolve_adapter_roots() -> tuple[Path, Path]:
     review_bundle = ROOT.parent
     review_bundle_mode = (review_bundle / "REVIEW_MANIFEST.json").is_file()
+    installed_opt_in = os.environ.get(INSTALLED_ADAPTER_TEST_ENV)
+    if installed_opt_in not in {None, "1"}:
+        raise RuntimeError(f"{INSTALLED_ADAPTER_TEST_ENV} must be exactly '1' when set")
     configured = os.environ.get("AGENT_SUPERVISOR_INSTALL_HOME")
     if review_bundle_mode:
         codex_root = review_bundle / "global-codex"
         claude_root = review_bundle / "global-claude"
-    else:
-        if configured:
-            install_home = Path(configured).resolve()
-        elif ROOT.name == ".agent-supervisor":
-            install_home = ROOT.parent
-        else:
-            install_home = Path.home()
+    elif installed_opt_in == "1":
+        install_home = Path(configured).resolve() if configured else Path.home().resolve()
         codex_root = install_home / ".codex" / "skills" / "dev-supervisor"
         claude_root = install_home / ".claude" / "skills" / "supervisor"
+    else:
+        codex_root = ROOT / "integrations" / "codex"
+        claude_root = ROOT / "integrations" / "claude"
     root_exists = (codex_root.exists(), claude_root.exists())
-    installation_expected = review_bundle_mode or bool(configured)
     if not any(root_exists):
-        if not installation_expected:
-            pytest.skip(
-                "global Claude/Codex adapters are not installed on this host",
-                allow_module_level=True,
-            )
         raise RuntimeError(
-            f"expected adapter installation unavailable: {(codex_root, claude_root)}"
+            f"expected adapter sources unavailable: {(codex_root, claude_root)}"
         )
     if not all(root_exists):
         raise RuntimeError(
@@ -132,27 +138,24 @@ def _isolate_inherited_git_repository(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_unconfigured_missing_adapter_roots_skip_but_expected_or_partial_fail(
+def test_repository_adapter_sources_are_default_and_installed_sources_require_opt_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    empty_home = tmp_path / "empty-home"
-    empty_home.mkdir()
-    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path / "shared-core")
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty_home))
-    monkeypatch.delenv("AGENT_SUPERVISOR_INSTALL_HOME", raising=False)
-
-    with pytest.raises(pytest.skip.Exception):
-        _resolve_adapter_roots()
-
     configured_home = tmp_path / "configured-home"
     monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(configured_home))
-    with pytest.raises(RuntimeError, match="expected adapter installation unavailable"):
+    monkeypatch.delenv(INSTALLED_ADAPTER_TEST_ENV, raising=False)
+    assert _resolve_adapter_roots() == (
+        ROOT / "integrations" / "codex",
+        ROOT / "integrations" / "claude",
+    )
+
+    monkeypatch.setenv(INSTALLED_ADAPTER_TEST_ENV, "1")
+    with pytest.raises(RuntimeError, match="expected adapter sources unavailable"):
         _resolve_adapter_roots()
 
-    monkeypatch.delenv("AGENT_SUPERVISOR_INSTALL_HOME")
-    (empty_home / ".codex" / "skills" / "dev-supervisor").mkdir(parents=True)
-    with pytest.raises(RuntimeError, match="partial adapter installation"):
+    monkeypatch.setenv(INSTALLED_ADAPTER_TEST_ENV, "true")
+    with pytest.raises(RuntimeError, match="must be exactly '1'"):
         _resolve_adapter_roots()
 
 
@@ -437,7 +440,7 @@ def test_gate_adapter_forwards_only_structured_contract_exit_codes(
 
 
 def _write_record(path: Path, record: dict) -> None:
-    path.write_text(json.dumps({"record": record}, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
 
 
 def test_installed_ledger_template_is_schema_valid():
@@ -772,7 +775,7 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
             _run_script("supervisor-event.ps1", arguments, env=env)
 
     review_file = records / "review.json"
-    _write_record(review_file, {
+    _write_record(review_file, {"record": {
         "contract": "ReviewRecord/v3", "review_id": "review-wrapper",
         "goal_id": goal_id, "goal_version": goal_version,
         "reviewer": "codex-reviewer", "reviewer_responsibility_group": "independent-quality-reviewer",
@@ -788,7 +791,7 @@ def test_powershell_thin_adapters_complete_with_explicit_audit_without_overclaim
         "evidence_verification": {"status": "VERIFIED", "reviewer": "codex-reviewer", "evidence_ids": evidence_ids},
         "verdict": "APPROVE", "category": "config-agent",
         "implementer_invocation_id": "invocation-wrapper", "reviewer_invocation_id": "review-invocation-wrapper",
-    })
+    }})
     rejected_review = _run_script(
         "supervisor-event.ps1",
         [*common, "-Event", "review_finalize", "-DataFile", str(review_file), "-Actor", "codex-reviewer"],
@@ -914,10 +917,13 @@ def test_powershell_bootstrap_forwards_structured_goal_and_intents_files(tmp_pat
         env=env,
     )
     state = json.loads(Path(started["state_file"]).read_text(encoding="utf-8"))
-    assert state["goal"]["objective"] == "Implement the typed UI contract"
-    assert state["goal"]["scope"] == {"in": ["config.json"], "out": ["src/**"]}
+    persisted = json.dumps(state, ensure_ascii=False)
+    assert state["goal"]["objective"].startswith("Complete host request sha256:")
+    assert "Implement the typed UI contract" not in persisted
+    assert state["prompt_privacy"]["raw_prompt_persisted"] is False
     assert state["intents"][0]["intent_id"] == "intent-ui"
     assert state["intents"][0]["domain"] == "ui"
+    assert state["intents"][0]["text"].startswith("Host intent 1 (ui) sha256:")
 
 
 def test_powershell_bootstrap_rejects_pid_scoped_session_fallback(tmp_path):
@@ -1075,7 +1081,15 @@ def test_codex_adapters_ignore_environment_core_and_profile_trust_overrides(
         "previous": None,
     }), encoding="utf-8")
 
-    env = os.environ.copy()
+    trusted_home = tmp_path / "trusted adapter installation"
+    trusted_home.mkdir()
+    env = _hermetic_adapter_env(
+        trusted_home,
+        session_id="environment-trust-session",
+    )
+    trusted_scripts = (
+        trusted_home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+    )
     env.update({
         "AGENT_SUPERVISOR_HOME": str(attacker_core),
         "AGENT_SUPERVISOR_CORE": str(attacker_core),
@@ -1092,7 +1106,7 @@ def test_codex_adapters_ignore_environment_core_and_profile_trust_overrides(
     bootstrap = subprocess.run(
         [
             _powershell(), "-NoLogo", "-NoProfile", "-File",
-            str(CODEX_SCRIPTS / "supervisor-bootstrap.ps1"),
+            str(trusted_scripts / "supervisor-bootstrap.ps1"),
             "-Workspace", str(workspace),
             "-RoundId", "environment-trust-round",
             "-Message", "verify adapter anchored trust",
@@ -1117,7 +1131,7 @@ def test_codex_adapters_ignore_environment_core_and_profile_trust_overrides(
     native = subprocess.run(
         [
             sys.executable, "-E", "-P", "-X", "utf8",
-            str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+            str(trusted_scripts / "codex-supervisor-hook.py"),
             "--event", "SessionEnd",
         ],
         cwd=workspace,
@@ -1756,13 +1770,169 @@ def test_spool_tail_drops_oversized_unterminated_partial_record(tmp_path: Path) 
     assert hook["_tail_lines"](spool) == []
 
 
+def test_hook_bounds_ingress_and_rechecks_serialized_forwarding() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="bounded_hook_ingress",
+    )
+
+    class ReadProbe(io.BytesIO):
+        requested: int | None = None
+
+        def read(self, size: int = -1) -> bytes:
+            self.requested = size
+            return super().read(size)
+
+    stream = ReadProbe(b"{}")
+    assert hook["_read_bounded_stdin"](stream, maximum=2) == b"{}"
+    assert stream.requested == 3
+    with pytest.raises(ValueError, match="stdin-too-large"):
+        hook["_read_bounded_stdin"](io.BytesIO(b"{}x"), maximum=2)
+
+    forward_globals = hook["_forward"].__globals__
+    forward_globals["MAX_STDIN_BYTES"] = 64
+    with pytest.raises(ValueError, match="forwarded-stdin-too-large"):
+        hook["_forward"](
+            "SessionStart",
+            {"session_id": "bounded-forward", "value": "x" * 64},
+            False,
+        )
+    assert hook["ADAPTER_VERSION"] == "3.1.6"
+
+
+def test_hook_oversized_stdin_is_rejected_without_parsing_or_echoing_payload() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="privacy_safe_hook_overflow",
+    )
+    hook_globals = hook["main"].__globals__
+    secret = b'{' + b'"private":"' + b'x' * hook["MAX_STDIN_BYTES"] + b'"}'
+    captured: dict[str, object] = {}
+
+    def record(event: str, payload: dict, reason: str, input_bytes: int) -> bool:
+        captured.update({
+            "event": event,
+            "payload": payload,
+            "reason": reason,
+            "input_bytes": input_bytes,
+        })
+        return True
+
+    hook_globals["sys"] = _ModuleProxy(
+        sys,
+        stdin=_ModuleProxy(sys.stdin, buffer=io.BytesIO(secret)),
+    )
+    hook_globals["_record_degraded"] = record
+    hook_globals["_emit_fail_open"] = lambda marker_recorded: captured.update({
+        "marker_recorded": marker_recorded,
+    })
+    hook_globals["_parse_payload"] = lambda _raw: pytest.fail(
+        "oversized stdin reached JSON parsing"
+    )
+
+    assert hook["main"](["--event", "SessionStart"]) == 0
+    assert captured == {
+        "event": "SessionStart",
+        "payload": {},
+        "reason": "invalid_input",
+        "input_bytes": hook["MAX_STDIN_BYTES"] + 1,
+        "marker_recorded": True,
+    }
+    assert b"private" not in json.dumps(captured, default=str).encode("utf-8")
+
+
+def test_hook_registry_accepts_only_valid_optional_argv_approvals() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="strict_hook_registry",
+    )
+    entry = {
+        "kind": "local",
+        "path": str(_trusted_python_path()),
+        "sha256": "a" * 64,
+        "allowed_argv_sha256": ["b" * 64],
+    }
+
+    def encoded(candidate: dict) -> bytes:
+        return json.dumps({
+            "contract": "TrustedExecutableRegistry/v1",
+            "entries": {"python": candidate},
+            "generated_at": "2026-08-25T00:00:00Z",
+        }).encode("utf-8")
+
+    parsed = hook["_parse_trusted_executable_registry"](encoded(entry))
+    assert parsed["python"]["allowed_argv_sha256"] == ["b" * 64]
+
+    invalid_entries = (
+        {**entry, "allowed_argv_sha256": "b" * 64},
+        {**entry, "allowed_argv_sha256": ["b" * 64, "b" * 64]},
+        {**entry, "allowed_argv_sha256": ["B" * 64]},
+        {**entry, "unexpected": True},
+    )
+    for invalid in invalid_entries:
+        with pytest.raises(FileNotFoundError, match="trusted_executable_registry_invalid"):
+            hook["_parse_trusted_executable_registry"](encoded(invalid))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows registry bridge validation")
+def test_powershell_registry_accepts_valid_optional_argv_approvals_and_rejects_scalar(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "registry adapter home"
+    scripts = home / ".codex" / "skills" / "dev-supervisor" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(CODEX_SCRIPTS / "supervisor-core.ps1", scripts / "supervisor-core.ps1")
+    python_path = _trusted_python_path()
+    digest = hashlib.sha256(python_path.read_bytes()).hexdigest()
+    registry = home / ".agent-supervisor" / "trusted-executables.json"
+    registry.parent.mkdir(parents=True)
+
+    def resolve(entry: dict) -> str:
+        registry.write_text(json.dumps({
+            "contract": "TrustedExecutableRegistry/v1",
+            "entries": {"python": entry},
+            "generated_at": "2026-08-25T00:00:00Z",
+        }), encoding="utf-8")
+        escaped = str(scripts / "supervisor-core.ps1").replace("'", "''")
+        completed = subprocess.run(
+            [
+                _powershell(),
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                f". '{escaped}'; [Console]::Out.Write([string](Get-AgentSupervisorTrustedRegistryPythonPath))",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=20,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return completed.stdout
+
+    base_entry = {
+        "kind": "local",
+        "path": str(python_path),
+        "sha256": digest,
+    }
+    assert Path(resolve({
+        **base_entry,
+        "allowed_argv_sha256": ["c" * 64],
+    })) == python_path
+    assert resolve({
+        **base_entry,
+        "allowed_argv_sha256": "c" * 64,
+    }) == ""
+
+
 def test_spool_never_writes_partial_json_when_single_record_exceeds_cap(
     tmp_path: Path,
 ) -> None:
     hook = runpy.run_path(str(CODEX_SCRIPTS / "codex-supervisor-hook.py"))
     hook_globals = hook["_record_degraded"].__globals__
     hook_globals["MAX_SPOOL_BYTES"] = 64
-    hook_globals["_home"] = lambda: tmp_path
+    hook_globals["_adapter_install_home"] = lambda: tmp_path
 
     hook["_record_degraded"](
         "Stop",
@@ -2294,6 +2464,10 @@ def test_powershell_python_command_runs_real_production_identity_probe(
     tmp_path: Path,
 ) -> None:
     python_path = _trusted_python_path()
+    scripts = tmp_path / "identity home" / ".codex" / "skills" / "dev-supervisor" / "scripts"
+    scripts.mkdir(parents=True)
+    core_script = scripts / "supervisor-core.ps1"
+    shutil.copy2(CODEX_SCRIPTS / core_script.name, core_script)
     harness = tmp_path / "real-python-identity-probe.ps1"
     harness.write_text(textwrap.dedent(
         """
@@ -2303,7 +2477,12 @@ def test_powershell_python_command_runs_real_production_identity_probe(
         function Get-AgentSupervisorPythonAllowedRoots {
             return @((Split-Path -Parent $PythonPath))
         }
-        function Get-AgentSupervisorTrustedRegistryPythonPath { return $PythonPath }
+        function Get-AgentSupervisorTrustedRegistryPythonPath {
+            return Resolve-AgentSupervisorTrustedPythonPath `
+                -Candidate $PythonPath `
+                -AllowedRoots @((Split-Path -Parent $PythonPath)) `
+                -KnownExecutables @($PythonPath)
+        }
         $resolved = Get-AgentSupervisorPythonCommand
         $accepted = $null -ne $resolved
         $command = if ($accepted) { [string]$resolved.Command } else { '' }
@@ -2323,7 +2502,7 @@ def test_powershell_python_command_runs_real_production_identity_probe(
     completed = subprocess.run(
         [
             _powershell(), "-NoLogo", "-NoProfile", "-File", str(harness),
-            str(CODEX_SCRIPTS / "supervisor-core.ps1"), str(python_path),
+            str(core_script), str(python_path),
         ],
         capture_output=True,
         text=True,

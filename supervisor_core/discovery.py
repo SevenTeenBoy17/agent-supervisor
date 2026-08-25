@@ -34,6 +34,15 @@ _SAFE_PLUGIN_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _CONCRETE_PLUGIN_VERSION = re.compile(
     r"\d+(?:\.\d+)+(?:[-+._a-zA-Z0-9]*)?"
 )
+_MAX_DISCOVERY_ROOTS = 64
+_MAX_DISCOVERY_DIRECTORIES = 10_000
+_MAX_DISCOVERY_ENTRIES = 50_000
+_MAX_DISCOVERED_SKILLS = 4_096
+_MAX_SKILL_BYTES = 2 * 1024 * 1024
+_MAX_TOML_BYTES = 1024 * 1024
+_MAX_AGENT_ROLES = 128
+_MAX_METADATA_NODES = 20_000
+_MAX_METADATA_DEPTH = 48
 
 
 def _canonical_plugin_skill_name(source: str, declared_name: str) -> str:
@@ -193,7 +202,12 @@ def _latest_codex_plugin_skills(
     try:
         registry_resolved = registry_root.resolve(strict=True)
         package_root.resolve(strict=True).relative_to(registry_resolved)
-        entries = list(os.scandir(package_root))
+        with os.scandir(package_root) as iterator:
+            entries = []
+            for entry in iterator:
+                entries.append(entry)
+                if len(entries) > _MAX_DISCOVERY_ENTRIES:
+                    return None, "plugin-version-entry-limit"
     except (OSError, RuntimeError, ValueError):
         return None, "plugin-package-unavailable"
     candidates: list[tuple[tuple[Any, ...], str, Path]] = []
@@ -228,8 +242,16 @@ def _codex_default_roots(home: Path) -> list[RootSpec]:
     if not config_path.exists():
         return result
     try:
+        if config_path.stat().st_size > _MAX_TOML_BYTES:
+            raise ValueError("codex-plugin-config-size-limit")
         with config_path.open("rb") as handle:
-            config = tomllib.load(handle)
+            raw_config = handle.read(_MAX_TOML_BYTES + 1)
+        if len(raw_config) > _MAX_TOML_BYTES:
+            raise ValueError("codex-plugin-config-size-limit")
+        config = tomllib.loads(raw_config.decode("utf-8"))
+        _validate_metadata_complexity(config)
+    except UnicodeDecodeError as exc:
+        raise ValueError("codex-plugin-config-malformed") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ValueError("codex-plugin-config-malformed") from exc
     except OSError as exc:
@@ -315,7 +337,23 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     metadata = yaml.safe_load("".join(lines[1:closing_index])) or {}
     if not isinstance(metadata, dict):
         raise ValueError("YAML frontmatter must be an object")
+    _validate_metadata_complexity(metadata)
     return metadata, "".join(lines[closing_index + 1 :])
+
+
+def _validate_metadata_complexity(value: Any) -> None:
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_METADATA_NODES or depth > _MAX_METADATA_DEPTH:
+            raise ValueError("metadata-complexity-limit")
+        if isinstance(current, dict):
+            stack.extend((key, depth + 1) for key in current)
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend((item, depth + 1) for item in current)
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
@@ -348,6 +386,8 @@ def _stable_skill_bytes(path: Path) -> tuple[bytes, str]:
     try:
         path_before = path.lstat()
         _validate_skill_metadata(path, path_before)
+        if path_before.st_size < 1 or path_before.st_size > _MAX_SKILL_BYTES:
+            raise _StableSkillReadError("skill-read-size-limit")
 
         flags = os.O_RDONLY
         for flag_name in (
@@ -450,8 +490,13 @@ def _scan_skill_paths(root_path: Path) -> tuple[list[Path], list[dict[str, str]]
     pending = [root_path]
     skill_paths: list[Path] = []
     ignored: list[dict[str, str]] = []
+    directory_count = 0
+    entry_count = 0
     while pending:
         directory = pending.pop()
+        directory_count += 1
+        if directory_count > _MAX_DISCOVERY_DIRECTORIES:
+            raise _StableSkillReadError("skill-scan-directory-limit")
         try:
             with os.scandir(directory) as iterator:
                 entries = sorted(iterator, key=lambda entry: entry.name.casefold())
@@ -459,6 +504,9 @@ def _scan_skill_paths(root_path: Path) -> tuple[list[Path], list[dict[str, str]]
             ignored.append({"path": str(directory), "reason": f"directory-scan-unavailable:{type(exc).__name__}"})
             continue
         for entry in entries:
+            entry_count += 1
+            if entry_count > _MAX_DISCOVERY_ENTRIES:
+                raise _StableSkillReadError("skill-scan-entry-limit")
             path = Path(entry.path)
             try:
                 metadata = entry.stat(follow_symlinks=False)
@@ -479,6 +527,8 @@ def _scan_skill_paths(root_path: Path) -> tuple[list[Path], list[dict[str, str]]
                 pending.append(path)
             elif stat.S_ISREG(metadata.st_mode) and entry.name == "SKILL.md":
                 skill_paths.append(path)
+                if len(skill_paths) > _MAX_DISCOVERED_SKILLS:
+                    raise _StableSkillReadError("skill-scan-count-limit")
     return sorted(skill_paths, key=lambda path: str(path).casefold()), ignored
 
 
@@ -489,10 +539,16 @@ def _nearest_toml(path: Path, stop: Path) -> dict[str, Any]:
             candidate = current / name
             if candidate.exists():
                 try:
+                    if candidate.stat().st_size > _MAX_TOML_BYTES:
+                        return {}
                     with candidate.open("rb") as handle:
-                        data = tomllib.load(handle)
+                        raw = handle.read(_MAX_TOML_BYTES + 1)
+                    if len(raw) > _MAX_TOML_BYTES:
+                        return {}
+                    data = tomllib.loads(raw.decode("utf-8"))
+                    _validate_metadata_complexity(data)
                     return data if isinstance(data, dict) else {}
-                except (OSError, tomllib.TOMLDecodeError):
+                except (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError):
                     return {}
         if current == stop or current.parent == current:
             return {}
@@ -664,6 +720,8 @@ def scan_project_agents(
     rows = project_config.get("agent_roles")
     if not isinstance(rows, list):
         return []
+    if len(rows) > _MAX_AGENT_ROLES:
+        raise ValueError("agent-role-count-limit")
     id_counts: dict[str, int] = {}
     for row in rows:
         if isinstance(row, dict):
@@ -763,7 +821,10 @@ def scan_skills(
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     ignored: list[dict[str, str]] = []
-    for root in roots:
+    root_list = list(roots)
+    if len(root_list) > _MAX_DISCOVERY_ROOTS:
+        raise ValueError("discovery-root-count-limit")
+    for root in root_list:
         if root.unavailable_reason:
             ignored.append(
                 {
@@ -865,6 +926,8 @@ def scan_skills(
                     "fallback_id": metadata.get("fallback_id") or metadata.get("fallback"),
                 }
             )
+            if len(records) > _MAX_DISCOVERED_SKILLS:
+                raise ValueError("discovered-skill-count-limit")
     agents = scan_project_agents(project_config, workspace)
     identity_collisions = _fail_closed_global_identity_collisions(records, agents)
     active = [r for r in records if r["active"]]

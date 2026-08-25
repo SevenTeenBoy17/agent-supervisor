@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.11"
+
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project
+        run: python -m pip install -e .
+
+      - name: Compile Python sources
+        run: python -m compileall -q supervisor_core bin integrations tests
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Scan publishable tree and Git history
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: python bin/scan-release-secrets.py --history
+
+      - name: Verify dry-run installation
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: python bin/install-agent-supervisor.py
+
+      - name: Build and inspect deterministic release
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: >-
+          python bin/build-core-release-manifest.py
+          --root .
+          --version 3.1.6
+          --output .ci-artifacts/supervisor-runtime.zip
+          --identity-output .ci-artifacts/release-identity.json
+
+      - name: Build wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: python -m pip wheel . --no-deps --wheel-dir .ci-artifacts
+

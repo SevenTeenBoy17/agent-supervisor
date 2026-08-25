@@ -264,16 +264,16 @@ check("zero-skill turn warns about [SKIP]", "[!]" in r and "SKIP" in r, r[-200:]
 
 print()
 print("=" * 72)
-print("T7  prompt log redaction + consistent hashed session ownership")
+print("T7  prompt content is not persisted + consistent hashed session ownership")
 print("=" * 72)
 secret = "dummy-value-for-redaction"
 credential_name = "pass" + "word"
 run("prompt-submit", {"prompt": credential_name + "=" + secret, "cwd": "D:/proj", "session_id": HOST_SID})
 rows = read_log_rows("T7 prompt redaction")
 prompts = [row for row in rows if row.get("event") == "prompt-submit"]
-check("prompt_head is redacted before persistence",
+check("prompt text is absent from default persistence",
       bool(prompts) and secret not in json.dumps(prompts[-1], ensure_ascii=False)
-      and "已抹除" in prompts[-1].get("prompt_head", ""),
+      and "prompt_head" not in prompts[-1],
       json.dumps(prompts[-1], ensure_ascii=False) if prompts else "no prompt row")
 check("prompt event uses the same full-id hash token",
       bool(prompts) and prompts[-1].get("sid") == SID_HASH,
