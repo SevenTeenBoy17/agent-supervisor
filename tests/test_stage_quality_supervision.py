@@ -369,6 +369,35 @@ def test_stop_stays_incomplete_for_missing_gate_out_of_scope_failed_review_and_p
     assert any("P0/P1" in error for error in p0["validation"]["errors"])
 
 
+def test_stop_stays_incomplete_when_review_findings_contain_p0(
+    tmp_path: Path, valid_bundle
+) -> None:
+    state, events = copy.deepcopy(valid_bundle)
+    ctx = StateContext.build(
+        runtime="test",
+        project="example",
+        workspace=str(state["workspace"]),
+        session="findings-session",
+        round_id="findings-round",
+        state_root=str(tmp_path / "state-findings-p0"),
+    )
+    review = state["reviews"][0]
+    review["verdict"] = "APPROVE"
+    review["unresolved_p0_p1"] = 0
+    review["review_output_artifact"] = {"review_summary": {"issues": []}}
+    review["findings"] = [{"id": "secret-leak", "severity": "P0"}]
+    review["attestation"] = sign_record(review)
+    ctx.save(state)
+    for event in events:
+        ctx.append_event(event)
+    final, code = finalize_round(ctx, stop_attempt=3)
+    assert code != 0
+    assert final["terminal_state"] != "complete"
+    combined = "\n".join(final["validation"]["errors"])
+    assert "P0/P1" in combined
+    assert "secret-leak" in combined
+
+
 def test_validator_exception_records_degraded_and_cannot_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

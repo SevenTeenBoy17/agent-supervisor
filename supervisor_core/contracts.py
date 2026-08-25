@@ -1094,13 +1094,8 @@ def _quality_from_state(
     unresolved: list[str] = []
     seen_unresolved: set[str] = set()
     for review in reviews:
-        artifact = review.get("review_output_artifact")
-        summary = artifact.get("review_summary") if isinstance(artifact, dict) else None
-        issues = summary.get("issues") if isinstance(summary, dict) else None
         issue_markers: list[str] = []
-        for issue in _list(issues):
-            if not isinstance(issue, dict):
-                continue
+        for issue in _review_issue_rows(review):
             severity = str(issue.get("severity") or issue.get("level") or "").strip().upper()
             if severity not in {"P0", "P1"}:
                 continue
@@ -1290,13 +1285,39 @@ def _hhmm(value: Any) -> str:
         return "--:--"
 
 
+def _review_issue_rows(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect issue dicts from the review artifact and ``findings`` without aliasing."""
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def _take(value: Any) -> None:
+        candidates: list[Any] = []
+        if isinstance(value, list):
+            candidates = value
+        elif isinstance(value, dict):
+            nested = value.get("issues")
+            if isinstance(nested, list):
+                candidates = nested
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            rows.append(item)
+
+    artifact = review.get("review_output_artifact")
+    summary = artifact.get("review_summary") if isinstance(artifact, dict) else None
+    if isinstance(summary, dict):
+        _take(summary.get("issues"))
+    _take(review.get("findings"))
+    return rows
+
+
 def _display_status(item: dict[str, Any], quality: dict[str, Any]) -> str:
     if item.get("kind") == "review" and quality.get("review_verdict"):
         return str(quality.get("review_verdict"))
-    if item.get("kind") == "plugin_app" and quality.get("review_verdict") and item.get("status") == "failed":
-        verdict = str(quality.get("review_verdict"))
-        if verdict in REVIEW_VERDICTS:
-            return verdict
     return str(item.get("status") or "")
 
 

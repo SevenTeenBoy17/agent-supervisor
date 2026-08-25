@@ -8,7 +8,7 @@ from typing import Any
 from . import workspace as workspace_module
 from .constants import CHANGE_MODES, EXECUTION_MODES, INTENT_STATES, REVIEW_VERDICTS
 from .attestation import verify_record
-from .contracts import validate_review_shape
+from .contracts import _review_issue_rows, validate_review_shape
 from .util import canonical_sha256, parse_time, sha256_text, utc_now
 from .workspace import (
     capture_supervisor_source_snapshot,
@@ -2089,20 +2089,22 @@ def _validate_criteria_and_waivers(state: dict[str, Any], satisfied_labels: dict
 
 def _unresolved_p0_p1_markers(review: dict[str, Any]) -> list[str]:
     markers: list[str] = []
+    seen: set[str] = set()
     raw_count = review.get("unresolved_p0_p1")
     if type(raw_count) is int and raw_count > 0:
-        markers.append(f"count:{raw_count}")
-    artifact = review.get("review_output_artifact")
-    summary = artifact.get("review_summary") if isinstance(artifact, dict) else None
-    issues = summary.get("issues") if isinstance(summary, dict) else None
-    if isinstance(issues, list):
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            severity = str(issue.get("severity") or issue.get("level") or "").strip().upper()
-            if severity in {"P0", "P1"}:
-                issue_id = str(issue.get("id") or issue.get("path") or severity).strip()
-                markers.append(f"{severity}:{issue_id}")
+        count_marker = f"count:{raw_count}"
+        markers.append(count_marker)
+        seen.add(count_marker)
+    for issue in _review_issue_rows(review):
+        severity = str(issue.get("severity") or issue.get("level") or "").strip().upper()
+        if severity not in {"P0", "P1"}:
+            continue
+        issue_id = str(issue.get("id") or issue.get("path") or severity).strip()
+        marker = f"{severity}:{issue_id}"
+        if marker in seen:
+            continue
+        seen.add(marker)
+        markers.append(marker)
     return markers
 
 

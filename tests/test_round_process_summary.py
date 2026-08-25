@@ -628,3 +628,36 @@ def test_sanitize_helper_strips_stack_stdio_and_pii() -> None:
     assert "张三" not in clean
     assert PII_PHONE not in clean
     assert "Traceback" not in clean
+
+
+def test_failed_plugin_app_keeps_failed_status_when_review_verdict_exists() -> None:
+    attempt, result = _pair(
+        invocation_id="inv-plugin",
+        capability="design-app",
+        result="failed",
+        details={"kind": "plugin_app", "summary": "plugin export failed"},
+    )
+    summary = build_round_process_summary(
+        _state(reviews=[_signed_review()]),
+        [attempt, result],
+    )
+    by_id = _by_id(summary)
+    assert by_id["design-app"]["kind"] == "plugin_app"
+    assert by_id["design-app"]["status"] == "failed"
+    view = render_round_process_summary(summary)
+    assert "Plugin/App｜design-app｜failed" in view
+    assert "Plugin/App｜design-app｜REQUEST_CHANGES" not in view
+    assert "独立 reviewer REQUEST_CHANGES" in view
+
+
+def test_review_findings_p0_surfaces_even_when_count_and_artifact_issues_are_empty() -> None:
+    review = _signed_review(
+        unresolved_p0_p1=0,
+        review_output_artifact={"review_summary": {"issues": []}},
+        findings=[{"id": "finding-p0", "severity": "P0"}],
+    )
+    summary = build_round_process_summary(_state(reviews=[review]), [])
+    unresolved = summary["quality"]["unresolved_p0_p1"]
+    assert any("P0:finding-p0" in str(marker) for marker in unresolved)
+    view = render_round_process_summary(summary)
+    assert "未解决 P0/P1=1" in view
