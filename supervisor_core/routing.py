@@ -72,7 +72,14 @@ _DOMAIN_PREFERENCES: dict[str, tuple[str, ...]] = {
     "ui": ("ui_implementer", "engineering-frontend-developer"),
     "api": ("api_wirer", "engineering-backend-architect"),
     "db": ("db_architect", "engineering-database-optimizer"),
-    "review": ("reviewer", "engineering-code-reviewer", "testing-reality-checker", "code-review-graph-helper"),
+    "review": (
+        "supervisor",
+        "dev-supervisor",
+        "reviewer",
+        "engineering-code-reviewer",
+        "testing-reality-checker",
+        "code-review-graph-helper",
+    ),
     "goal-alignment": ("supervisor", "dev-supervisor", "ce-plan"),
     "quality-gate": ("supervisor", "dev-supervisor", "code-review-graph-helper", "ce-code-review"),
     "capability-reuse": ("supervisor", "dev-supervisor", "ce-agent-native-architecture"),
@@ -166,11 +173,17 @@ _RAW_STOPWORDS = {
 # exclusion set deliberately broader than prose stopwords.  A capability named
 # only after generic work (for example "code-review") is not self-identifying.
 _GENERIC_CANONICAL_TERMS = _RAW_STOPWORDS | {
+    "anthropic",
+    "chatgpt",
+    "claude",
+    "codex",
     "debug",
     "fix",
+    "grok",
     "implementation",
     "implement",
     "issue",
+    "openai",
     "plugin",
     "reuse",
     "route",
@@ -195,6 +208,20 @@ _SCOPE_CONSTRAINT_MARKERS = (
     "不改产品",
     "不得修改",
     "不提交",
+)
+_NUMBERED_MARKER = re.compile(
+    r"(^|[\s。；;：:])(?:\d{1,3}[.)]\s*|\d{1,3}、\s*|"
+    r"[（(]\d{1,3}[）)]\s*|[一二三四五六七八九十]+[、.)]\s*)"
+)
+_NUMBERED_NEW_TOPIC = re.compile(r"(请先|深度思考如何|另外|此外)")
+_HEADING_ONLY = re.compile(r"^(?:我的)?核心功能需求是$|^需求如下$|^如下$")
+_NOISE_CLAUSES = {"思考分析", "明确过程", "其中表面", "结构等", "插件应用等"}
+_DEFAULT_CLAUSE_SPLIT = re.compile(r"[。！？!?；;，,、：\n]+")
+_CONJUNCTION_SPLIT = re.compile(
+    r"(?i)\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|"
+    r"\band\s+(?=(?:add|fix|update|remove|delete|run|verify|test|review|implement|build|create|ensure|support|write|check|deploy)\b)|"
+    r"并且|然后|同时(?:还|再)?|以及|另外|此外|还要|"
+    r"并(?=补充|添加|新增|修复|实现|验证|检查|运行|更新|删除|完成|支持|部署|审查|测试)"
 )
 
 
@@ -240,31 +267,83 @@ def _primary_domain(matches: list[str], used: set[str]) -> str:
     return pool[0]
 
 
-def split_intents(message: str) -> list[dict[str, Any]]:
-    numbered = re.sub(
-        r"(^|[\s。；;])(?:\d{1,3}[.)]\s+|\d{1,3}、\s*|[（(]\d{1,3}[）)]\s*|[一二三四五六七八九十]+[、.)]\s*)",
-        lambda match: (match.group(1) if match.group(1) else "") + "\n",
-        message,
-    )
-    conjunctions = re.sub(
-        r"(?i)\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|"
-        r"\band\s+(?=(?:add|fix|update|remove|delete|run|verify|test|review|implement|build|create|ensure|support|write|check|deploy)\b)|"
-        r"并且|然后|同时(?:还|再)?|以及|另外|此外|还要|"
-        r"并(?=补充|添加|新增|修复|实现|验证|检查|运行|更新|删除|完成|支持|部署|审查|测试)",
-        "\n",
-        numbered,
-    )
-    clauses = [
-        part.strip()
-        for part in re.split(r"[。！？!?；;，,、：\n]+", conjunctions)
-        if part.strip()
+def _compact_clause(clause: str) -> str:
+    return re.sub(r"[\s\d.、，,：:；;！!？?（）()]+", "", clause)
+
+
+def _is_noise_clause(clause: str) -> bool:
+    compact = _compact_clause(clause)
+    return (not compact) or bool(_HEADING_ONLY.match(compact)) or compact in _NOISE_CLAUSES or len(compact) <= 2
+
+
+def _split_default_clauses(text: str) -> list[str]:
+    conjunctions = _CONJUNCTION_SPLIT.sub("\n", text)
+    return [part.strip() for part in _DEFAULT_CLAUSE_SPLIT.split(conjunctions) if part.strip()]
+
+
+def _split_numbered_item_body(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[。！？!?]+", text) if part.strip()]
+
+
+def _split_soft_clauses(text: str) -> list[str]:
+    prepared = re.sub(r"以及(?=不要|禁止|不得)", "\n", text)
+    prepared = re.sub(r"(请先)", r"\n\1", prepared)
+    return [
+        part.strip(" ，,、")
+        for part in re.split(r"[。！？!?\n]+", prepared)
+        if part.strip(" ，,、")
     ]
+
+
+def _split_numbered_item(text: str) -> list[str]:
+    remaining = text.strip()
+    clauses: list[str] = []
+    while remaining:
+        topic = _NUMBERED_NEW_TOPIC.search(remaining)
+        if topic is None:
+            clauses.extend(_split_numbered_item_body(remaining))
+            break
+        if topic.start() > 0:
+            clauses.extend(_split_numbered_item_body(remaining[: topic.start()]))
+            remaining = remaining[topic.start() :].strip()
+            continue
+        clauses.extend(_split_soft_clauses(remaining))
+        break
+    return clauses
+
+
+def _clauses_from_numbered_message(message: str, matches: list[re.Match[str]]) -> list[str]:
+    clauses: list[str] = []
+    preamble = message[: matches[0].start()].strip()
+    if preamble:
+        clauses.extend(_split_default_clauses(preamble))
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(message)
+        body = message[start:end].strip()
+        if body:
+            clauses.extend(_split_numbered_item(body))
+    return clauses
+
+
+def split_intents(message: str) -> list[dict[str, Any]]:
+    matches = list(_NUMBERED_MARKER.finditer(message))
+    if len(matches) >= 2:
+        clauses = _clauses_from_numbered_message(message, matches)
+    else:
+        numbered = _NUMBERED_MARKER.sub(
+            lambda match: (match.group(1) if match.group(1) else "") + "\n",
+            message,
+        )
+        clauses = _split_default_clauses(numbered)
     if not clauses and message.strip():
         clauses = [message.strip()]
     intents: list[dict[str, Any]] = []
     seen: set[str] = set()
     used_domains: set[str] = set()
     for clause in clauses:
+        if _is_noise_clause(clause):
+            continue
         if _is_scope_constraint_clause(clause):
             domain = "scope-constraint"
             kind = "scope-constraint"

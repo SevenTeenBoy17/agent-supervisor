@@ -14,6 +14,17 @@ USER_CORE_REQUEST = (
     "全过程质量监工及时纠偏与最终验收、每轮结束输出简约时间线日志。"
 )
 
+USER_NUMBERED_REQUEST = (
+    "我的核心功能需求是： 1.每轮对话任务开始的时候，需要对我的任务做深度理解、思考分析，"
+    "并对skill池（已安装已有的）进行扫描，明确过程、其中表面以及背后需要用到哪些skill进行思考并进行对应调用以及进行质量检查。"
+    " 2.进行质量监工，审查监工每轮对话完成过程以及结果，避免在错误道路越走越远、及时纠正偏差以及进行最终成果验收把关"
+    " 3.每次对话任务结束完成后，需要返回简约核心的过程日志，比如在哪些时间节点调用了什么skill、agent、插件应用等以及对应完成的情况质量等,"
+    "以及再让其避免在goal模式或者完成任务过程中反复进行一些无关紧要、或者做切实没必要的重复的工作 "
+    "深度思考如何全方面、多轮次进行验证测试，确保这个agent可以在codex中以及claude中在不同的项目中均可以使用，尤其是codex中进行使用，无bug,"
+    "以及不要用现有的项目进行测试验证 请先深度理解上述需求以及现有的agent的所有内容以及结构等，进行优化升级以及进行全面测试检查，"
+    "确保所有功能可以用、无误后再交付给我"
+)
+
 NOISE_SKILLS = (
     "figma:figma-create-new-file",
     "animal-island-ui-style",
@@ -280,6 +291,59 @@ def test_phase_budget_unlimited_total_preserves_long_capability_names() -> None:
     for capability_id in result["selected_capabilities"]:
         assert capability_id == capability_id.strip()
         assert "..." not in capability_id
+
+
+def test_numbered_chinese_request_keeps_coherent_intents() -> None:
+    rows = normalize_intents(split_intents(USER_NUMBERED_REQUEST), USER_NUMBERED_REQUEST)
+    functional = [
+        row
+        for row in rows
+        if row["kind"] == "functional" and not row["depends_on_intent_ids"]
+    ]
+    texts = [row["text"] for row in rows]
+    joined = " ".join(texts)
+    assert 3 <= len(functional) <= 10
+    assert "扫描" in joined or "skill" in joined.casefold()
+    assert "监工" in joined or "质量" in joined
+    assert "日志" in joined
+    assert "重复" in joined or "无关" in joined
+    assert any(
+        row["kind"] == "scope-constraint" and "不要用现有" in row["text"]
+        for row in rows
+    )
+    assert {"结果", "agent", "结构等", "明确过程", "其中表面", "思考分析"}.isdisjoint(
+        {row["text"].strip() for row in rows}
+    )
+    assert all(len(row["text"]) >= 4 for row in rows)
+    keys = [row["dedupe_key"] for row in rows]
+    assert len(keys) == len(set(keys))
+
+
+def test_host_name_codex_does_not_select_unrelated_slide_skill() -> None:
+    inventory = _inventory()
+    inventory["skills"].append(
+        _skill("codex-ppt", "generate powerpoint slides from articles")
+    )
+    result = route_intents(
+        message=USER_NUMBERED_REQUEST,
+        inventory=inventory,
+        phase_budget=3,
+    )
+    selected = set(result["selected_capabilities"])
+    assert "codex-ppt" not in selected
+    assert selected.isdisjoint(NOISE_SKILLS)
+    log_rows = [
+        row
+        for row in result["coverage"]
+        if "日志" in str(row.get("text") or "")
+    ]
+    assert log_rows
+    assert any(
+        {"dev-supervisor", "supervisor"} & set(row.get("capability_ids") or [])
+        for row in log_rows
+    )
+    assert all(len(phase["capability_ids"]) <= 3 for phase in result["phases"])
+    assert result["total_capability_limit"] is None
 
 
 def test_child_intents_keep_distinct_text_and_parent_link() -> None:
