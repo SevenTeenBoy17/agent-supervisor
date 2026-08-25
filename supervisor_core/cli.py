@@ -75,6 +75,7 @@ from .validation import (
     _trusted_invocation_for_runtime,
     _validate_evidence,
     _validate_live_or_artifact_binding,
+    record_intent_capability_attempt,
     successful_invocations,
     validate_state,
 )
@@ -3265,6 +3266,12 @@ def command_event(args: argparse.Namespace) -> int:
             nonlocal record_id
             if is_result:
                 _record_breaker_result(state, capability, str(args.result))
+                record_intent_capability_attempt(
+                    state,
+                    capability,
+                    result=str(args.result),
+                    invocation_id=invocation_id,
+                )
             record_id = _apply_state_record(state, payload, event_type)
             if payload.get("status") == "degraded" or payload.get("degraded_prior") is True:
                 state["health"] = "degraded"
@@ -3873,6 +3880,8 @@ def _routing_intents_for_start(
             "role",
             "required_responsibility_groups",
             "depends_on_intent_ids",
+            "attempted_capabilities",
+            "evidence_ids",
         ):
             if key in raw_row:
                 merged[key] = copy.deepcopy(raw_row[key])
@@ -4901,7 +4910,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.1.2")
+    parser.add_argument("--version", action="version", version="3.1.3")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

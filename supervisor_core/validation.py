@@ -25,6 +25,68 @@ PROGRESS_GUARD_ALLOW = "allow"
 PROGRESS_GUARD_REFUSE_REDUNDANT = "refuse-redundant"
 
 
+def append_attempted_capability(
+    intent: dict[str, Any],
+    capability_id: str,
+    *,
+    result: str,
+    invocation_id: str | None = None,
+    evidence_ids: list[str] | None = None,
+) -> None:
+    """Record one real capability attempt onto an intent for later progress_guard."""
+    cap = str(capability_id or "").strip()
+    if not cap or not isinstance(intent, dict):
+        return
+    row: dict[str, Any] = {
+        "capability_id": cap,
+        "result": str(result or "").strip() or "failed",
+        "evidence_ids": [
+            str(item).strip()
+            for item in (evidence_ids if evidence_ids is not None else intent.get("evidence_ids") or [])
+            if str(item).strip()
+        ],
+    }
+    if invocation_id and str(invocation_id).strip():
+        row["invocation_id"] = str(invocation_id).strip()
+    attempts = intent.get("attempted_capabilities")
+    if not isinstance(attempts, list):
+        attempts = []
+        intent["attempted_capabilities"] = attempts
+    attempts.append(row)
+
+
+def record_intent_capability_attempt(
+    state: dict[str, Any],
+    capability_id: str,
+    *,
+    result: str,
+    invocation_id: str | None = None,
+) -> None:
+    """Stamp a correlated invocation result onto every intent that selected it."""
+    cap = str(capability_id or "").strip()
+    if not cap or not isinstance(state, dict):
+        return
+    for intent in state.get("intents") or []:
+        if not isinstance(intent, dict):
+            continue
+        selected = [
+            str(item).strip()
+            for item in list(intent.get("capability_ids") or [])
+            + list(intent.get("skill_capability_ids") or [])
+            + list(intent.get("agent_capability_ids") or [])
+            if str(item).strip()
+        ]
+        if cap not in selected:
+            continue
+        append_attempted_capability(
+            intent,
+            cap,
+            result=result,
+            invocation_id=invocation_id,
+            evidence_ids=list(intent.get("evidence_ids") or []),
+        )
+
+
 def progress_guard_decision(intent: dict[str, Any], capability_id: str) -> str:
     """Decide whether routing a capability again would produce new evidence."""
     cap = str(capability_id or "").strip()

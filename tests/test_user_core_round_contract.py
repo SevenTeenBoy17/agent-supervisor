@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
+
 from supervisor_core.contracts import build_goal, normalize_intents
 from supervisor_core.routing import route_intents, split_intents
 from supervisor_core.validation import (
     PROGRESS_GUARD_ALLOW,
     PROGRESS_GUARD_REFUSE_REDUNDANT,
     progress_guard_decision,
+    record_intent_capability_attempt,
 )
 
 
@@ -215,6 +218,50 @@ def test_attempted_capability_without_progress_is_refused_redundant() -> None:
     for row in result["coverage"]:
         assert "figma:figma-create-new-file" not in row["capability_ids"]
     assert "figma:figma-create-new-file" not in result["selected_capabilities"]
+
+
+def test_invocation_result_stamp_makes_reroute_refuse_redundant() -> None:
+    first = route_intents(
+        message=USER_CORE_REQUEST,
+        inventory=_inventory(),
+        supplied_intents=normalize_intents(
+            [
+                {
+                    "intent_id": "intent-understanding",
+                    "text": "每轮深度理解并自动路由 Skill",
+                    "domain": "capability-reuse",
+                }
+            ]
+        ),
+        phase_budget=3,
+    )
+    covered = next(
+        row for row in first["coverage"] if row.get("intent_id") == "intent-understanding"
+    )
+    assert covered["capability_ids"]
+    chosen = str(covered["capability_ids"][0])
+    state = {"intents": [copy.deepcopy(covered)]}
+    record_intent_capability_attempt(
+        state,
+        chosen,
+        result="success",
+        invocation_id="inv-live-supervisor",
+    )
+    second = route_intents(
+        message=USER_CORE_REQUEST,
+        inventory=_inventory(),
+        supplied_intents=state["intents"],
+        phase_budget=3,
+    )
+    refused = [
+        row
+        for row in second["rejected"]
+        if row["status"] == "refused-redundant"
+        and row["capability_id"] == chosen
+        and row["intent_id"] == "intent-understanding"
+    ]
+    assert refused
+    assert chosen not in second["selected_capabilities"]
 
 
 def test_attempted_capability_with_new_evidence_is_not_refused() -> None:
