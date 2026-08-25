@@ -1,0 +1,63 @@
+{
+  "schema_version": 3,
+  "goal": {
+    "goal_id": "goal-example",
+    "version": 1,
+    "source_request_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "change_mode": "replace",
+    "objective": "Replace this example with the current user-approved objective.",
+    "acceptance_criteria": [
+      {
+        "criterion_id": "AC-EXAMPLE-01",
+        "description": "Replace this non-empty example with a binary acceptance criterion.",
+        "domain": "config-agent",
+        "expected_evidence": [
+          "gate.replace-with-id"
+        ],
+        "required": true
+      }
+    ],
+    "in_scope": [
+      "Replace with at least one explicitly allowed path or responsibility."
+    ],
+    "out_of_scope": [],
+    "constraints": [],
+    "non_goals": [],
+    "assumptions": [],
+    "risks": []
+  },
+  "tasks": [
+    {
+      "task_id": "task-example-01",
+      "goal_id": "goal-example",
+      "goal_version": 1,
+      "criterion_ids": [
+        "AC-EXAMPLE-01"
+      ],
+      "allowed_paths": [
+        "replace/with/leased/path"
+      ],
+      "expected_evidence": [
+        "gate.replace-with-id"
+      ],
+      "status": "doing",
+      "evidence_ids": []
+    }
+  ],
+  "intent_coverage": [
+    {
+      "intent_id": "intent-example-01",
+      "text_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "status": "deferred",
+      "reason": "Template placeholder; classify the real atomic intent before execution.",
+      "capability_ids": [],
+      "method": "template-placeholder",
+      "phase": 0
+    }
+  ],
+  "invocations": [],
+  "evidence": [],
+  "reviews": [],
+  "waivers": [],
+  "terminal_state": "incomplete"
+}

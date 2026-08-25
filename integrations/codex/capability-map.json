@@ -1,0 +1,89 @@
+{
+  "schema_version": 3,
+  "catalog_mode": "dynamic-live-discovery",
+  "generated_inventory_is_authoritative": true,
+  "entry_role": "portable-policy-hint",
+  "health_source": "runtime-discovery",
+  "entries": [
+    {
+      "id": "skill.dev-supervisor",
+      "kind": "skill",
+      "description": "Goal, evidence, quality, review, and finalization control plane.",
+      "owns": ["supervisor-state"],
+      "must_not_touch": ["product-implementation"],
+      "risk_tier": 1,
+      "fallback_id": "manual.supervisor-protocol",
+      "health": "runtime-probe-required"
+    },
+    {
+      "id": "plugin.browser",
+      "kind": "plugin",
+      "description": "Interactive browser verification.",
+      "owns": ["live-browser-observation"],
+      "must_not_touch": ["unapproved-external-state"],
+      "risk_tier": 2,
+      "fallback_id": "skill.webapp-testing",
+      "health": "runtime-probe-required"
+    },
+    {
+      "id": "skill.webapp-testing",
+      "kind": "skill",
+      "description": "Repeatable local browser and Playwright-style verification when the interactive browser is unavailable.",
+      "owns": ["local-browser-verification"],
+      "must_not_touch": ["unapproved-external-state"],
+      "risk_tier": 2,
+      "fallback_id": "manual.browser-verification",
+      "health": "runtime-probe-required"
+    },
+    {
+      "id": "skill.code-review-graph",
+      "kind": "skill",
+      "description": "Graph-backed impact and diff review.",
+      "owns": ["read-only-review"],
+      "must_not_touch": ["implementation"],
+      "risk_tier": 1,
+      "fallback_id": "manual.impact-review",
+      "health": "runtime-probe-required"
+    },
+    {
+      "id": "manual.supervisor-protocol",
+      "kind": "manual",
+      "description": "Apply the documented goal, evidence, review, and finalization protocol without a loaded Supervisor skill.",
+      "owns": ["supervisor-protocol-fallback"],
+      "must_not_touch": ["product-implementation"],
+      "risk_tier": 1,
+      "fallback_id": null,
+      "health": "declared-fallback"
+    },
+    {
+      "id": "manual.browser-verification",
+      "kind": "manual",
+      "description": "Provide bounded, reproducible manual browser verification steps and record their limitations.",
+      "owns": ["manual-browser-verification"],
+      "must_not_touch": ["unapproved-external-state"],
+      "risk_tier": 1,
+      "fallback_id": null,
+      "health": "declared-fallback"
+    },
+    {
+      "id": "manual.impact-review",
+      "kind": "manual",
+      "description": "Perform a read-only diff, dependency, ownership, and missing-test review when graph tooling is unavailable.",
+      "owns": ["manual-impact-review"],
+      "must_not_touch": ["implementation"],
+      "risk_tier": 1,
+      "fallback_id": null,
+      "health": "declared-fallback"
+    },
+    {
+      "id": "manual.route-next-best",
+      "kind": "manual",
+      "description": "Select the next healthy non-overlapping capability from the live registry and record the degraded hop.",
+      "owns": ["manual-capability-routing"],
+      "must_not_touch": ["disabled-capability"],
+      "risk_tier": 1,
+      "fallback_id": null,
+      "health": "declared-fallback"
+    }
+  ]
+}
