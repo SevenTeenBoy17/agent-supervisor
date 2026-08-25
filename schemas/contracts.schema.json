@@ -44,7 +44,7 @@
       "required": ["invocation_id", "capability", "stage", "actor", "responsibility_group", "identity_assurance", "timestamp"],
       "properties": {
         "stage": {"enum": ["attempt", "result"]},
-        "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", null]},
+        "result": {"enum": ["success", "failed", "refused", "cancelled", "manual-specialized", "methodology-only", null]},
         "responsibility_group": {"type": ["string", "null"], "minLength": 1},
         "identity_assurance": {"enum": ["host-hook-observed", "codex-explicit-audit", "declared-runtime", "core-executed-gate", "core-trusted-finalize"]}
       }
@@ -324,6 +324,103 @@
         "assurance": {"const": "local-integrity-only"},
         "same_user_adversary_resistant": {"const": false},
         "limitation": {"type": "string", "minLength": 1}
+      }
+    },
+    "RoundProcessSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "round", "intent_summary", "timeline", "quality"],
+      "properties": {
+        "contract": {"const": "RoundProcessSummary/v1"},
+        "round": {"$ref": "#/$defs/RoundProcessSummaryRound"},
+        "intent_summary": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/RoundProcessSummaryIntent"}
+        },
+        "timeline": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/RoundProcessSummaryTimelineItem"}
+        },
+        "quality": {"$ref": "#/$defs/RoundProcessSummaryQuality"}
+      }
+    },
+    "RoundProcessSummaryRound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "goal_id", "goal_version", "change_mode", "terminal_state"],
+      "properties": {
+        "started_at": {"type": "string", "minLength": 1},
+        "ended_at": {"type": ["string", "null"], "minLength": 1},
+        "goal_id": {"type": "string", "minLength": 1},
+        "goal_version": {"type": "integer", "minimum": 1},
+        "change_mode": {"enum": ["continue", "extend", "replace"]},
+        "terminal_state": {
+          "enum": ["complete", "incomplete", "blocked", "user-waived", null]
+        }
+      }
+    },
+    "RoundProcessSummaryIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent_id", "status"],
+      "properties": {
+        "intent_id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["covered", "skipped", "deferred", "unavailable", "failed"]},
+        "kind": {"enum": ["functional", "scope-constraint"]}
+      }
+    },
+    "RoundProcessSummaryTimelineItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "kind", "canonical_id", "status", "intent_ids", "contribution", "evidence_ids"],
+      "properties": {
+        "at": {"type": "string", "minLength": 1},
+        "kind": {
+          "enum": ["skill", "agent", "plugin_app", "native_command", "quality_gate", "review"]
+        },
+        "canonical_id": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["success", "failed", "refused", "cancelled", "fallback", "methodology-only", "not-invoked"]
+        },
+        "intent_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "contribution": {"type": "string"},
+        "evidence_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "RoundProcessSummaryQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gates", "review_verdict", "unresolved_p0_p1", "degraded_fallbacks"],
+      "properties": {
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "status": {"enum": ["PASS", "FAIL", "SKIP", "MISSING"]}
+            }
+          }
+        },
+        "review_verdict": {
+          "enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_DISCUSSION", null]
+        },
+        "unresolved_p0_p1": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "degraded_fallbacks": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
       }
     }
   }

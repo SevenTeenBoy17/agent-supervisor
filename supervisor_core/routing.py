@@ -4,15 +4,29 @@ import re
 from collections import defaultdict
 from typing import Any
 
-from .contracts import normalize_intents
+from .contracts import intent_dedupe_key, normalize_intents
 
 _DOMAIN_TERMS: dict[str, tuple[str, ...]] = {
     "ui": ("ui", "frontend", "interface", "page", "前端", "界面", "页面"),
     "api": ("api", "endpoint", "backend", "接口", "后端"),
     "db": ("db", "database", "schema", "数据库", "数据层"),
-    "review": ("review", "reviewer", "coderabbit", "code rabbit", "审查", "复核", "独立审核"),
+    "review": (
+        "review",
+        "reviewer",
+        "coderabbit",
+        "code rabbit",
+        "审查",
+        "复核",
+        "独立审核",
+        "日志",
+        "时间线",
+        "结束日志",
+        "过程日志",
+        "简约",
+        "结束",
+    ),
     "goal-alignment": ("目标", "对齐", "goal", "intent", "需求", "supervisor"),
-    "quality-gate": ("质量", "把关", "监工", "验证", "证据"),
+    "quality-gate": ("质量", "把关", "监工", "验证", "证据", "纠偏", "验收"),
     "capability-reuse": (
         "skill",
         "capability",
@@ -23,6 +37,9 @@ _DOMAIN_TERMS: dict[str, tuple[str, ...]] = {
         "复用",
         "调用",
         "路由",
+        "调度",
+        "理解",
+        "扫描",
         "agent",
         "已安装",
         "安装并启用",
@@ -164,6 +181,21 @@ _GENERIC_CANONICAL_TERMS = _RAW_STOPWORDS | {
 }
 
 _SUPPLIED_SINGLETON_ACTION_TERMS = {"audit", "build", "implement", "review"}
+_SCOPE_CONSTRAINT_MARKERS = (
+    "仅编写",
+    "只写",
+    "不修复",
+    "不发布",
+    "非目标",
+    "不要",
+    "禁止",
+    "不得宣称",
+    "本轮只",
+    "不切换全局",
+    "不改产品",
+    "不得修改",
+    "不提交",
+)
 
 
 def _clause_has_term(lowered: str, term: str) -> bool:
@@ -171,6 +203,41 @@ def _clause_has_term(lowered: str, term: str) -> bool:
     if any("\u4e00" <= character <= "\u9fff" for character in folded):
         return folded in lowered
     return bool(re.search(rf"(?<![a-z0-9]){re.escape(folded)}(?![a-z0-9])", lowered))
+
+
+def _is_scope_constraint_clause(clause: str) -> bool:
+    lowered = clause.casefold()
+    return any(marker.casefold() in lowered for marker in _SCOPE_CONSTRAINT_MARKERS)
+
+
+def _clause_domain_matches(clause: str) -> list[str]:
+    lowered = clause.casefold()
+    scored: list[tuple[int, str]] = []
+    for domain, terms in _DOMAIN_TERMS.items():
+        weight = 0
+        for term in terms:
+            if not _clause_has_term(lowered, term):
+                continue
+            weight += (
+                len(term)
+                if any("\u4e00" <= character <= "\u9fff" for character in term)
+                else 1
+            )
+        if weight:
+            scored.append((weight, domain))
+    scored.sort(key=lambda row: -row[0])
+    matches = [domain for _weight, domain in scored]
+    if _TECHNICAL_DOMAINS.intersection(matches):
+        matches = [domain for domain in matches if domain != "repair-design"]
+    return matches or ["general"]
+
+
+def _primary_domain(matches: list[str], used: set[str]) -> str:
+    unused = [domain for domain in matches if domain not in used]
+    pool = unused or list(matches)
+    if "general" in pool and len(pool) > 1:
+        pool = [domain for domain in pool if domain != "general"]
+    return pool[0]
 
 
 def split_intents(message: str) -> list[dict[str, Any]]:
@@ -187,28 +254,37 @@ def split_intents(message: str) -> list[dict[str, Any]]:
         "\n",
         numbered,
     )
-    clauses = [part.strip() for part in re.split(r"[。！？!?；;，,\n]+", conjunctions) if part.strip()]
+    clauses = [
+        part.strip()
+        for part in re.split(r"[。！？!?；;，,、：\n]+", conjunctions)
+        if part.strip()
+    ]
     if not clauses and message.strip():
         clauses = [message.strip()]
     intents: list[dict[str, Any]] = []
     seen: set[str] = set()
+    used_domains: set[str] = set()
     for clause in clauses:
-        matches = []
-        lowered = clause.casefold()
-        for domain, terms in _DOMAIN_TERMS.items():
-            if any(_clause_has_term(lowered, term) for term in terms):
-                matches.append(domain)
-        # A concrete implementation domain is more informative than the generic
-        # "implement/repair" meta-domain triggered by the same clause.
-        if _TECHNICAL_DOMAINS.intersection(matches):
-            matches = [domain for domain in matches if domain != "repair-design"]
-        if not matches:
-            matches = ["general"]
-        for domain in matches:
-            key = f"{domain}:{clause}"
-            if key not in seen:
-                intents.append({"intent_id": f"intent-{len(intents) + 1}", "text": clause, "domain": domain})
-                seen.add(key)
+        if _is_scope_constraint_clause(clause):
+            domain = "scope-constraint"
+            kind = "scope-constraint"
+        else:
+            domain = _primary_domain(_clause_domain_matches(clause), used_domains)
+            kind = "functional"
+            used_domains.add(domain)
+        key = intent_dedupe_key(clause)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        intents.append(
+            {
+                "intent_id": f"intent-{len(intents) + 1}",
+                "text": clause,
+                "domain": domain,
+                "kind": kind,
+                "dedupe_key": key,
+            }
+        )
     return intents
 
 
@@ -417,6 +493,7 @@ def _invalid_route(
         "identity_conflict_diagnostics": list(
             identity_conflict_diagnostics or []
         ),
+        "rejected": [],
         "valid": False,
         "errors": errors,
     }
@@ -527,21 +604,90 @@ def route_intents(
     selected_agents: list[str] = []
     capability_roles: dict[str, set[str]] = defaultdict(set)
     coverage: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    from .validation import (
+        PROGRESS_GUARD_REFUSE_REDUNDANT,
+        progress_guard_decision,
+    )
     for index, intent in enumerate(atomic, start=1):
         text = str(intent.get("text", ""))
         domain = str(intent.get("domain", "general"))
         role = _intent_role(intent)
+        intent_id = str(intent.get("intent_id") or f"intent-{index}")
         required_groups = {
             str(group).casefold()
             for group in intent.get("required_responsibility_groups", [])
             if isinstance(group, str) and group.strip()
         }
+        blocked_capabilities: set[str] = set()
+        for attempt in intent.get("attempted_capabilities") or []:
+            if not isinstance(attempt, dict):
+                continue
+            attempted_id = str(attempt.get("capability_id") or "").strip()
+            if not attempted_id:
+                continue
+            if progress_guard_decision(intent, attempted_id) == PROGRESS_GUARD_REFUSE_REDUNDANT:
+                blocked_capabilities.add(attempted_id)
+                rejected.append(
+                    {
+                        "intent_id": intent_id,
+                        "capability_id": attempted_id,
+                        "status": "refused-redundant",
+                        "reason": "already-attempted-without-new-evidence",
+                    }
+                )
+        if str(intent.get("status") or "") == "covered":
+            coverage.append(
+                {
+                    "contract": "IntentCoverage/v3",
+                    "intent_id": intent_id,
+                    "text": text,
+                    "domain": domain,
+                    "kind": str(intent.get("kind") or "functional"),
+                    "dedupe_key": str(intent.get("dedupe_key") or intent_dedupe_key(text)),
+                    "acceptance_criteria": list(intent.get("acceptance_criteria") or []),
+                    "evidence_ids": list(intent.get("evidence_ids") or []),
+                    "attempted_capabilities": list(intent.get("attempted_capabilities") or []),
+                    "status": "skipped",
+                    "reason": "already covered; redundant routing skipped",
+                    "capability_ids": [],
+                    "skill_capability_ids": [],
+                    "agent_capability_ids": [],
+                    "role": role,
+                    "required_responsibility_groups": sorted(required_groups),
+                    "depends_on_intent_ids": list(intent.get("depends_on_intent_ids", [])),
+                }
+            )
+            continue
+        if str(intent.get("kind") or "") == "scope-constraint" or domain == "scope-constraint":
+            coverage.append(
+                {
+                    "contract": "IntentCoverage/v3",
+                    "intent_id": intent_id,
+                    "text": text,
+                    "domain": "scope-constraint",
+                    "kind": "scope-constraint",
+                    "dedupe_key": str(intent.get("dedupe_key") or intent_dedupe_key(text)),
+                    "acceptance_criteria": list(intent.get("acceptance_criteria") or []),
+                    "evidence_ids": list(intent.get("evidence_ids") or []),
+                    "attempted_capabilities": list(intent.get("attempted_capabilities") or []),
+                    "status": "skipped",
+                    "reason": "scope/non-goal constraint; not a functional routing target",
+                    "capability_ids": [],
+                    "skill_capability_ids": [],
+                    "agent_capability_ids": [],
+                    "role": role,
+                    "required_responsibility_groups": sorted(required_groups),
+                    "depends_on_intent_ids": list(intent.get("depends_on_intent_ids", [])),
+                }
+            )
+            continue
         preserve_routing = intent.get("_preserve_routing") is True
         if preserve_routing:
             prior_ids = [
                 str(value).strip()
                 for value in intent.get("capability_ids", [])
-                if isinstance(value, str) and value.strip()
+                if isinstance(value, str) and value.strip() and value.strip() not in blocked_capabilities
             ]
             chosen_capabilities: list[dict[str, Any]] = []
             chosen_ids: list[str] = []
@@ -657,7 +803,7 @@ def route_intents(
         ranked = []
         for capability in capabilities:
             capability_id = str(capability.get("id") or capability.get("name") or "").strip()
-            if not capability_id:
+            if not capability_id or capability_id in blocked_capabilities:
                 continue
             ranking_fields = ["id", "name", "description", "owns"]
             if capability.get("capability_kind") == "agent":
@@ -699,8 +845,7 @@ def route_intents(
                 and raw_terms & capability_terms
             )
             supplied_chinese_domain_match = bool(
-                caller_supplied_intents
-                and any(
+                any(
                     _is_multichar_chinese_term(term)
                     for term in raw_overlap & set(_DOMAIN_TERMS.get(domain, ()))
                 )
@@ -717,6 +862,17 @@ def route_intents(
             ):
                 confidence = 1
             else:
+                confidence = 0
+            criteria = intent.get("acceptance_criteria") or []
+            if criteria and confidence and not (
+                preferred
+                or raw_overlap
+                or any(
+                    _high_information_terms(str(criterion)) & capability_terms
+                    for criterion in criteria
+                    if isinstance(criterion, str)
+                )
+            ):
                 confidence = 0
             if confidence:
                 ranked.append((confidence, score, capability_id, capability))
@@ -751,6 +907,7 @@ def route_intents(
             chosen_ids = [row[2] for row in grouped.values()]
         if not required_groups and not chosen_ids and ranked:
             chosen_ids = [ranked[0][2]]
+        chosen_ids = [item for item in chosen_ids if item not in blocked_capabilities]
         if chosen_ids:
             for chosen in chosen_ids:
                 if chosen not in selected:
@@ -778,6 +935,11 @@ def route_intents(
                     "intent_id": str(intent.get("intent_id") or f"intent-{index}"),
                     "text": text,
                     "domain": domain,
+                    "kind": str(intent.get("kind") or "functional"),
+                    "dedupe_key": str(intent.get("dedupe_key") or intent_dedupe_key(text)),
+                    "acceptance_criteria": list(intent.get("acceptance_criteria") or []),
+                    "evidence_ids": list(intent.get("evidence_ids") or []),
+                    "attempted_capabilities": list(intent.get("attempted_capabilities") or []),
                     "status": "deferred",
                     "reason": f"scheduled for capabilities {', '.join(chosen_ids)}",
                     "capability_ids": chosen_ids,
@@ -801,6 +963,11 @@ def route_intents(
                     "intent_id": str(intent.get("intent_id") or f"intent-{index}"),
                     "text": text,
                     "domain": domain,
+                    "kind": str(intent.get("kind") or "functional"),
+                    "dedupe_key": str(intent.get("dedupe_key") or intent_dedupe_key(text)),
+                    "acceptance_criteria": list(intent.get("acceptance_criteria") or []),
+                    "evidence_ids": list(intent.get("evidence_ids") or []),
+                    "attempted_capabilities": list(intent.get("attempted_capabilities") or []),
                     "status": "skipped",
                     "reason": (
                         f"required responsibility groups unavailable: {', '.join(missing_required_groups)}"
@@ -955,6 +1122,7 @@ def route_intents(
         },
         "identity_conflicts": [],
         "identity_conflict_diagnostics": [],
+        "rejected": rejected,
         "valid": zero_skill_valid,
         "errors": zero_skill_errors,
     }

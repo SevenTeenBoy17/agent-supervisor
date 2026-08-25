@@ -19,7 +19,12 @@ from typing import Any
 
 from .constants import EXIT_COMPLETE, EXIT_DEGRADED, EXIT_INCOMPLETE, EXIT_INVALID
 from .attestation import sign_record, verify_record
-from .contracts import invocation_event, normalize_intents
+from .contracts import (
+    build_round_process_summary,
+    invocation_event,
+    normalize_intents,
+    render_round_process_summary,
+)
 from .discovery import (
     baseline_report,
     parse_roots,
@@ -3185,6 +3190,11 @@ def command_event(args: argparse.Namespace) -> int:
         payload["record"] = _core_codex_changes_record(
             state_for_changes, caller_request
         )
+    if event_type == "handoff_requested":
+        live_state = ctx.load()
+        payload["goal_drift"] = goal_drift_report(live_state)
+        payload["summary"] = str(payload.get("summary") or "phase-transition")
+        payload["reason"] = str(payload.get("reason") or payload.get("summary") or "phase-transition")
     invocation_id = str(payload.get("invocation_id") or "")
     capability = str(payload.get("capability") or "")
     is_result = event_type in {"invocation_result", "skill_result"}
@@ -3228,7 +3238,9 @@ def command_event(args: argparse.Namespace) -> int:
             ),
         )
     elif is_result:
-        if not invocation_id or not capability or args.result not in {"success", "failed", "refused", "cancelled", "manual-specialized"}:
+        if not invocation_id or not capability or args.result not in {
+            "success", "failed", "refused", "cancelled", "manual-specialized", "methodology-only",
+        }:
             raise InvalidState("invocation result requires id, capability, and a supported result")
         payload = invocation_event(
             invocation_id=invocation_id,
@@ -3265,6 +3277,13 @@ def command_event(args: argparse.Namespace) -> int:
         payload.pop("record", None)
         payload["record_id"] = record_id
     recorded = ctx.append_event(payload)
+    if event_type == "handoff_requested":
+        emit_stage_checkpoint(
+            ctx,
+            ctx.load(),
+            reason=str(payload.get("reason") or "phase-transition"),
+            actor=str(payload.get("actor") or ctx.runtime),
+        )
     try:
         prune_old_state(ctx.root.parents[4])
     except (OSError, IndexError):
@@ -3426,30 +3445,8 @@ def command_finalize(args: argparse.Namespace) -> int:
 
 
 def _handoff(state: dict[str, Any], events: list[dict[str, Any]]) -> str:
-    goal = state.get("goal", {})
-    validation = state.get("validation", {})
-    lines = [
-        "# Agent Supervisor Handoff",
-        "",
-        f"- Goal: {goal.get('objective', '')}",
-        f"- Goal ID/version: {goal.get('goal_id', '')} / {goal.get('version', '')}",
-        f"- Mode: {state.get('execution_mode', '')}",
-        f"- Terminal: {state.get('terminal_state') or 'active'}",
-        f"- Health: {state.get('health', '')}",
-        "",
-        "## Intent coverage",
-        "",
-    ]
-    for intent in state.get("intents", []):
-        if isinstance(intent, dict):
-            lines.append(f"- [{intent.get('status', '')}] {intent.get('intent_id', '')}: {intent.get('text', '')} — {intent.get('reason', '')}")
-    lines.extend(["", "## Validation", ""])
-    errors = validation.get("errors", []) if isinstance(validation, dict) else []
-    lines.extend([f"- {item}" for item in errors] or ["- Not finalized yet."])
-    lines.extend(["", "## Recent events", ""])
-    for event in events[-20:]:
-        lines.append(f"- #{event.get('sequence')} {event.get('recorded_at')} {event.get('event_type')} {event.get('status', '')}")
-    return "\n".join(lines).rstrip() + "\n"
+    summary = build_round_process_summary(state, events)
+    return render_round_process_summary(summary)
 
 
 def command_query(args: argparse.Namespace) -> int:
@@ -3981,6 +3978,15 @@ def _normalized_tool_marker(tool_name: str) -> str:
     return re.sub(r"[^a-z]", "", unversioned)
 
 
+def _timeline_kind_for_tool(tool_name: str) -> str | None:
+    marker = _normalized_tool_marker(tool_name)
+    if marker in _WRITE_TOOL_MARKERS or marker in {
+        "applypatch", "execcommand", "bash", "shell", "pwsh", "powershell", "cmd",
+    }:
+        return "native_command"
+    return None
+
+
 def _apply_patch_write_paths(tool_input: dict[str, Any]) -> tuple[list[str], str | None]:
     raw_patch = next(
         (
@@ -4063,6 +4069,126 @@ def _normalize_classifier_command(raw: Any) -> str | None:
     return normalized or None
 
 
+_T3_RISK_CATEGORIES = {
+    "force-push",
+    "recursive-delete",
+    "db-migration",
+    "deploy",
+    "secret-mutation",
+    "billing",
+    "mail-send",
+    "money-trade",
+}
+_WRITE_RISK_CATEGORIES = {
+    "write-lease",
+    "write-scope",
+    "apply-patch-parse",
+}
+
+
+def _risk_tier_for_category(category: str | None) -> str:
+    if not category:
+        return "none"
+    if category in _T3_RISK_CATEGORIES:
+        return "t3"
+    if category in _WRITE_RISK_CATEGORIES:
+        return "write"
+    return "none"
+
+
+def _stamp_pretool_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    stamped = dict(policy)
+    stamped.setdefault("risk_tier", _risk_tier_for_category(str(stamped.get("category") or "") or None))
+    return stamped
+
+
+def _goal_criterion_ids(goal: dict[str, Any]) -> set[str]:
+    return {
+        str(row.get("criterion_id") or "").strip()
+        for row in goal.get("acceptance_criteria") or []
+        if isinstance(row, dict) and str(row.get("criterion_id") or "").strip()
+    }
+
+
+def _lease_criterion_ids(task: dict[str, Any]) -> list[str]:
+    return [
+        str(item).strip()
+        for item in task.get("criterion_ids") or []
+        if str(item).strip()
+    ]
+
+
+def goal_drift_report(state: dict[str, Any]) -> dict[str, Any]:
+    """Compare the live GoalContract against the signed request_manifest."""
+    goal = state.get("goal") if isinstance(state.get("goal"), dict) else {}
+    manifest = state.get("request_manifest") if isinstance(state.get("request_manifest"), dict) else {}
+    current_hash = canonical_sha256(goal) if goal else ""
+    bound_hash = str(manifest.get("goal_sha256") or "")
+    id_mismatch = bool(manifest) and (
+        str(manifest.get("goal_id") or "") != str(goal.get("goal_id") or "")
+        or (
+            manifest.get("goal_version") is not None
+            and manifest.get("goal_version") != goal.get("version")
+        )
+    )
+    hash_mismatch = bool(bound_hash and current_hash and bound_hash != current_hash)
+    drifted = id_mismatch or hash_mismatch
+    return {
+        "status": "drift" if drifted else "aligned",
+        "goal_id": goal.get("goal_id"),
+        "goal_version": goal.get("version"),
+        "change_mode": goal.get("change_mode"),
+        "goal_sha256": current_hash or None,
+        "request_manifest_goal_sha256": bound_hash or None,
+        "reason": (
+            "goal contract diverged from signed request_manifest"
+            if drifted
+            else "goal aligned with signed request_manifest"
+        ),
+    }
+
+
+def emit_stage_checkpoint(
+    ctx: StateContext,
+    state: dict[str, Any],
+    *,
+    reason: str,
+    actor: str,
+) -> dict[str, Any]:
+    """Persist a short handoff and a structured drift check before a risky stage."""
+    drift = goal_drift_report(state)
+    summary = build_round_process_summary(state, ctx.events())
+    handoff_text = render_round_process_summary(summary)
+    handoff_written = False
+    try:
+        default_output = (
+            Path(ctx.workspace)
+            / ".agent-supervisor"
+            / "handoffs"
+            / sha256_text(str(ctx.session))
+            / "latest.md"
+        )
+        output = resolve_handoff_output_path(ctx.workspace, ctx.session, str(default_output))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(output, handoff_text.encode("utf-8"))
+        handoff_written = True
+    except (OSError, TypeError, ValueError):
+        handoff_written = False
+    event = {
+        "event_type": "stage_checkpoint",
+        "status": "drift" if drift["status"] == "drift" else "recorded",
+        "reason": reason,
+        "actor": actor,
+        "goal_drift": drift,
+        "handoff_sha256": sha256_text(handoff_text),
+        "handoff_written": handoff_written,
+        "summary_contract": "RoundProcessSummary/v1",
+        "goal_id": drift.get("goal_id"),
+        "goal_version": drift.get("goal_version"),
+    }
+    return ctx.append_event(event)
+
+
 def _t3_command_action(tool_input: dict[str, Any]) -> tuple[str, str] | None:
     """Classify obvious T3 commands for local, best-effort audit gating.
 
@@ -4121,7 +4247,7 @@ def _t3_command_action(tool_input: dict[str, Any]) -> tuple[str, str] | None:
     return (category, sha256_text(command)) if category else None
 
 
-def _pretool_policy(
+def _evaluate_pretool_policy(
     state: dict[str, Any], *, tool_name: str, tool_input: dict[str, Any], actor: str
 ) -> dict[str, Any]:
     t3_action = _t3_command_action(tool_input)
@@ -4200,6 +4326,8 @@ def _pretool_policy(
         and isinstance(task.get("allowed_paths"), list)
     ]
     path_hashes: list[str] = []
+    bound_criteria: list[str] = []
+    goal_criteria = _goal_criterion_ids(goal_contract)
     for value in write_paths:
         relative = canonical_workspace_path(workspace, value)
         if relative is None:
@@ -4240,7 +4368,12 @@ def _pretool_policy(
                 "path_sha256": sha256_text(relative),
                 "reason": "write path is outside the active GoalContract or project policy scope",
             }
-        if not any(path_matches_lease(relative, list(task.get("allowed_paths", []))) for task in active_leases):
+        covering = [
+            task
+            for task in active_leases
+            if path_matches_lease(relative, list(task.get("allowed_paths", [])))
+        ]
+        if not covering:
             return {
                 "deny": True,
                 "hard_deny": False,
@@ -4249,14 +4382,47 @@ def _pretool_policy(
                 "path_sha256": sha256_text(relative),
                 "reason": "no active lease owned by this actor covers the canonical write path",
             }
+        path_bound = [
+            criterion_id
+            for task in covering
+            for criterion_id in _lease_criterion_ids(task)
+            if not goal_criteria or criterion_id in goal_criteria
+        ]
+        if goal_criteria and not path_bound:
+            return {
+                "deny": True,
+                "hard_deny": False,
+                "category": "write-lease",
+                "status": "denied",
+                "path_sha256": sha256_text(relative),
+                "goal_id": goal_contract.get("goal_id"),
+                "goal_version": goal_contract.get("version"),
+                "criterion_ids": [],
+                "reason": "active lease is not bound to a current goal criterion",
+            }
+        bound_criteria.extend(path_bound)
+    unique_criteria = list(dict.fromkeys(bound_criteria))
     return {
         "deny": False,
         "hard_deny": False,
         "category": "write-lease",
         "status": "authorized",
         "path_sha256": path_hashes[0] if len(path_hashes) == 1 else sha256_text("\n".join(path_hashes)),
+        "goal_id": goal_contract.get("goal_id"),
+        "goal_version": goal_contract.get("version"),
+        "criterion_ids": unique_criteria,
         "reason": "all canonical write paths are covered by an active actor-owned lease",
     }
+
+
+def _pretool_policy(
+    state: dict[str, Any], *, tool_name: str, tool_input: dict[str, Any], actor: str
+) -> dict[str, Any]:
+    return _stamp_pretool_policy(
+        _evaluate_pretool_policy(
+            state, tool_name=tool_name, tool_input=tool_input, actor=actor
+        )
+    )
 
 
 def _persist_hook_degraded(payload: Any, args: argparse.Namespace, exc: Exception) -> None:
@@ -4533,15 +4699,26 @@ def command_hook(args: argparse.Namespace) -> int:
                     else "observed"
                 )
             if policy.get("category"):
+                goal_row = state.get("goal") if isinstance(state.get("goal"), dict) else {}
                 ctx.append_event({
                     "event_type": "pretool_policy",
                     "invocation_id": invocation_id,
                     "category": policy.get("category"),
+                    "risk_tier": policy.get("risk_tier") or _risk_tier_for_category(
+                        str(policy.get("category") or "") or None
+                    ),
                     "status": effective_status,
                     "policy_status": policy.get("status"),
                     "execution_mode": execution_mode,
                     "would_deny": would_deny,
                     "hard_deny": policy.get("hard_deny") is True,
+                    "goal_id": policy.get("goal_id") or goal_row.get("goal_id"),
+                    "goal_version": (
+                        policy.get("goal_version")
+                        if policy.get("goal_version") is not None
+                        else goal_row.get("version")
+                    ),
+                    "criterion_ids": list(policy.get("criterion_ids") or []),
                     **({"action_sha256": policy["action_sha256"]} if policy.get("action_sha256") else {}),
                     **({"granting_request_sha256": policy["granting_request_sha256"]} if policy.get("granting_request_sha256") else {}),
                     **({"path_sha256": policy["path_sha256"]} if policy.get("path_sha256") else {}),
@@ -4595,10 +4772,14 @@ def command_hook(args: argparse.Namespace) -> int:
                     })
                 print(json.dumps(output, ensure_ascii=False))
                 return EXIT_COMPLETE
+            attempt_details = {"summary": f"{tool_name} attempt", **_invocation_state_binding(state)}
+            tool_kind = _timeline_kind_for_tool(tool_name)
+            if tool_kind:
+                attempt_details["kind"] = tool_kind
             ctx.append_event(invocation_event(
                 invocation_id=invocation_id, capability=capability_name, stage="attempt", result=None,
                 actor=host_actor,
-                details={"summary": f"{tool_name} attempt", **_invocation_state_binding(state)},
+                details=attempt_details,
                 identity_assurance=_hook_identity_assurance(args.runtime),
                 responsibility_group=host_responsibility_group,
             ))
@@ -4630,16 +4811,29 @@ def command_hook(args: argparse.Namespace) -> int:
             )
             result_name = "failed" if failed else "success"
             ctx.update(lambda state_value: _record_breaker_result(state_value, capability_name, result_name))
+            result_details = {"summary": f"{tool_name} completed", **_invocation_state_binding(state)}
+            tool_kind = _timeline_kind_for_tool(tool_name)
+            if tool_kind:
+                result_details["kind"] = tool_kind
             ctx.append_event(invocation_event(
                 invocation_id=invocation_id, capability=capability_name, stage="result", result=result_name,
                 actor=host_actor,
-                details={"summary": f"{tool_name} completed", **_invocation_state_binding(state)},
+                details=result_details,
                 identity_assurance=_hook_identity_assurance(args.runtime),
                 responsibility_group=host_responsibility_group,
             ))
             print("{}")
             return EXIT_COMPLETE
+        if args.event == "PreCompact":
+            emit_stage_checkpoint(
+                ctx, state, reason="precompact", actor=host_actor,
+            )
+            print("{}")
+            return EXIT_COMPLETE
         if args.event == "SubagentStart":
+            emit_stage_checkpoint(
+                ctx, state, reason="subagent_start", actor=host_actor,
+            )
             ctx.append_event({
                 "event_type": "subagent_start",
                 "status": "observed",

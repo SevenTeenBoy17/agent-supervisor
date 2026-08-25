@@ -17,7 +17,7 @@ from supervisor_core.cli import (
     _routing_intents_for_start,
     command_hook,
 )
-from supervisor_core.contracts import normalize_intents
+from supervisor_core.contracts import invocation_event, normalize_intents
 from supervisor_core.discovery import scan_project_agents
 from supervisor_core.lifecycle import start_round
 from supervisor_core.routing import route_intents, split_intents
@@ -787,3 +787,114 @@ def test_invalid_dependency_graphs_fail_closed(
     assert route["dependency_graph"]["status"] == "invalid"
     assert any(expected_error in error for error in route["errors"])
     assert route["phases"] == []
+
+
+def test_handoff_summary_redacts_prompt_argv_cookie_token_db_pii_stack_and_stdio(
+    tmp_path: Path,
+) -> None:
+    prompt_secret = "PROMPT-LEAK-ALPHA-9182"
+    argv_secret = "hunter2-argv-secret"
+    cookie_secret = "session=cookie-leak-xyz"
+    token_secret = "sk_live_" + "t" * 24
+    db_secret = "postgresql://fixture-db:fixture-pass@db.invalid/app"
+    pii_name = "学生张三"
+    pii_stu = "学号20260824001"
+    pii_phone = "13800138000"
+    stack_secret = "SECRET_STACK_FRAME_9911"
+    stdout_secret = "SECRET_STDOUT_PAYLOAD_7733"
+    stderr_secret = "SECRET_STDERR_PAYLOAD_6622"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = StateContext.build(
+        runtime="codex",
+        project="privacy-routing",
+        workspace=str(workspace),
+        session="privacy-summary",
+        round_id="privacy-summary-round",
+        state_root=str(tmp_path / "state"),
+    )
+    message = f"API security audit {SENSITIVE_PHRASE}"
+    private_config = {"project_id": "privacy-routing", "privacy": {"persist_raw_prompts": False}}
+    safe_goal, safe_intents, withheld = _privacy_safe_prompt_contract(
+        message, private_config, _atomic_intents()
+    )
+    assert withheld
+    state = start_round(
+        ctx,
+        message=message,
+        change_mode="replace",
+        execution_mode="observe",
+        project_config=private_config,
+        quality_profile={},
+        goal_supplied=safe_goal,
+        intents_supplied=safe_intents,
+    )
+
+    def persist(current: dict[str, object]) -> None:
+        current["capability_inventory"] = copy.deepcopy(_inventory())
+        current["terminal_state"] = "incomplete"
+
+    persisted = ctx.update(persist)
+    details = {
+        "summary": f"handled {pii_name} {pii_stu} {pii_phone}",
+        "prompt": f"{message}; {prompt_secret}",
+        "argv": ["audit-tool", "--password", argv_secret, f"--token={token_secret}"],
+        "cookie": f"Cookie: {cookie_secret}",
+        "token": token_secret,
+        "database_url": db_secret,
+        "stack": (
+            "Traceback (most recent call last):\n"
+            f"  File \"audit.py\", line 4, in run\n{stack_secret}"
+        ),
+        "stdout": stdout_secret,
+        "stderr": stderr_secret,
+    }
+    # Secrets stay in the in-memory view path. Attested ledger writes refuse
+    # integrity-bound mutation, which is the controlled-storage boundary.
+    events = list(ctx.events())
+    events.extend([
+        invocation_event(
+            invocation_id="inv-privacy",
+            capability="api-security-audit",
+            stage="attempt",
+            result=None,
+            actor="worker-a",
+            responsibility_group="api-implementation",
+            identity_assurance="host-hook-observed",
+            details=copy.deepcopy(details),
+        ),
+        invocation_event(
+            invocation_id="inv-privacy",
+            capability="api-security-audit",
+            stage="result",
+            result="success",
+            actor="worker-a",
+            responsibility_group="api-implementation",
+            identity_assurance="host-hook-observed",
+            details=copy.deepcopy(details),
+        ),
+    ])
+    handoff = _handoff(persisted, events)
+    assert handoff.startswith("# RoundProcessSummary/v1")
+    for secret in (
+        SENSITIVE_PHRASE,
+        prompt_secret,
+        argv_secret,
+        cookie_secret,
+        token_secret,
+        db_secret,
+        "张三",
+        "20260824001",
+        pii_phone,
+        stack_secret,
+        stdout_secret,
+        stderr_secret,
+        "fixture-pass",
+        "Traceback",
+    ):
+        assert secret not in handoff
+    assert "api-security-audit" in handoff
+    assert "终态 incomplete" in handoff
+    assert "未宣称 complete" in handoff
+    assert SENSITIVE_PHRASE not in ctx.state_file.read_text(encoding="utf-8")
+    assert SENSITIVE_PHRASE not in ctx.events_file.read_text(encoding="utf-8")

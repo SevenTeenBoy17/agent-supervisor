@@ -21,6 +21,39 @@ from .workspace import (
     workspace_delta,
 )
 
+PROGRESS_GUARD_ALLOW = "allow"
+PROGRESS_GUARD_REFUSE_REDUNDANT = "refuse-redundant"
+
+
+def progress_guard_decision(intent: dict[str, Any], capability_id: str) -> str:
+    """Decide whether routing a capability again would produce new evidence."""
+    cap = str(capability_id or "").strip()
+    if not cap or not isinstance(intent, dict):
+        return PROGRESS_GUARD_REFUSE_REDUNDANT
+    current_evidence = {
+        str(item).strip()
+        for item in intent.get("evidence_ids") or []
+        if str(item).strip()
+    }
+    attempts = intent.get("attempted_capabilities")
+    if not isinstance(attempts, list):
+        return PROGRESS_GUARD_ALLOW
+    for raw in attempts:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("capability_id") or "").strip() != cap:
+            continue
+        prior_evidence = {
+            str(item).strip()
+            for item in raw.get("evidence_ids") or []
+            if str(item).strip()
+        }
+        if current_evidence - prior_evidence:
+            return PROGRESS_GUARD_ALLOW
+        return PROGRESS_GUARD_REFUSE_REDUNDANT
+    return PROGRESS_GUARD_ALLOW
+
+
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
 _PLACEHOLDER = re.compile(r"(?i)\b(?:tbd|todo|fixme|placeholder|trust\s+me|稍后|待定|未解决)\b")
@@ -1268,6 +1301,13 @@ def _validate_intents(
                 errors.append(
                     f"intent {intent.get('intent_id', index)} has no completion-trusted correlated invocation and no locally-audited correlated capability invocation"
                 )
+            for capability_id in capabilities or []:
+                if not isinstance(capability_id, str) or not capability_id.strip():
+                    continue
+                if progress_guard_decision(intent, capability_id) == PROGRESS_GUARD_REFUSE_REDUNDANT:
+                    errors.append(
+                        f"intent {intent.get('intent_id', index)} covered with redundant capability {capability_id}"
+                    )
         elif status == "skipped":
             if not _nonempty_string(intent.get("reason")) or intent.get("reason") == "awaiting routing":
                 errors.append(f"intent {intent.get('intent_id', index)} skipped without concrete reason")
@@ -1796,10 +1836,31 @@ def _validate_changes_and_reviews(
                     or verification.get("evidence_ids") != rerun_ids
                 ):
                     errors.append(f"review {review.get('review_id')} evidence verification assertion invalid")
+                unresolved = _unresolved_p0_p1_markers(review)
+                if unresolved:
+                    errors.append(
+                        f"review {review.get('review_id')} has unresolved P0/P1: {', '.join(unresolved[:8])}"
+                    )
                 if review.get("verdict") == "APPROVE":
-                    approvals += 1
+                    if unresolved:
+                        errors.append(
+                            f"review {review.get('review_id')} APPROVE is blocked by unresolved P0/P1"
+                        )
+                    else:
+                        approvals += 1
                 else:
                     errors.append(f"review {review.get('review_id')} verdict {review.get('verdict')}")
+            policy = state.get("quality_profile") if isinstance(state.get("quality_profile"), dict) else {}
+            completion_policy = policy.get("completion_policy") if isinstance(policy.get("completion_policy"), dict) else {}
+            if completion_policy.get("unresolved_p0_p1_blocks_complete") is not False:
+                for review in reviews:
+                    if not isinstance(review, dict):
+                        continue
+                    unresolved = _unresolved_p0_p1_markers(review)
+                    if unresolved:
+                        errors.append(
+                            f"unresolved P0/P1 block complete: {review.get('review_id')}"
+                        )
             if approvals == 0:
                 errors.append("no independent APPROVE review for changed diff")
             if _test_paths_changed(changes) and test_integrity_approvals == 0:
@@ -2026,6 +2087,35 @@ def _validate_criteria_and_waivers(state: dict[str, Any], satisfied_labels: dict
     return valid_waived
 
 
+def _unresolved_p0_p1_markers(review: dict[str, Any]) -> list[str]:
+    markers: list[str] = []
+    raw_count = review.get("unresolved_p0_p1")
+    if type(raw_count) is int and raw_count > 0:
+        markers.append(f"count:{raw_count}")
+    artifact = review.get("review_output_artifact")
+    summary = artifact.get("review_summary") if isinstance(artifact, dict) else None
+    issues = summary.get("issues") if isinstance(summary, dict) else None
+    if isinstance(issues, list):
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            severity = str(issue.get("severity") or issue.get("level") or "").strip().upper()
+            if severity in {"P0", "P1"}:
+                issue_id = str(issue.get("id") or issue.get("path") or severity).strip()
+                markers.append(f"{severity}:{issue_id}")
+    return markers
+
+
+def _validate_stage_checkpoints(events: list[dict[str, Any]], errors: list[str]) -> None:
+    for event in events:
+        if not isinstance(event, dict) or event.get("event_type") != "stage_checkpoint":
+            continue
+        drift = event.get("goal_drift") if isinstance(event.get("goal_drift"), dict) else {}
+        if event.get("status") == "drift" or drift.get("status") == "drift":
+            errors.append("goal drift recorded at stage checkpoint; round cannot complete")
+            return
+
+
 def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -2075,6 +2165,7 @@ def validate_state(state: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
     _validate_changes_and_reviews(state, evidence_by_id, events, errors, warnings, observed)
     _validate_quality(state, evidence_by_id, errors, observed)
     valid_waived = _validate_criteria_and_waivers(state, satisfied_labels, errors)
+    _validate_stage_checkpoints(events, errors)
     if state.get("health") == "degraded":
         errors.append("supervisor health degraded")
     return {
