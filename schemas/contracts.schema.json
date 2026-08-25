@@ -396,7 +396,7 @@
     "RoundProcessSummaryQuality": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["gates", "review_verdict", "unresolved_p0_p1", "degraded_fallbacks"],
+      "required": ["gates", "review_verdict", "unresolved_p0_p1", "degraded_fallbacks", "redundancy"],
       "properties": {
         "gates": {
           "type": "array",
@@ -420,6 +420,16 @@
         "degraded_fallbacks": {
           "type": "array",
           "items": {"type": "string", "minLength": 1}
+        },
+        "redundancy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["refused_redundant", "already_covered_skipped", "degraded_fallbacks"],
+          "properties": {
+            "refused_redundant": {"type": "integer", "minimum": 0},
+            "already_covered_skipped": {"type": "integer", "minimum": 0},
+            "degraded_fallbacks": {"type": "integer", "minimum": 0}
+          }
         }
       }
     }

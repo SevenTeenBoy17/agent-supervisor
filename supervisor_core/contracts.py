@@ -1047,6 +1047,36 @@ def _trusted_reviews(state: dict[str, Any]) -> list[dict[str, Any]]:
     return trusted
 
 
+def _redundancy_stats(state: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, int]:
+    """Count signed refused-redundant, already-covered skips, and fallback facts."""
+    refused = 0
+    covered_skips = 0
+    route = state.get("capability_route") if isinstance(state.get("capability_route"), dict) else {}
+    for row in _list(route.get("rejected")):
+        if isinstance(row, dict) and row.get("status") == "refused-redundant":
+            refused += 1
+    if refused == 0:
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if event.get("event_type") in {"invocation_result", "skill_result"}:
+                continue
+            if str(event.get("status") or "") == "refused-redundant" or str(event.get("reason") or "") == "already-attempted-without-new-evidence":
+                refused += 1
+    for intent in _list(state.get("intents")):
+        if not isinstance(intent, dict):
+            continue
+        reason = str(intent.get("reason") or "")
+        if intent.get("status") == "skipped" and ("already covered" in reason or "redundant" in reason.casefold()):
+            covered_skips += 1
+    fallbacks = _degraded_fallback_originals(state, events)
+    return {
+        "refused_redundant": refused,
+        "already_covered_skipped": covered_skips,
+        "degraded_fallbacks": len(fallbacks),
+    }
+
+
 def _quality_from_state(
     state: dict[str, Any],
     events: list[dict[str, Any]],
@@ -1138,6 +1168,7 @@ def _quality_from_state(
         "review_verdict": verdict,
         "unresolved_p0_p1": unresolved,
         "degraded_fallbacks": _degraded_fallback_originals(state, events),
+        "redundancy": _redundancy_stats(state, events),
     }
 
 
@@ -1439,8 +1470,17 @@ def render_round_process_summary(summary: dict[str, Any] | None) -> str:
     verdict = quality.get("review_verdict") or "无"
     unresolved = _list(quality.get("unresolved_p0_p1"))
     gate_text = "；".join(gate_parts) if gate_parts else "无登记门"
+    redundancy = quality.get("redundancy") if isinstance(quality.get("redundancy"), dict) else {}
     lines.append(
         f"质量：{gate_text}；独立 reviewer {verdict}；未解决 P0/P1={len(unresolved)}"
+    )
+    lines.append(
+        "冗余：拒绝重复 "
+        f"{int(redundancy.get('refused_redundant') or 0)}；"
+        "已覆盖跳过 "
+        f"{int(redundancy.get('already_covered_skipped') or 0)}；"
+        "fallback "
+        f"{int(redundancy.get('degraded_fallbacks') or 0)}"
     )
     if terminal == "complete":
         conclusion = "结论：已满足完成条件"

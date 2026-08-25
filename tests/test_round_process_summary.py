@@ -223,6 +223,12 @@ def test_schema_accepts_min_contract_and_rejects_unknown_fields() -> None:
         "review_verdict",
         "unresolved_p0_p1",
         "degraded_fallbacks",
+        "redundancy",
+    }
+    assert summary["quality"]["redundancy"] == {
+        "refused_redundant": 0,
+        "already_covered_skipped": 0,
+        "degraded_fallbacks": 0,
     }
     for item in summary["timeline"]:
         assert set(item) == {
@@ -353,10 +359,45 @@ def test_failed_original_and_fallback_are_two_independent_facts() -> None:
     assert "ev-021" in by_id["original-skill"]["evidence_ids"]
     assert "ev-023" in by_id["fallback-skill"]["evidence_ids"]
     assert "original-skill" in summary["quality"]["degraded_fallbacks"]
+    assert summary["quality"]["redundancy"]["degraded_fallbacks"] == 1
     view = render_round_process_summary(summary)
     assert "original-skill" in view
     assert "fallback-skill" in view
     assert "original-skill｜success" not in view
+    assert "冗余：拒绝重复 0；已覆盖跳过 0；fallback 1" in view
+
+
+def test_redundancy_counts_refused_redundant_and_already_covered_skips() -> None:
+    state = _state(
+        intents=[
+            {
+                "intent_id": "intent-route",
+                "status": "skipped",
+                "kind": "functional",
+                "reason": "already covered; redundant routing skipped",
+                "capability_ids": [],
+                "text": "sha256:" + "a" * 64,
+            }
+        ],
+        capability_route={
+            "rejected": [
+                {
+                    "intent_id": "intent-route",
+                    "capability_id": "dev-supervisor",
+                    "status": "refused-redundant",
+                    "reason": "already-attempted-without-new-evidence",
+                }
+            ]
+        },
+    )
+    summary = build_round_process_summary(state, [])
+    assert summary["quality"]["redundancy"] == {
+        "refused_redundant": 1,
+        "already_covered_skipped": 1,
+        "degraded_fallbacks": 0,
+    }
+    view = render_round_process_summary(summary)
+    assert "冗余：拒绝重复 1；已覆盖跳过 1；fallback 0" in view
 
 
 def test_kinds_distinguish_skill_agent_plugin_native_and_methodology_only() -> None:
