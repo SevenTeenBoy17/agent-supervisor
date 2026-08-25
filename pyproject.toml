@@ -1,6 +1,6 @@
 [project]
 name = "agent-supervisor-core"
-version = "3.1.4"
+version = "3.1.5"
 description = "Runtime-neutral goal, evidence, routing, and quality supervisor"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0", "jsonschema>=4.23"]

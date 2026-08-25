@@ -1109,6 +1109,22 @@ def _record_breaker_result(state: dict[str, Any], capability: str, result: str) 
     state["updated_at"] = utc_now()
 
 
+def _intent_has_bound_evidence(
+    state: dict[str, Any], intent: dict[str, Any], record: dict[str, Any]
+) -> bool:
+    requested_ids = [
+        str(item).strip()
+        for item in list(record.get("evidence_ids") or []) + list(intent.get("evidence_ids") or [])
+        if str(item).strip()
+    ]
+    known = {
+        str(row.get("evidence_id") or "").strip()
+        for row in state.get("evidence") or []
+        if isinstance(row, dict) and str(row.get("evidence_id") or "").strip()
+    }
+    return bool(requested_ids) and all(item in known for item in requested_ids)
+
+
 def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_type: str) -> str | None:
     aliases = {
         "task_record": ("tasks", "task_id"),
@@ -1132,6 +1148,11 @@ def _apply_state_record(state: dict[str, Any], payload: dict[str, Any], event_ty
             raise InvalidState("intent disposition requires intent_id")
         for intent in state.get("intents", []):
             if isinstance(intent, dict) and intent.get("intent_id") == intent_id:
+                requested = str(record.get("status") or intent.get("status") or "")
+                if requested == "covered" and not _intent_has_bound_evidence(state, intent, record):
+                    intent["status"] = "deferred"
+                    intent["reason"] = "covered requires a bound EvidenceRecord"
+                    return intent_id
                 for key in ("status", "reason", "capability_ids", "method", "phase"):
                     if key in record:
                         intent[key] = record[key]
@@ -4910,7 +4931,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.1.4")
+    parser.add_argument("--version", action="version", version="3.1.5")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

@@ -217,6 +217,9 @@ _NUMBERED_NEW_TOPIC = re.compile(r"(请先|深度思考如何|另外|此外)")
 _HEADING_ONLY = re.compile(r"^(?:我的)?核心功能需求是$|^需求如下$|^如下$")
 _NOISE_CLAUSES = {"思考分析", "明确过程", "其中表面", "结构等", "插件应用等"}
 _DEFAULT_CLAUSE_SPLIT = re.compile(r"[。！？!?；;，,、：\n]+")
+_PRIMARY_TASK_SECTION = re.compile(
+    r"(?:^|\n)\s*(?:验证任务|本次模拟任务|本次任务|工作任务)\s*[：:]"
+)
 _CONJUNCTION_SPLIT = re.compile(
     r"(?i)\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|"
     r"\band\s+(?=(?:add|fix|update|remove|delete|run|verify|test|review|implement|build|create|ensure|support|write|check|deploy)\b)|"
@@ -326,7 +329,15 @@ def _clauses_from_numbered_message(message: str, matches: list[re.Match[str]]) -
     return clauses
 
 
-def split_intents(message: str) -> list[dict[str, Any]]:
+def _primary_task_body(message: str) -> str | None:
+    match = _PRIMARY_TASK_SECTION.search(message or "")
+    if match is None:
+        return None
+    body = message[match.end() :].strip()
+    return body or None
+
+
+def _clauses_from_message(message: str) -> list[str]:
     matches = list(_NUMBERED_MARKER.finditer(message))
     if len(matches) >= 2:
         clauses = _clauses_from_numbered_message(message, matches)
@@ -338,18 +349,50 @@ def split_intents(message: str) -> list[dict[str, Any]]:
         clauses = _split_default_clauses(numbered)
     if not clauses and message.strip():
         clauses = [message.strip()]
+    return clauses
+
+
+def split_intents(message: str) -> list[dict[str, Any]]:
+    """Split a request into atomic intents.
+
+    A marked ``验证任务：`` / ``本次任务：`` section is the product work. The
+    surrounding supervisor protocol (must-scan, do-not-complete, invocation
+    pairing) becomes scope constraints so it cannot drown the real task.
+    Unmarked numbered product requests keep the ordinary split path.
+    """
+    section = _PRIMARY_TASK_SECTION.search(message or "")
+    if section is not None:
+        product_clauses = [
+            part.strip(" ，,、")
+            for part in re.split(r"[。！？!?\n]+", message[section.end() :])
+            if part.strip(" ，,、")
+        ]
+        protocol_clauses = _clauses_from_message(message[: section.start()])
+        clause_kinds = [(clause, "scope-constraint") for clause in protocol_clauses] + [
+            (
+                clause,
+                "scope-constraint" if _is_scope_constraint_clause(clause) else "functional",
+            )
+            for clause in product_clauses
+        ]
+    else:
+        clause_kinds = [
+            (
+                clause,
+                "scope-constraint" if _is_scope_constraint_clause(clause) else "functional",
+            )
+            for clause in _clauses_from_message(message)
+        ]
     intents: list[dict[str, Any]] = []
     seen: set[str] = set()
     used_domains: set[str] = set()
-    for clause in clauses:
+    for clause, kind in clause_kinds:
         if _is_noise_clause(clause):
             continue
-        if _is_scope_constraint_clause(clause):
+        if kind == "scope-constraint":
             domain = "scope-constraint"
-            kind = "scope-constraint"
         else:
             domain = _primary_domain(_clause_domain_matches(clause), used_domains)
-            kind = "functional"
             used_domains.add(domain)
         key = intent_dedupe_key(clause)
         if not key or key in seen:

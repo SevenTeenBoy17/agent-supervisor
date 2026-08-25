@@ -393,6 +393,69 @@ def test_host_name_codex_does_not_select_unrelated_slide_skill() -> None:
     assert result["total_capability_limit"] is None
 
 
+CODEX_VERIFY_PROMPT = (
+    "使用 dev-supervisor（Supervisor v3.1.4）。本轮只在当前工作区 D:\\yuanma\\test 做验证，不要连到其他产品仓库。\n\n"
+    "必须：\n"
+    "1. 实时扫描当前已安装且启用的 Skill/Agent/Plugin，禁止用历史缓存；给出 inventory hash。\n"
+    "2. 把任务拆成多个原子意图/子任务。不同子任务、不同阶段可以调用不同 Skill。整轮没有最低数量、也没有总上限；每一阶段只选当前真正需要的能力，需要更多就开下一阶段，禁止凑数（例如 PPT、可爱 UI 等无关 Skill）。\n"
+    "3. 打开并执行选中的 SKILL.md。只有同一 invocation_id 的 attempt + result=success 才算用过；scheduled/deferred 不算成功。已 attempt 且无新证据的不得重复（refused-redundant）。\n"
+    "4. 缺证据不要宣称 complete。结束只输出 RoundProcessSummary/v1，外加「阶段 → Skill → 选用/跳过原因」。\n\n"
+    "验证任务：\n"
+    "写一份一页说明到 src/supervisor-usage.md，讲清「理解需求、扫描本地 Skill、按子任务分阶段调用、质量把关」。不要做实现以外的无关工作。"
+)
+
+
+def test_marked_verify_task_is_not_exploded_into_protocol_product_intents() -> None:
+    rows = normalize_intents(split_intents(CODEX_VERIFY_PROMPT), CODEX_VERIFY_PROMPT)
+    functional = [row for row in rows if row["kind"] == "functional"]
+    constraints = [row for row in rows if row["kind"] == "scope-constraint"]
+    joined = " ".join(row["text"] for row in functional)
+    assert constraints
+    assert any("supervisor-usage.md" in row["text"] for row in functional)
+    assert len(functional) <= 3
+    assert "实时扫描当前已安装" not in joined
+    assert all("dev-supervisor" not in row["text"] for row in functional)
+    selected = set(
+        route_intents(
+            message=CODEX_VERIFY_PROMPT,
+            inventory=_inventory(),
+            phase_budget=3,
+        )["selected_capabilities"]
+    )
+    assert selected.isdisjoint(NOISE_SKILLS)
+    assert "codex-ppt" not in selected
+
+
+def test_unmarked_numbered_product_request_still_has_three_functional_intents() -> None:
+    rows = normalize_intents(split_intents(USER_NUMBERED_REQUEST), USER_NUMBERED_REQUEST)
+    functional = [
+        row
+        for row in rows
+        if row["kind"] == "functional" and not row.get("depends_on_intent_ids")
+    ]
+    assert len(functional) >= 3
+
+
+def test_covered_disposition_without_evidence_stays_deferred() -> None:
+    from supervisor_core.cli import _intent_has_bound_evidence, _apply_state_record
+
+    state = {
+        "intents": [{"intent_id": "intent-1", "status": "deferred", "evidence_ids": []}],
+        "evidence": [],
+    }
+    payload = {
+        "record": {
+            "intent_id": "intent-1",
+            "status": "covered",
+            "reason": "wrote the file",
+        }
+    }
+    assert _intent_has_bound_evidence(state, state["intents"][0], payload["record"]) is False
+    _apply_state_record(state, payload, "intent_disposition")
+    assert state["intents"][0]["status"] == "deferred"
+    assert "EvidenceRecord" in str(state["intents"][0].get("reason") or "")
+
+
 def test_child_intents_keep_distinct_text_and_parent_link() -> None:
     rows = normalize_intents(
         [
