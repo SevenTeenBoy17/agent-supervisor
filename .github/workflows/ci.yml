@@ -85,7 +85,71 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q supervisor_core bin integrations tests
 
+      - name: Prepare hermetic Supervisor test home
+        shell: pwsh
+        env:
+          AGENT_SUPERVISOR_CI_TEST_HOME: ${{ runner.temp }}/agent-supervisor-test-home
+        run: |
+          @'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          def digest(path: Path) -> str:
+              value = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.hexdigest()
+
+          selected = {
+              "git": shutil.which("git"),
+              "python": sys.executable,
+              "pwsh": shutil.which("pwsh") or shutil.which("powershell"),
+          }
+          if any(not value for value in selected.values()):
+              raise SystemExit("CI test dependencies are unavailable")
+          executables = {
+              name: Path(str(value)).resolve(strict=True)
+              for name, value in selected.items()
+          }
+          install_home = Path(os.environ["AGENT_SUPERVISOR_CI_TEST_HOME"]).resolve()
+          registry = install_home / ".agent-supervisor" / "trusted-executables.json"
+          registry.parent.mkdir(parents=True, exist_ok=True)
+          registry.write_text(
+              json.dumps(
+                  {
+                      "contract": "TrustedExecutableRegistry/v1",
+                      "entries": {
+                          name: {
+                              "kind": "local",
+                              "path": str(path),
+                              "sha256": digest(path),
+                          }
+                          for name, path in executables.items()
+                      },
+                      "generated_at": "2000-01-01T00:00:00Z",
+                  },
+                  sort_keys=True,
+              ),
+              encoding="utf-8",
+          )
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python bin/install-agent-supervisor.py `
+            --source "$env:GITHUB_WORKSPACE" `
+            --install-home "$env:AGENT_SUPERVISOR_CI_TEST_HOME" `
+            --apply
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run tests
+        shell: pwsh
+        env:
+          HOME: ${{ runner.temp }}/agent-supervisor-test-home
+          USERPROFILE: ${{ runner.temp }}/agent-supervisor-test-home
         run: python -m pytest -q
 
       - name: Verify dry-run installation

@@ -2249,6 +2249,14 @@ def test_posix_real_executable_selection_accepts_an_explicit_fixed_candidate(
 def test_wsl_posix_production_selection_covers_versioned_python_and_pwsh_branches() -> None:
     wsl = shutil.which("wsl.exe")
     assert wsl is not None
+    usable = subprocess.run(
+        [wsl, "-e", "true"],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if usable.returncode != 0:
+        pytest.skip("Windows-hosted WSL integration requires a usable distribution")
     translated = subprocess.run(
         [wsl, "-e", "wslpath", "-a", str(CODEX_SCRIPTS / "codex-supervisor-hook.py")],
         capture_output=True,
