@@ -397,6 +397,7 @@ def test_absent_attestation_key_is_created_once_and_is_usable(
 
 
 def test_selftest_cleans_temp_tree_when_collection_raises(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_base: list[Path] = []
@@ -406,6 +407,47 @@ def test_selftest_cleans_temp_tree_when_collection_raises(
         observed_base.append(base)
         raise RuntimeError("simulated collection crash")
 
+    python = Path(cli_module.sys.executable).resolve(strict=True)
+    registry_root = tmp_path / "policy" / ".agent-supervisor"
+    registry_root.mkdir(parents=True)
+    registry = {
+        "registry_path": str(registry_root / "trusted-executables.json"),
+        "registry_sha256": "a" * 64,
+        "entries": {
+            "python": {
+                "kind": "local",
+                "path": str(python),
+                "sha256": cli_module.sha256_file(python),
+            }
+        },
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "load_trusted_executable_registry",
+        lambda: registry,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_trusted_selftest_executable",
+        lambda _registry, _aliases: (str(python), cli_module.sha256_file(python)),
+    )
+    dependency_site = tmp_path / "dependencies" / "site-packages"
+    for name in cli_module._SELFTEST_RUNTIME_PACKAGES:
+        dependency_package = dependency_site / name
+        dependency_package.mkdir(parents=True)
+        (dependency_package / "__init__.py").write_text(
+            '__version__ = "test"\n',
+            encoding="utf-8",
+        )
+    (dependency_site / "typing_extensions.py").write_text(
+        '__version__ = "test"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_trusted_selftest_dependency_paths",
+        lambda *_args, **_kwargs: [str(dependency_site)],
+    )
     monkeypatch.setattr(cli_module.subprocess, "run", explode)
 
     with pytest.raises(RuntimeError, match="collection crash"):

@@ -88,6 +88,58 @@ def test_bound_review_source_manifest_mismatch_fails_before_review(
             sys.modules[module_name] = previous
 
 
+def test_bound_review_source_uses_release_adapter_names_and_exact_core_manifest(
+    tmp_path: Path,
+) -> None:
+    module_name = "_agent_supervisor_review_source"
+    bound = types.ModuleType(module_name)
+    bound.contract = "SupervisorReviewSource/v1"
+    bound.profile_root = str(tmp_path.resolve())
+    bound.resources = {
+        "supervisor_core/__init__.py": b"VERSION = 'test'\n",
+        "integrations/codex/scripts/hook.py": b"CODEX = True\n",
+        "integrations/claude/scripts/hook.py": b"CLAUDE = True\n",
+    }
+    core_manifest = {
+        f"global-core/{name}": sha256_bytes(content)
+        for name, content in sorted(bound.resources.items())
+    }
+    bound.core_manifest_sha256 = canonical_sha256(core_manifest)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = bound
+    runner = Path(cli_module.__file__).resolve().parents[1] / "bin" / "run-coderabbit-review.py"
+    try:
+        loaded = runpy.run_path(str(runner), run_name="__supervisor_bound_review_valid__")
+        groups = loaded["source_groups"]()
+        destination = tmp_path / "review"
+        destination.mkdir()
+        manifest = loaded["prepare_review_tree"](destination, groups)
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+    observed = {row["path"]: row["sha256"] for row in manifest}
+    assert {
+        path: digest for path, digest in observed.items() if path.startswith("global-core/")
+    } == core_manifest
+    assert observed["global-codex/scripts/hook.py"] == sha256_bytes(b"CODEX = True\n")
+    assert observed["global-claude/scripts/hook.py"] == sha256_bytes(b"CLAUDE = True\n")
+
+
+def test_release_adapter_manifest_is_projected_from_immutable_resources() -> None:
+    resources = {
+        "supervisor_core/__init__.py": b"core\n",
+        "integrations/codex/scripts/hook.py": b"codex\n",
+        "integrations/claude/scripts/hook.py": b"claude\n",
+    }
+    manifest = cli_module._review_adapter_manifest(resources)
+    assert manifest == {
+        "global-claude/scripts/hook.py": sha256_bytes(b"claude\n"),
+        "global-codex/scripts/hook.py": sha256_bytes(b"codex\n"),
+    }
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
     env = os.environ.copy()
     env["GIT_CONFIG_NOSYSTEM"] = "1"

@@ -688,7 +688,7 @@ def main():
         hidden_detail = "input-read-detail-should-stay-hidden"
 
         class BrokenBinaryInput:
-            def read(self):
+            def read(self, _size: int = -1):
                 raise OSError(hidden_detail)
 
         class BrokenInput:
@@ -703,6 +703,131 @@ def main():
         self.assertEqual(rc, 0)
         record.assert_called_once_with("SessionStart", {}, "stdin_read_failed")
         self.assertNotIn(hidden_detail, output.getvalue() + errors.getvalue())
+
+    def test_hook_payload_parser_enforces_byte_structure_and_boundary_budgets(self) -> None:
+        adapter = load_module("supervisor_v3_hook_payload_boundary_probe", ADAPTER)
+
+        class ReadProbe(io.BytesIO):
+            requested: int | None = None
+
+            def read(self, size: int = -1) -> bytes:
+                self.requested = size
+                return super().read(size)
+
+        stream = ReadProbe(b"{}")
+        self.assertEqual(adapter._read_bounded_stdin(stream, maximum=2), b"{}")
+        self.assertEqual(stream.requested, 3)
+        with self.assertRaisesRegex(adapter._HookPayloadError, "too-large"):
+            adapter._read_bounded_stdin(io.BytesIO(b"{}x"), maximum=2)
+
+        invalid_payloads = (
+            b'{"private":"\xff"}',
+            b'{"session_id":"first","session_id":"second"}',
+            br'{"session_id":"first","\u0073ession_id":"second"}',
+            br'{"tool_name":"secret-\ud800"}',
+            b'{"value":NaN}',
+            b'{"value":Infinity}',
+            b'{"value":-Infinity}',
+            b'{"value":1e400}',
+        )
+        for raw in invalid_payloads:
+            with self.subTest(raw=raw[:24]):
+                with self.assertRaises(adapter._HookPayloadError):
+                    adapter._payload(raw)
+        self.assertEqual(
+            adapter._payload(br'{"value":1e308,"tool_name":"\ud83d\ude80"}'),
+            {"value": 1e308, "tool_name": "🚀"},
+        )
+
+        depth_value: object = 0
+        for _ in range(adapter.MAX_HOOK_JSON_DEPTH - 2):
+            depth_value = [depth_value]
+        at_depth_limit = json.dumps(
+            {"value": depth_value}, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertIsInstance(adapter._payload(at_depth_limit), dict)
+        # Construct the over-limit sibling explicitly so malformed JSON cannot
+        # masquerade as successful complexity enforcement.
+        depth_value = [depth_value]
+        over_depth_limit = json.dumps(
+            {"value": depth_value}, separators=(",", ":")
+        ).encode("utf-8")
+        with self.assertRaisesRegex(adapter._HookPayloadError, "complexity"):
+            adapter._payload(over_depth_limit)
+
+        boundary_items = adapter.MAX_HOOK_JSON_NODES - 3
+        at_node_limit = json.dumps(
+            {"items": [0] * boundary_items}, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertEqual(
+            len(adapter._payload(at_node_limit)["items"]),
+            boundary_items,
+        )
+        over_node_limit = json.dumps(
+            {"items": [0] * (boundary_items + 1)}, separators=(",", ":")
+        ).encode("utf-8")
+        with self.assertRaisesRegex(adapter._HookPayloadError, "complexity"):
+            adapter._payload(over_node_limit)
+
+    def test_invalid_hook_envelopes_fail_open_with_empty_metadata_only_payload(self) -> None:
+        adapter = load_module("supervisor_v3_invalid_envelope_probe", ADAPTER)
+        secret = "adapter-boundary-secret-must-not-persist"
+        depth_value: object = secret
+        for _ in range(adapter.MAX_HOOK_JSON_DEPTH - 1):
+            depth_value = [depth_value]
+        boundary_items = adapter.MAX_HOOK_JSON_NODES - 2
+        cases = {
+            "oversized": (
+                b'{"private":"'
+                + secret.encode("ascii")
+                + b"x" * adapter.MAX_HOOK_PAYLOAD_BYTES
+                + b'"}'
+            ),
+            "invalid-utf8": b'{"private":"' + secret.encode("ascii") + b'\xff"}',
+            "duplicate-key": (
+                b'{"private":"'
+                + secret.encode("ascii")
+                + b'","private":"second"}'
+            ),
+            "lone-surrogate": (
+                b'{"tool_name":"'
+                + secret.encode("ascii")
+                + br'-\ud800"}'
+            ),
+            "nonfinite-constant": (
+                b'{"session_id":NaN,"private":"'
+                + secret.encode("ascii")
+                + b'"}'
+            ),
+            "nonfinite-overflow": (
+                b'{"session_id":1e400,"private":"'
+                + secret.encode("ascii")
+                + b'"}'
+            ),
+            "over-depth": json.dumps(
+                {"value": depth_value}, separators=(",", ":")
+            ).encode("utf-8"),
+            "over-node": json.dumps(
+                {"items": [secret] * boundary_items}, separators=(",", ":")
+            ).encode("utf-8"),
+        }
+
+        class BinaryInput:
+            def __init__(self, raw: bytes) -> None:
+                self.buffer = io.BytesIO(raw)
+
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                with mock.patch.object(adapter.sys, "stdin", BinaryInput(raw)):
+                    with mock.patch.object(adapter, "_record_degraded") as record:
+                        with mock.patch.object(adapter, "_forward") as forward:
+                            self.assertEqual(
+                                adapter.main(["--event", "SessionStart"]),
+                                0,
+                            )
+                forward.assert_not_called()
+                record.assert_called_once_with("SessionStart", {}, "invalid_input")
+                self.assertNotIn(secret, repr(record.call_args))
 
     def test_internal_timeout_stays_below_registered_host_ceiling(self) -> None:
         adapter = load_module("supervisor_v3_timeout_probe", ADAPTER)
@@ -792,6 +917,230 @@ def main():
         self.assertEqual(child_args[1:4], ["-I", "-S", "-c"])
         self.assertNotIn("-m", child_args)
         self.assertNotIn("pythonpath", {name.casefold() for name in child_env})
+        dependency_roots = child_env["AGENT_SUPERVISOR_DEPENDENCY_ROOTS"].split(
+            os.pathsep
+        )
+        self.assertTrue(dependency_roots)
+        self.assertTrue(all(Path(path).is_absolute() for path in dependency_roots))
+
+    def test_dependency_roots_ignore_environment_and_reject_untrusted_paths(self) -> None:
+        adapter = load_module("supervisor_v3_dependency_root_probe", ADAPTER)
+        actual = adapter._verified_dependency_roots()
+        self.assertTrue(actual)
+        self.assertTrue(
+            all(path.name.casefold() in {"site-packages", "dist-packages"} for path in actual)
+        )
+
+        attacker = Path(self.temp.name) / "attacker" / "site-packages"
+        (attacker / "yaml").mkdir(parents=True)
+        (attacker / "yaml" / "__init__.py").write_text("", encoding="utf-8")
+        (attacker / "jsonschema").mkdir()
+        (attacker / "jsonschema" / "__init__.py").write_text("", encoding="utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_SUPERVISOR_DEPENDENCY_ROOTS": str(attacker),
+                "PYTHONUSERBASE": str(attacker.parent),
+            },
+            clear=False,
+        ):
+            with mock.patch.object(adapter.site, "getsitepackages", return_value=[str(attacker)]):
+                poisoned = adapter._verified_dependency_roots()
+        self.assertNotIn(attacker, poisoned)
+
+        with mock.patch.object(adapter.site, "getsitepackages", return_value=[]):
+            with mock.patch.object(adapter, "_trusted_user_site", return_value=attacker):
+                with self.assertRaisesRegex(FileNotFoundError, "dependency"):
+                    adapter._verified_dependency_roots()
+
+    def test_forward_ignores_poisoned_pythonuserbase(self) -> None:
+        attacker = Path(self.temp.name) / "ambient-user-base"
+        site_packages = (
+            attacker
+            / f"Python{sys.version_info.major}{sys.version_info.minor}"
+            / "site-packages"
+        )
+        marker = Path(self.temp.name) / "pythonuserbase-ran.txt"
+        for package in ("yaml", "jsonschema"):
+            package_root = site_packages / package
+            package_root.mkdir(parents=True, exist_ok=True)
+            (package_root / "__init__.py").write_text(
+                "import os, pathlib\n"
+                "pathlib.Path(os.environ['ATTACK_MARKER']).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+        env = self.env(self.stub_core)
+        env["PYTHONUSERBASE"] = str(attacker)
+        env["ATTACK_MARKER"] = str(marker)
+
+        proc = subprocess.run(
+            [sys.executable, str(ADAPTER), "--event", "SessionStart"],
+            input=json.dumps({"session_id": "userbase-poison", "cwd": "D:/project"}).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, b"")
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_dependency_roots_include_adjacent_link_free_venv(self) -> None:
+        adapter = load_module("supervisor_v3_venv_dependency_probe", ADAPTER)
+        venv = Path(self.temp.name) / "trusted-venv"
+        executable = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"trusted interpreter fixture\n")
+        (venv / "pyvenv.cfg").write_text(
+            "home = C:/trusted/base\ninclude-system-site-packages = false\n",
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            site_packages = venv / "Lib" / "site-packages"
+        else:
+            thread_abi = "t" if "t" in getattr(sys, "abiflags", "") else ""
+            site_packages = venv / "lib" / (
+                f"python{sys.version_info.major}.{sys.version_info.minor}{thread_abi}"
+            ) / "site-packages"
+        for package in ("yaml", "jsonschema"):
+            package_root = site_packages / package
+            package_root.mkdir(parents=True, exist_ok=True)
+            (package_root / "__init__.py").write_text(
+                "ORIGIN = 'venv'\n", encoding="utf-8"
+            )
+
+        base_root = Path(self.temp.name) / "trusted-base"
+        base_site = base_root / "site-packages"
+        user_base = Path(self.temp.name) / "trusted-user"
+        user_site = user_base / "site-packages"
+        for root, origin in ((base_site, "base"), (user_site, "user")):
+            for package in ("yaml", "jsonschema"):
+                package_root = root / package
+                package_root.mkdir(parents=True, exist_ok=True)
+                (package_root / "__init__.py").write_text(
+                    f"ORIGIN = {origin!r}\n", encoding="utf-8"
+                )
+
+        with mock.patch.object(adapter.sys, "executable", str(executable)):
+            with mock.patch.object(adapter.sys, "prefix", str(base_root)):
+                with mock.patch.object(adapter.sys, "base_prefix", str(base_root)):
+                    with mock.patch.object(
+                        adapter.site, "getsitepackages", return_value=[str(base_site)]
+                    ):
+                        with mock.patch.object(
+                            adapter, "_trusted_user_base", return_value=user_base
+                        ):
+                            with mock.patch.object(
+                                adapter, "_trusted_user_site", return_value=user_site
+                            ):
+                                roots = adapter._verified_dependency_roots()
+
+        self.assertEqual(roots, (site_packages,))
+
+    @unittest.skipUnless(os.name == "nt", "Windows user-site tag regression")
+    def test_windows_free_threaded_user_site_uses_winver_tag(self) -> None:
+        adapter = load_module("supervisor_v3_windows_user_site_probe", ADAPTER)
+        base = Path(self.temp.name) / "roaming-python"
+        with mock.patch.object(adapter, "_trusted_user_base", return_value=base):
+            with mock.patch.object(adapter.sys, "winver", "3.14t", create=True):
+                self.assertEqual(
+                    adapter._trusted_user_site(),
+                    base / "Python314t" / "site-packages",
+                )
+            with mock.patch.object(adapter.sys, "winver", "../../attacker", create=True):
+                self.assertIsNone(adapter._trusted_user_site())
+
+    def test_frozen_child_loads_real_venv_site_before_fallback(self) -> None:
+        adapter = load_module("supervisor_v3_frozen_venv_probe", ADAPTER)
+        venv = Path(self.temp.name) / "real-venv"
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr.decode(errors="replace"))
+        executable = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if os.name == "posix":
+            self.assertTrue(executable.is_symlink(), "expected the standard POSIX venv launcher")
+        if os.name == "nt":
+            site_packages = venv / "Lib" / "site-packages"
+        else:
+            thread_abi = "t" if "t" in getattr(sys, "abiflags", "") else ""
+            site_packages = venv / "lib" / (
+                f"python{sys.version_info.major}.{sys.version_info.minor}{thread_abi}"
+            ) / "site-packages"
+        fallback = venv / "fallback" / "site-packages"
+        for root, origin in ((site_packages, "venv"), (fallback, "fallback")):
+            for package in ("yaml", "jsonschema"):
+                package_root = root / package
+                package_root.mkdir(parents=True, exist_ok=True)
+                (package_root / "__init__.py").write_text(
+                    f"ORIGIN = {origin!r}\n", encoding="utf-8"
+                )
+
+        runner_tree = ast.parse(adapter.FROZEN_RUNTIME_RUNNER)
+        probe_tree = ast.Module(
+            body=[
+                node
+                for node in runner_tree.body
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                or (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name
+                    in {"trusted_user_base", "verified_venv_paths", "enable_dependency_paths"}
+                )
+            ],
+            type_ignores=[],
+        )
+        probe_tree.body.extend(
+            ast.parse(
+                "enable_dependency_paths()\n"
+                "import yaml, jsonschema\n"
+                "print(json.dumps({'yaml': yaml.ORIGIN, 'jsonschema': jsonschema.ORIGIN, "
+                "'paths': [yaml.__file__, jsonschema.__file__]}, sort_keys=True))\n"
+            ).body
+        )
+        ast.fix_missing_locations(probe_tree)
+        env = dict(os.environ)
+        env["AGENT_SUPERVISOR_DEPENDENCY_ROOTS"] = os.pathsep.join(
+            (str(site_packages), str(fallback))
+        )
+        proc = subprocess.run(
+            [str(executable), "-I", "-S", "-c", ast.unparse(probe_tree)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["yaml"], "venv")
+        self.assertEqual(payload["jsonschema"], "venv")
+        self.assertTrue(all(str(site_packages) in value for value in payload["paths"]))
+
+    def test_frozen_child_rejects_nonregular_venv_executable(self) -> None:
+        adapter = load_module("supervisor_v3_frozen_nonregular_probe", ADAPTER)
+        runner_tree = ast.parse(adapter.FROZEN_RUNTIME_RUNNER)
+        function = next(
+            node
+            for node in runner_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "verified_venv_paths"
+        )
+        namespace = {"os": os, "stat": stat, "sys": sys}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<probe>", "exec"), namespace)
+        directory = Path(self.temp.name) / "venv" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        directory.mkdir(parents=True)
+        with mock.patch.object(sys, "executable", str(directory)):
+            self.assertIsNone(namespace["verified_venv_paths"]())
 
     def test_mutable_core_environment_has_no_runtime_fallback(self) -> None:
         env = self.env(self.missing_core)
@@ -1840,6 +2189,59 @@ class LegacyLogSafety(unittest.TestCase):
             self.assertTrue(all(results))
             self.assertEqual({row["index"] for row in rows}, set(range(48)))
             self.assertFalse(log._log_lock_file(log._current_log_file()).exists())
+
+    def test_windows_delete_pending_lock_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-delete-pending-") as temp:
+            home = Path(temp) / "home"
+            with mock.patch.object(Path, "home", return_value=home):
+                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}):
+                    log = load_module("supervisor_v3_log_delete_pending_probe", LOG)
+
+            lock = log._log_lock_file(log._current_log_file())
+            real_open = os.open
+            observed = {"attempts": 0}
+
+            def transient_open(path, flags, *args, **kwargs):
+                if Path(path) == lock:
+                    observed["attempts"] += 1
+                    if observed["attempts"] == 1:
+                        raise PermissionError(13, "delete pending", str(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(log.os, "name", "nt"):
+                with mock.patch.object(log.os, "open", side_effect=transient_open):
+                    descriptor, acquired = log._acquire_state_lock(
+                        timeout_seconds=0.25,
+                        lock_path=lock,
+                    )
+
+            self.assertIsNotNone(descriptor)
+            self.assertEqual(acquired, lock)
+            self.assertEqual(observed["attempts"], 2)
+            log._release_state_lock(descriptor, acquired)
+            self.assertFalse(lock.exists())
+
+    def test_windows_permanent_lock_denial_has_bounded_retries(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-lock-denied-") as temp:
+            home = Path(temp) / "home"
+            with mock.patch.object(Path, "home", return_value=home):
+                with mock.patch.dict(os.environ, {"SUP_DRYRUN": "0"}):
+                    log = load_module("supervisor_v3_log_lock_denied_probe", LOG)
+
+            lock = log._log_lock_file(log._current_log_file())
+            denied = PermissionError(13, "access denied", str(lock))
+            with mock.patch.object(log.os, "name", "nt"):
+                with mock.patch.object(log.os, "open", side_effect=denied) as opened:
+                    with mock.patch.object(log.time, "sleep") as sleep:
+                        descriptor, acquired = log._acquire_state_lock(
+                            timeout_seconds=5.0,
+                            lock_path=lock,
+                        )
+
+            self.assertIsNone(descriptor)
+            self.assertEqual(acquired, lock)
+            self.assertEqual(opened.call_count, 4)
+            self.assertEqual(sleep.call_count, 3)
 
     def test_dispatch_results_override_attempts_and_v2_counts_calls_not_names(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-results-") as temp:

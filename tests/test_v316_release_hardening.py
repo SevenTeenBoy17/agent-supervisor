@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,6 +22,17 @@ def _load_builder():
     spec = importlib.util.spec_from_file_location(
         "release_builder_v316_hardening",
         ROOT / "bin" / "build-core-release-manifest.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_review_runner():
+    spec = importlib.util.spec_from_file_location(
+        "review_runner_v316_release_hardening",
+        ROOT / "bin" / "run-coderabbit-review.py",
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -162,6 +176,122 @@ def test_builder_rejects_output_through_symlinked_parent(
     with pytest.raises(ValueError, match="outside release root"):
         builder._contained_output(root, redirected / "core.zip")
     assert not (outside / "core.zip").exists()
+
+
+def test_builder_rejects_reparse_component_even_when_target_stays_inside_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    output_parent = root / "runtime"
+    output_parent.mkdir(parents=True)
+    real_is_indirection = builder._is_link_or_reparse
+
+    monkeypatch.setattr(
+        builder,
+        "_is_link_or_reparse",
+        lambda path: path == output_parent or real_is_indirection(path),
+    )
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        builder._contained_output(root, output_parent / "core.zip")
+
+
+def test_source_checkout_review_uses_only_git_indexed_release_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    source = tmp_path / "source"
+    tracked = source / "supervisor_core" / "tracked.py"
+    untracked = source / "supervisor_core" / "untracked.py"
+    staged = source / "integrations" / "codex" / "staged.py"
+    for path, content in (
+        (tracked, b"TRACKED = True\n"),
+        (untracked, b"UNTRACKED = True\n"),
+        (staged, b"STAGED = True\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    observed: dict[str, Any] = {}
+
+    def indexed_paths(command, cwd, *, timeout, env):
+        observed.update(command=command, cwd=cwd, timeout=timeout, env=env)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                b"supervisor_core/tracked.py\0"
+                b"integrations/codex/staged.py\0"
+            ),
+        )
+
+    monkeypatch.setattr(runner, "CORE_ROOT", source)
+    monkeypatch.setattr(runner, "_SOURCE_CHECKOUT", True)
+    monkeypatch.setattr(runner, "_git_environment", lambda: {})
+    monkeypatch.setattr(runner, "_run_bytes", indexed_paths)
+
+    destination = tmp_path / "review"
+    manifest = runner.prepare_review_tree(destination)
+    selected = {row["path"] for row in manifest}
+
+    assert observed["command"][:5] == [
+        "git", "ls-files", "--cached", "-z", "--",
+    ]
+    assert observed["cwd"] == source
+    assert "global-core/supervisor_core/tracked.py" in selected
+    assert "release-codex/staged.py" in selected
+    assert not any("untracked.py" in path for path in selected)
+
+
+def test_source_checkout_review_rejects_casefold_colliding_index_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    source = tmp_path / "source"
+    source.mkdir()
+
+    monkeypatch.setattr(runner, "_git_environment", lambda: {})
+    monkeypatch.setattr(
+        runner,
+        "_run_bytes",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=b"bin/Release.py\0bin/release.py\0",
+        ),
+    )
+
+    with pytest.raises(runner.ReviewScopeError, match="case-collision"):
+        runner._source_checkout_groups(source)
+
+
+def test_bound_runtime_review_does_not_require_a_git_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    bound_root = tmp_path / "bound-core"
+    source = bound_root / "supervisor_core" / "trusted.py"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"BOUND = True\n")
+
+    monkeypatch.setattr(runner, "_SOURCE_CHECKOUT", False)
+    monkeypatch.setattr(
+        runner,
+        "source_groups",
+        lambda: [("global-core", bound_root, [source])],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_source_checkout_groups",
+        lambda _root: pytest.fail("bound runtime must not consult a Git index"),
+    )
+
+    manifest = runner.prepare_review_tree(tmp_path / "review")
+
+    assert any(row["path"] == "global-core/supervisor_core/trusted.py" for row in manifest)
 
 
 def test_builder_stages_and_fully_validates_before_ordered_atomic_publication(
@@ -411,6 +541,17 @@ def test_runtime_paths_exclude_transient_trees_but_keep_repository_tests(
     )
 
 
+def test_runtime_paths_include_release_selftest_support_tools() -> None:
+    selected = {
+        path.as_posix() for path in runtime_bundle._runtime_paths(ROOT)
+    }
+
+    assert {
+        "bin/install-agent-supervisor.py",
+        "bin/scan-release-secrets.py",
+    } <= selected
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -450,3 +591,224 @@ def test_release_identity_rejects_version_different_from_manifest(tmp_path: Path
             "runtime/core.zip",
             blob,
         )
+
+
+def _git(repo: Path, *arguments: str, text: bool = True) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=text,
+    )
+
+
+def _review_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key in (
+            "PATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "PATHEXT",
+            "TMP",
+            "TEMP",
+            "TMPDIR",
+        )
+        if (value := os.environ.get(key))
+    }
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_AUTHOR_NAME": "Supervisor Review Test",
+        "GIT_AUTHOR_EMAIL": "review-test@example.invalid",
+        "GIT_COMMITTER_NAME": "Supervisor Review Test",
+        "GIT_COMMITTER_EMAIL": "review-test@example.invalid",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+    })
+    return environment
+
+
+def test_coderabbit_review_reconstructs_exact_workspace_add_modify_delete_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "config", "user.email", "review-test@example.invalid")
+    _git(source, "config", "user.name", "Review Test")
+
+    original = {
+        "tests/test_guard.py": b"def test_guard():\n    assert True\n",
+        ".github/workflows/ci.yml": b"name: ci\npermissions: read-all\n",
+        "docs/obsolete.md": b"obsolete release note\n",
+    }
+    for relative, content in original.items():
+        path = source.joinpath(*PurePosixPath(relative).parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "baseline")
+
+    current = {
+        "tests/test_guard.py": b"def test_guard():\n    assert 1 == 1\n",
+        ".github/workflows/ci.yml": b"name: ci\npermissions:\n  contents: read\n",
+        "docs/new.md": b"new release note\n",
+    }
+    for relative, content in current.items():
+        path = source.joinpath(*PurePosixPath(relative).parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (source / "docs" / "obsolete.md").unlink()
+    _git(source, "add", "-A")
+
+    delta = {
+        "tests/test_guard.py": {
+            "before": hashlib.sha256(original["tests/test_guard.py"]).hexdigest(),
+            "after": hashlib.sha256(current["tests/test_guard.py"]).hexdigest(),
+        },
+        ".github/workflows/ci.yml": {
+            "before": hashlib.sha256(original[".github/workflows/ci.yml"]).hexdigest(),
+            "after": hashlib.sha256(current[".github/workflows/ci.yml"]).hexdigest(),
+        },
+        "docs/obsolete.md": {
+            "before": hashlib.sha256(original["docs/obsolete.md"]).hexdigest(),
+            "after": None,
+        },
+        "docs/new.md": {
+            "before": None,
+            "after": hashlib.sha256(current["docs/new.md"]).hexdigest(),
+        },
+    }
+    binding = {
+        "contract": "ReviewArtifactBindingInput/v1",
+        "workspace_base_sha256": "a" * 64,
+        "workspace_head_sha256": "b" * 64,
+        "diff_hash": runner._canonical_sha256(delta),
+        "workspace_delta_manifest": delta,
+    }
+    monkeypatch.setattr(runner, "_resolved_command", lambda command: command)
+    monkeypatch.setattr(runner, "_git_environment", _review_git_environment)
+
+    materialized = runner.materialize_workspace_delta(source, binding)
+    review = tmp_path / "review"
+    review.mkdir()
+    context = review / "global-core" / "context.py"
+    context.parent.mkdir(parents=True)
+    context.write_bytes(b"CONTEXT = True\n")
+    context_manifest = [{
+        "path": "global-core/context.py",
+        "sha256": hashlib.sha256(context.read_bytes()).hexdigest(),
+    }]
+    manifest = runner.review_manifest_with_workspace_delta(
+        context_manifest,
+        materialized,
+    )
+    baseline = runner.prepare_git_repository(review, manifest, materialized)
+    head, binary_diff_sha256 = runner.review_revision_binding(review, baseline)
+
+    assert len(binary_diff_sha256) == 64
+    observed = {
+        line.split("\t", 1)[1]: line.split("\t", 1)[0]
+        for line in _git(
+            review,
+            "diff",
+            "--name-status",
+            "--no-renames",
+            baseline,
+            head,
+        ).stdout.splitlines()
+    }
+    assert observed == {
+        ".github/workflows/ci.yml": "M",
+        "docs/new.md": "A",
+        "docs/obsolete.md": "D",
+        "tests/test_guard.py": "M",
+    }
+    assert _git(review, "show", f"{baseline}:tests/test_guard.py", text=False).stdout == original[
+        "tests/test_guard.py"
+    ]
+    assert _git(review, "show", f"{head}:tests/test_guard.py", text=False).stdout == current[
+        "tests/test_guard.py"
+    ]
+    assert _git(review, "show", f"{baseline}:docs/obsolete.md", text=False).stdout == original[
+        "docs/obsolete.md"
+    ]
+    assert _git(review, "show", f"{head}:docs/new.md", text=False).stdout == current[
+        "docs/new.md"
+    ]
+    verified = runner._verified_full_snapshot_manifest(
+        review,
+        baseline,
+        head,
+        manifest,
+        delta,
+    )
+    assert verified[".github/workflows/ci.yml"] == delta[
+        ".github/workflows/ci.yml"
+    ]["after"]
+
+
+def test_coderabbit_review_fails_closed_when_bound_before_bytes_do_not_match_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "config", "user.email", "review-test@example.invalid")
+    _git(source, "config", "user.name", "Review Test")
+    target = source / "tests" / "test_guard.py"
+    target.parent.mkdir()
+    target.write_bytes(b"def test_guard():\n    assert True\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "baseline")
+    target.write_bytes(b"def test_guard():\n    assert 1 == 1\n")
+    _git(source, "add", "-A")
+    delta = {
+        "tests/test_guard.py": {
+            "before": "0" * 64,
+            "after": hashlib.sha256(target.read_bytes()).hexdigest(),
+        }
+    }
+    binding = {
+        "contract": "ReviewArtifactBindingInput/v1",
+        "workspace_base_sha256": "a" * 64,
+        "workspace_head_sha256": "b" * 64,
+        "diff_hash": runner._canonical_sha256(delta),
+        "workspace_delta_manifest": delta,
+    }
+    monkeypatch.setattr(runner, "_resolved_command", lambda command: command)
+    monkeypatch.setattr(runner, "_git_environment", _review_git_environment)
+
+    with pytest.raises(runner.ReviewArtifactError, match="before-hash-mismatch"):
+        runner.materialize_workspace_delta(source, binding)
+
+
+def test_review_source_descriptor_identity_rejects_same_size_open_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    expected = tmp_path / "expected.py"
+    replacement = tmp_path / "replacement.py"
+    expected.write_bytes(b"SAFE = True\n")
+    replacement.write_bytes(b"EVIL = True\n")
+    assert expected.stat().st_size == replacement.stat().st_size
+    real_open = runner.os.open
+
+    def redirected_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == expected:
+            return real_open(replacement, flags, *args, **kwargs)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(runner.os, "open", redirected_open)
+
+    with pytest.raises(runner.ReviewScopeError, match="source-mutated"):
+        runner._stable_regular_bytes(expected)

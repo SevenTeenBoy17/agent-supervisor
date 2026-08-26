@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -222,6 +223,39 @@ def _review_binding_and_output(category: str = "independent") -> tuple[dict, dic
 def _automated_review_context(
     valid_bundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[StateContext, dict, dict, dict]:
+    trusted_python_path = Path(sys.executable).resolve(strict=True)
+    git_command = shutil.which("git")
+    assert git_command is not None
+    trusted_git_path = Path(git_command).resolve(strict=True)
+    registry_path = tmp_path / "review-machine-policy" / "trusted-executables.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "contract": "TrustedExecutableRegistry/v1",
+                "entries": {
+                    "git": {
+                        "kind": "local",
+                        "path": str(trusted_git_path),
+                        "sha256": sha256_file(trusted_git_path),
+                    },
+                    "python": {
+                        "kind": "local",
+                        "path": str(trusted_python_path),
+                        "sha256": sha256_file(trusted_python_path),
+                    }
+                },
+                "generated_at": "2026-08-25T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        trust_module,
+        "trusted_executable_registry_path",
+        lambda: registry_path,
+    )
     registry = load_trusted_executable_registry()
     public_registry = registry_public_record(registry)
     trusted_python = public_registry["entries"]["python"]["path"]

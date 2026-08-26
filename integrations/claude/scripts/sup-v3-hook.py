@@ -16,10 +16,12 @@ import json
 import math
 import os
 import re
+import site
 import stat
 import struct
 import subprocess
 import sys
+import sysconfig
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -53,6 +55,9 @@ MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_MEMBERS = 512
 MAX_HOOK_PAYLOAD_BYTES = 4 * 1024 * 1024
+MAX_HOOK_JSON_NODES = 50_000
+MAX_HOOK_JSON_DEPTH = 64
+MAX_PYVENV_CONFIG_BYTES = 64 * 1024
 KNOWN_CORE_CODES = {0, 2, 3, 4, 64}
 REGISTERED_HOOK_TIMEOUT_SECONDS = 10.0
 HOOK_TIMEOUT_SAFETY_MARGIN_SECONDS = 1.0
@@ -67,7 +72,12 @@ EVENT_ALIASES = {
     "subagent-stop": "SubagentStop",
 }
 SAFE_FILE_NOT_FOUND_REASONS = frozenset(
-    {"active_pointer_rejected", "core_rejected", "core_missing"}
+    {
+        "active_pointer_rejected",
+        "core_dependency_missing",
+        "core_rejected",
+        "core_missing",
+    }
 )
 FAILURE_STATUSES = frozenset(
     {"error", "failed", "failure", "denied", "rejected", "cancelled", "canceled"}
@@ -133,6 +143,245 @@ def _canonical_existing(path: Path, *, directory: bool) -> Path | None:
     if os.path.normcase(str(resolved)) != os.path.normcase(str(lexical)):
         return None
     return resolved
+
+
+def _contained_path(path: Path, root: Path) -> bool:
+    try:
+        common = os.path.commonpath((str(path), str(root)))
+    except (OSError, ValueError):
+        return False
+    return os.path.normcase(common) == os.path.normcase(str(root))
+
+
+def _trusted_user_base() -> Path | None:
+    """Resolve the OS account's Python base without ambient home/base variables."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+            class GUID(ctypes.Structure):
+                _fields_ = (
+                    ("data1", wintypes.DWORD),
+                    ("data2", wintypes.WORD),
+                    ("data3", wintypes.WORD),
+                    ("data4", ctypes.c_ubyte * 8),
+                )
+
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            advapi32.OpenProcessToken.argtypes = (
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.HANDLE),
+            )
+            advapi32.OpenProcessToken.restype = wintypes.BOOL
+            shell32.SHGetKnownFolderPath.argtypes = (
+                ctypes.POINTER(GUID),
+                wintypes.DWORD,
+                wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+            ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+            ole32.CoTaskMemFree.restype = None
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(),
+                0x0008,  # TOKEN_QUERY
+                ctypes.byref(token),
+            ):
+                return None
+            try:
+                roaming_id = GUID(
+                    0x3EB685DB,
+                    0x65F9,
+                    0x4CF6,
+                    (ctypes.c_ubyte * 8)(
+                        0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D
+                    ),
+                )
+                folder = ctypes.c_void_p()
+                if shell32.SHGetKnownFolderPath(
+                    ctypes.byref(roaming_id), 0, token, ctypes.byref(folder)
+                ) != 0 or not folder.value:
+                    return None
+                try:
+                    value = ctypes.wstring_at(folder.value)
+                finally:
+                    ole32.CoTaskMemFree(folder)
+                if not value or len(value) > 32768:
+                    return None
+                return Path(value) / "Python"
+            finally:
+                kernel32.CloseHandle(token)
+        if os.name == "posix":
+            import pwd
+
+            home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            if sys.platform == "darwin" and getattr(sys, "_framework", ""):
+                return home / "Library" / str(sys._framework) / (
+                    f"{sys.version_info.major}.{sys.version_info.minor}"
+                )
+            return home / ".local"
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _trusted_user_site() -> Path | None:
+    base = _trusted_user_base()
+    if base is None:
+        return None
+    if os.name == "nt":
+        winver = getattr(sys, "winver", "")
+        if not isinstance(winver, str) or re.fullmatch(r"[0-9]{1,2}\.[0-9]{1,2}t?", winver) is None:
+            return None
+        return base / f"Python{winver.replace('.', '')}" / "site-packages"
+    if sys.platform == "darwin" and getattr(sys, "_framework", ""):
+        return base / "lib" / "python" / "site-packages"
+    thread_abi = "t" if "t" in getattr(sys, "abiflags", "") else ""
+    return base / "lib" / (
+        f"python{sys.version_info.major}.{sys.version_info.minor}{thread_abi}"
+    ) / "site-packages"
+
+
+def _verified_running_executable() -> Path | None:
+    """Allow a regular launcher or the standard POSIX venv leaf symlink."""
+    executable = _lexical_absolute(Path(sys.executable))
+    parent = _canonical_existing(executable.parent, directory=True)
+    if parent is None:
+        return None
+    try:
+        info = executable.lstat()
+        if stat.S_ISREG(info.st_mode):
+            resolved = executable.resolve(strict=True)
+            if os.path.normcase(str(resolved)) != os.path.normcase(str(executable)):
+                return None
+        elif os.name == "posix" and stat.S_ISLNK(info.st_mode):
+            resolved = executable.resolve(strict=True)
+            base_raw = getattr(sys, "_base_executable", "")
+            if not isinstance(base_raw, str) or not base_raw:
+                return None
+            base_resolved = _lexical_absolute(Path(base_raw)).resolve(strict=True)
+            if (
+                not stat.S_ISREG(resolved.stat().st_mode)
+                or os.path.normcase(str(resolved))
+                != os.path.normcase(str(base_resolved))
+            ):
+                return None
+        else:
+            return None
+    except OSError:
+        return None
+    return executable
+
+
+def _verified_venv_paths() -> tuple[Path, Path] | None:
+    """Bind a link-free venv root to the executable that launched this adapter."""
+    executable = _verified_running_executable()
+    if executable is None or executable.parent.name.casefold() not in {"bin", "scripts"}:
+        return None
+    root = _canonical_existing(executable.parent.parent, directory=True)
+    if root is None:
+        return None
+    config = _canonical_existing(root / "pyvenv.cfg", directory=False)
+    if config is None:
+        return None
+    try:
+        raw = _stable_read(config, MAX_PYVENV_CONFIG_BYTES)
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if (
+        not lines
+        or len(lines) > 64
+        or "\x00" in text
+        or not any(line.casefold().startswith("home =") for line in lines)
+    ):
+        return None
+    if os.name == "nt":
+        site_packages = root / "Lib" / "site-packages"
+    else:
+        thread_abi = "t" if "t" in getattr(sys, "abiflags", "") else ""
+        site_packages = root / "lib" / (
+            f"python{sys.version_info.major}.{sys.version_info.minor}{thread_abi}"
+        ) / "site-packages"
+    return root, site_packages
+
+
+def _verified_dependency_roots() -> tuple[Path, ...]:
+    """Select link-free interpreter-owned package roots for the isolated child."""
+    allowed: list[Path] = []
+    for raw in (
+        sys.prefix,
+        sys.base_prefix,
+        Path(sys.executable).parent,
+        _trusted_user_base(),
+    ):
+        if raw is None:
+            continue
+        trusted = _canonical_existing(Path(raw), directory=True)
+        if trusted is not None and trusted not in allowed:
+            allowed.append(trusted)
+    venv_paths = _verified_venv_paths()
+    if venv_paths is not None and venv_paths[0] not in allowed:
+        allowed.append(venv_paths[0])
+
+    selected: list[Path] = []
+    candidates: list[str] = []
+    # Preserve venv isolation: a complete venv dependency set wins over any
+    # interpreter or user-site copy, including older packages.
+    if venv_paths is not None:
+        candidates.append(str(venv_paths[1]))
+    try:
+        candidates.extend(site.getsitepackages())
+    except (AttributeError, OSError):
+        pass
+    trusted_user_site = _trusted_user_site()
+    if trusted_user_site is not None:
+        candidates.append(str(trusted_user_site))
+    for raw in candidates:
+        if not isinstance(raw, str) or not raw:
+            continue
+        candidate = _canonical_existing(Path(raw), directory=True)
+        if (
+            candidate is None
+            or candidate.name.casefold() not in {"site-packages", "dist-packages"}
+            or not any(_contained_path(candidate, root) for root in allowed)
+        ):
+            continue
+        if candidate not in selected:
+            selected.append(candidate)
+        if len(selected) >= 8:
+            break
+
+    required = {"yaml", "jsonschema"}
+    usable: list[Path] = []
+    for root in selected:
+        contributes = False
+        for package in tuple(required):
+            package_root = _canonical_existing(root / package, directory=True)
+            package_init = (
+                _canonical_existing(package_root / "__init__.py", directory=False)
+                if package_root is not None
+                else None
+            )
+            if package_init is not None:
+                required.remove(package)
+                contributes = True
+        if contributes:
+            usable.append(root)
+    if required or not usable:
+        raise FileNotFoundError("core_dependency_missing")
+    return tuple(usable)
 
 
 def _ensure_private_directory(path: Path) -> Path:
@@ -982,12 +1231,81 @@ def _record_degraded(event: str, payload: dict[str, Any], reason: str) -> None:
         _release_lock(session_fd, session_lock)
 
 
+class _HookPayloadError(ValueError):
+    """The untrusted host envelope violates the adapter input contract."""
+
+
+def _read_bounded_stdin(
+    stream: Any,
+    *,
+    maximum: int = MAX_HOOK_PAYLOAD_BYTES,
+) -> bytes:
+    """Read at most one byte beyond the hook contract before any decoding."""
+    if (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or not 0 <= maximum <= MAX_HOOK_PAYLOAD_BYTES
+    ):
+        raise ValueError("stdin-limit-invalid")
+    raw = stream.read(maximum + 1)
+    if not isinstance(raw, bytes):
+        raise TypeError("stdin-must-be-bytes")
+    if len(raw) > maximum:
+        raise _HookPayloadError("hook-payload-too-large")
+    return raw
+
+
+def _reject_hook_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _HookPayloadError("hook-payload-duplicate-key")
+        value[key] = item
+    return value
+
+
+def _reject_hook_nonfinite_constant(_value: str) -> Any:
+    raise _HookPayloadError("hook-payload-nonfinite-number")
+
+
+def _validate_hook_payload_complexity(value: Any) -> None:
+    """Apply additive node and depth budgets without recursive traversal."""
+    nodes = 0
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_HOOK_JSON_NODES or depth > MAX_HOOK_JSON_DEPTH:
+            raise _HookPayloadError("hook-payload-complexity-limit")
+        if isinstance(current, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
+                raise _HookPayloadError("hook-payload-invalid-unicode-scalar")
+        elif isinstance(current, float) and not math.isfinite(current):
+            raise _HookPayloadError("hook-payload-nonfinite-number")
+        elif isinstance(current, dict):
+            pending.extend((key, depth + 1) for key in current)
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+
+
 def _payload(raw: bytes) -> dict[str, Any]:
-    try:
-        decoded = json.loads(raw.decode("utf-8", "replace")) if raw.strip() else {}
-    except (TypeError, ValueError):
+    if not raw.strip():
         return {}
-    return decoded if isinstance(decoded, dict) else {}
+    try:
+        decoded = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_hook_duplicate_keys,
+            parse_constant=_reject_hook_nonfinite_constant,
+        )
+    except _HookPayloadError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise _HookPayloadError("hook-payload-invalid") from exc
+    if not isinstance(decoded, dict):
+        raise _HookPayloadError("hook-payload-object-required")
+    _validate_hook_payload_complexity(decoded)
+    return decoded
 
 
 FROZEN_RUNTIME_RUNNER = r'''
@@ -996,7 +1314,9 @@ import importlib.abc
 import importlib.util
 import io
 import json
+import os
 import re
+import stat
 import struct
 import sys
 import types
@@ -1016,6 +1336,212 @@ IDENTITY_FIELDS = {
 ROW_FIELDS = {"kind", "module", "path", "sha256", "size"}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_NAME = "SUPERVISOR-RUNTIME-MANIFEST.json"
+
+
+def trusted_user_base():
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+            class GUID(ctypes.Structure):
+                _fields_ = (
+                    ("data1", wintypes.DWORD),
+                    ("data2", wintypes.WORD),
+                    ("data3", wintypes.WORD),
+                    ("data4", ctypes.c_ubyte * 8),
+                )
+
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            advapi32.OpenProcessToken.argtypes = (
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.HANDLE),
+            )
+            advapi32.OpenProcessToken.restype = wintypes.BOOL
+            shell32.SHGetKnownFolderPath.argtypes = (
+                ctypes.POINTER(GUID),
+                wintypes.DWORD,
+                wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+            ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+            ole32.CoTaskMemFree.restype = None
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+            ):
+                return None
+            try:
+                roaming_id = GUID(
+                    0x3EB685DB,
+                    0x65F9,
+                    0x4CF6,
+                    (ctypes.c_ubyte * 8)(
+                        0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D
+                    ),
+                )
+                folder = ctypes.c_void_p()
+                if shell32.SHGetKnownFolderPath(
+                    ctypes.byref(roaming_id), 0, token, ctypes.byref(folder)
+                ) != 0 or not folder.value:
+                    return None
+                try:
+                    value = ctypes.wstring_at(folder.value)
+                finally:
+                    ole32.CoTaskMemFree(folder)
+                if not value or len(value) > 32768:
+                    return None
+                return os.path.join(value, "Python")
+            finally:
+                kernel32.CloseHandle(token)
+        if os.name == "posix":
+            import pwd
+
+            home = pwd.getpwuid(os.getuid()).pw_dir
+            if sys.platform == "darwin" and getattr(sys, "_framework", ""):
+                return os.path.join(
+                    home,
+                    "Library",
+                    str(sys._framework),
+                    f"{sys.version_info.major}.{sys.version_info.minor}",
+                )
+            return os.path.join(home, ".local")
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def verified_venv_paths():
+    executable = os.path.abspath(sys.executable)
+    parent = os.path.dirname(executable)
+    try:
+        if (
+            not os.path.isabs(executable)
+            or os.path.normcase(os.path.realpath(parent)) != os.path.normcase(parent)
+            or os.path.basename(parent).casefold() not in {"bin", "scripts"}
+        ):
+            return None
+        info = os.stat(executable, follow_symlinks=False)
+        resolved = os.path.realpath(executable)
+        if stat.S_ISREG(info.st_mode):
+            if os.path.normcase(resolved) != os.path.normcase(executable):
+                return None
+        elif os.name == "posix" and stat.S_ISLNK(info.st_mode):
+            base = getattr(sys, "_base_executable", "")
+            target = os.stat(resolved, follow_symlinks=False)
+            if (
+                not isinstance(base, str)
+                or not base
+                or not stat.S_ISREG(target.st_mode)
+                or os.path.normcase(resolved)
+                != os.path.normcase(os.path.realpath(os.path.abspath(base)))
+            ):
+                return None
+        else:
+            return None
+    except OSError:
+        return None
+    root = os.path.dirname(parent)
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(root):
+        return None
+    config = os.path.join(root, "pyvenv.cfg")
+    try:
+        config_lexical = os.path.abspath(config)
+        if os.path.normcase(os.path.realpath(config_lexical)) != os.path.normcase(config_lexical):
+            return None
+        before = os.stat(config_lexical, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size < 1 or before.st_size > 65536:
+            return None
+        with open(config_lexical, "rb") as handle:
+            raw = handle.read(65537)
+        after = os.stat(config_lexical, follow_symlinks=False)
+        if (
+            len(raw) != before.st_size
+            or len(raw) > 65536
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            return None
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if (
+        not lines
+        or len(lines) > 64
+        or "\x00" in text
+        or not any(line.casefold().startswith("home =") for line in lines)
+    ):
+        return None
+    if os.name == "nt":
+        site_packages = os.path.join(root, "Lib", "site-packages")
+    else:
+        thread_abi = "t" if "t" in getattr(sys, "abiflags", "") else ""
+        site_packages = os.path.join(
+            root,
+            "lib",
+            f"python{sys.version_info.major}.{sys.version_info.minor}{thread_abi}",
+            "site-packages",
+        )
+    return root, site_packages
+
+
+def enable_dependency_paths():
+    raw = os.environ.pop("AGENT_SUPERVISOR_DEPENDENCY_ROOTS", "")
+    if not raw:
+        raise ValueError("dependency-roots-missing")
+    allowed = []
+    for prefix in (
+        sys.prefix,
+        sys.base_prefix,
+        os.path.dirname(sys.executable),
+        trusted_user_base(),
+    ):
+        if not prefix or not os.path.isabs(prefix):
+            continue
+        resolved = os.path.realpath(prefix)
+        if os.path.normcase(resolved) == os.path.normcase(os.path.abspath(prefix)):
+            allowed.append(resolved)
+    venv_paths = verified_venv_paths()
+    if venv_paths is not None and venv_paths[0] not in allowed:
+        allowed.append(venv_paths[0])
+    selected = []
+    for value in raw.split(os.pathsep):
+        if not value or not os.path.isabs(value):
+            raise ValueError("dependency-root-invalid")
+        lexical = os.path.abspath(value)
+        resolved = os.path.realpath(lexical)
+        if (
+            os.path.normcase(lexical) != os.path.normcase(resolved)
+            or os.path.basename(resolved).casefold() not in {"site-packages", "dist-packages"}
+            or not os.path.isdir(resolved)
+        ):
+            raise ValueError("dependency-root-invalid")
+        trusted = False
+        for prefix in allowed:
+            try:
+                common = os.path.commonpath((resolved, prefix))
+            except ValueError:
+                continue
+            if os.path.normcase(common) == os.path.normcase(prefix):
+                trusted = True
+                break
+        if not trusted:
+            raise ValueError("dependency-root-untrusted")
+        if resolved not in selected:
+            selected.append(resolved)
+    if not selected:
+        raise ValueError("dependency-roots-missing")
+    sys.path.extend(path for path in selected if path not in sys.path)
 
 
 def reject_duplicates(pairs):
@@ -1233,6 +1759,7 @@ def run():
     identity, bundle, payload = load_frame()
     manifest, resources, module_rows = inspect_bundle(identity, bundle)
     install(identity, manifest, resources, module_rows)
+    enable_dependency_paths()
     event, state_root = sys.argv[1], sys.argv[2]
     sys.argv = [
         "agent-supervisor", "hook", "--runtime", "claude", "--event", event,
@@ -1274,8 +1801,18 @@ def _run_frozen_runtime(
     )
     env = dict(os.environ)
     for name in tuple(env):
-        if name.casefold() in {"pythonhome", "pythoninspect", "pythonpath", "pythonstartup"}:
+        if name.casefold() in {
+            "agent_supervisor_dependency_roots",
+            "pythonhome",
+            "pythoninspect",
+            "pythonuserbase",
+            "pythonpath",
+            "pythonstartup",
+        }:
             env.pop(name, None)
+    env["AGENT_SUPERVISOR_DEPENDENCY_ROOTS"] = os.pathsep.join(
+        str(path) for path in _verified_dependency_roots()
+    )
     env["AGENT_SUPERVISOR_INSTALL_HOME"] = str(_installation_home())
     state_root = _home() / ".agent-supervisor" / "state"
     proc = subprocess.run(
@@ -1331,16 +1868,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--event")
     args, _ = parser.parse_known_args(argv)
 
+    payload: dict[str, Any] = {}
     try:
-        raw = sys.stdin.buffer.read()
+        raw = _read_bounded_stdin(sys.stdin.buffer)
+    except _HookPayloadError:
+        event = _event_name(args.event or args.legacy_event, payload) or "unknown"
+        _record_degraded(event, payload, "invalid_input")
+        return 0
     except Exception:
         # The input stream itself can fail before any payload exists. Keep the
         # category fixed and path-free; never echo the exception or partial bytes.
-        payload: dict[str, Any] = {}
         event = _event_name(args.event or args.legacy_event, payload) or "unknown"
         _record_degraded(event, payload, "stdin_read_failed")
         return 0
-    payload = _payload(raw)
+    try:
+        payload = _payload(raw)
+    except _HookPayloadError:
+        event = _event_name(args.event or args.legacy_event, payload) or "unknown"
+        _record_degraded(event, payload, "invalid_input")
+        return 0
     event = _event_name(args.event or args.legacy_event, payload)
     if not event:
         _record_degraded("unknown", payload, "invalid_event")

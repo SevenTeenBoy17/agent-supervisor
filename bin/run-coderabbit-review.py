@@ -17,6 +17,7 @@ import tempfile
 import threading
 import types
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 
 MAX_REVIEW_FILES = 512
@@ -30,6 +31,7 @@ _SUBPROCESS_READ_CHUNK = 64 * 1024
 _BOUND_REVIEW_SOURCE = sys.modules.get("_agent_supervisor_review_source")
 _BOUND_CORE_TEMP: tempfile.TemporaryDirectory[str] | None = None
 _BOUND_CORE_MANIFEST_SHA256: str | None = None
+_SOURCE_CHECKOUT = False
 if (
     isinstance(_BOUND_REVIEW_SOURCE, types.ModuleType)
     and getattr(_BOUND_REVIEW_SOURCE, "contract", None) == "SupervisorReviewSource/v1"
@@ -100,6 +102,7 @@ else:
         # files are copied and hashed into the disposable review repository
         # before any external process is launched.
         PROFILE_ROOT = CORE_ROOT
+        _SOURCE_CHECKOUT = True
     else:
         raise RuntimeError("unsupported immutable Supervisor core layout")
 SUPERVISOR_DATA_ROOT = PROFILE_ROOT / ".agent-supervisor"
@@ -166,7 +169,7 @@ _KNOWN_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "credentialed-url",
         re.compile(
             r"(?i)\b(?:https?|postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss)://"
-            r"[^\s/:@]+:[^\s/@]+@[^\s/]+"
+            r"[^\s/:@]+:[^\s/@]+@[^\s/\"'`]+"
         ),
     ),
     (
@@ -209,10 +212,23 @@ _COOKIE_SESSION_LITERAL = re.compile(
     r"|\bcookie\s*:\s*(?:[A-Za-z0-9_.-]{1,64}=)?"
     r")(?:\"([^\"\r\n;]{1,512})\"|'([^'\r\n;]{1,512})'|([^\s,;)\]}]{1,512}))"
 )
-_PLACEHOLDER_MARKERS = {
-    "<", "${", "example", "dummy", "placeholder", "redacted", "changeme",
-    "process.env", "os.environ", "getenv", "environment variable", "private channel",
+_PLACEHOLDER_VALUES = {
+    "example", "dummy", "placeholder", "redacted", "[redacted]", "changeme",
+    "change-me", "environment variable", "private channel",
 }
+_ENV_PLACEHOLDER = re.compile(
+    r"(?ix)(?:"
+    r"\$\{[A-Z_][A-Z0-9_]{0,127}\}"
+    r"|process\.env\.[A-Z_][A-Z0-9_]{0,127}"
+    r"|os\.environ(?:\.get)?\(\s*['\"][A-Z_][A-Z0-9_]{0,127}['\"]\s*\)?"
+    r"|os\.environ\[\s*['\"][A-Z_][A-Z0-9_]{0,127}['\"]\s*\]?"
+    r"|getenv\(\s*['\"]?[A-Z_][A-Z0-9_]{0,127}['\"]?\s*\)?"
+    r")"
+)
+_ANGLE_PLACEHOLDER = re.compile(
+    r"(?:[A-Z][A-Z0-9_.-]{1,63}|(?i:(?:your|insert|replace|example|dummy)"
+    r"[ _-]+(?:api[ _-]?key|token|secret|password|credential)))"
+)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -486,10 +502,43 @@ def _safe_source(source_root: Path, source: Path) -> tuple[Path, Path]:
     return source_resolved, relative
 
 
+def _placeholder_value(value: str) -> bool:
+    """Recognize only complete placeholder values or explicit placeholder grammar."""
+    candidate = value.strip()
+    if (
+        len(candidate) >= 2
+        and candidate[0] == candidate[-1]
+        and candidate[0] in "`\"'"
+    ):
+        candidate = candidate[1:-1].strip()
+    if candidate.casefold() in _PLACEHOLDER_VALUES:
+        return True
+    if _ENV_PLACEHOLDER.fullmatch(candidate):
+        return True
+    if candidate.startswith("<") and candidate.endswith(">"):
+        return bool(_ANGLE_PLACEHOLDER.fullmatch(candidate[1:-1].strip()))
+    return False
+
+
+def _known_credential_placeholder(category: str, value: str) -> bool:
+    if _placeholder_value(value):
+        return True
+    if category != "credentialed-url":
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").casefold()
+        password = parsed.password or ""
+    except ValueError:
+        return False
+    return (
+        bool(hostname) and (hostname == "invalid" or hostname.endswith(".invalid"))
+    ) or _placeholder_value(password)
+
+
 def _looks_like_literal_secret(value: str, *, minimum_length: int, minimum_classes: int) -> bool:
-    candidate = value.strip().strip("`\"'")
-    lowered = candidate.casefold()
-    if len(candidate) < minimum_length or any(marker in lowered for marker in _PLACEHOLDER_MARKERS):
+    candidate = value.strip()
+    if len(candidate) < minimum_length or _placeholder_value(candidate):
         return False
     classes = sum((
         any(character.islower() for character in candidate),
@@ -505,21 +554,9 @@ def credential_finding(content: bytes) -> str | None:
     text = content.decode("utf-8", errors="ignore")
     for category, pattern in _KNOWN_CREDENTIAL_PATTERNS:
         for match in pattern.finditer(text):
-            matched = match.group(0).casefold()
-            synthetic = (
-                category != "private-key"
-                and (
-                    any(marker in matched for marker in _PLACEHOLDER_MARKERS)
-                    or (
-                        category in {
-                            "credentialed-url", "slack-webhook", "discord-webhook",
-                            "wecom-webhook",
-                        }
-                        and ".invalid" in matched
-                    )
-                )
-            )
-            if not synthetic:
+            if category == "private-key" or not _known_credential_placeholder(
+                category, match.group(0)
+            ):
                 return category
     for pattern, minimum_length, minimum_classes, category in (
         (_PASSWORD_LITERAL, 10, 3, "password-literal"),
@@ -643,26 +680,112 @@ def _configured_agent_paths(configured: dict[str, Any]) -> list[Path]:
     return paths
 
 
+_SOURCE_RELEASE_PATHS = (
+    "supervisor_core",
+    "schemas",
+    "tests",
+    "bin",
+    "README.md",
+    "pyproject.toml",
+    "VERSION",
+    ".gitignore",
+    "integrations/claude",
+    "integrations/codex",
+)
+_SOURCE_RELEASE_DIRECTORIES = {
+    "supervisor_core", "schemas", "tests", "bin",
+}
+_SOURCE_RELEASE_FILES = {"README.md", "pyproject.toml", "VERSION", ".gitignore"}
+
+
+def _source_checkout_groups(core_root: Path) -> list[tuple[str, Path, list[Path]]]:
+    """Select release-owned worktree files only when their paths exist in Git's index."""
+    root = Path(os.path.abspath(core_root))
+    completed = _run_bytes(
+        ["git", "ls-files", "--cached", "-z", "--", *_SOURCE_RELEASE_PATHS],
+        root,
+        timeout=60,
+        env=_git_environment(),
+    )
+    if completed.returncode:
+        raise ReviewScopeError("source-index-unavailable")
+    raw_output = completed.stdout
+    if not isinstance(raw_output, bytes):
+        raise ReviewScopeError("source-index-invalid")
+    encoded_paths = [item for item in raw_output.split(b"\0") if item]
+    if len(encoded_paths) > MAX_REVIEW_FILES:
+        raise ReviewScopeError("review-source-file-count-limit")
+
+    core_candidates: list[Path] = []
+    claude_candidates: list[Path] = []
+    codex_candidates: list[Path] = []
+    seen: set[str] = set()
+    seen_casefolded: set[str] = set()
+    for encoded in encoded_paths:
+        try:
+            raw_path = encoded.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReviewScopeError("source-index-path-invalid") from exc
+        relative = PurePosixPath(raw_path)
+        folded_path = raw_path.casefold()
+        if (
+            raw_path in seen
+            or not raw_path
+            or "\\" in raw_path
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ReviewScopeError("source-index-path-invalid")
+        if folded_path in seen_casefolded:
+            raise ReviewScopeError("source-index-path-case-collision")
+        seen.add(raw_path)
+        seen_casefolded.add(folded_path)
+        parts = relative.parts
+        candidate = root.joinpath(*parts)
+        if len(parts) >= 3 and parts[:2] == ("integrations", "claude"):
+            claude_candidates.append(candidate)
+        elif len(parts) >= 3 and parts[:2] == ("integrations", "codex"):
+            codex_candidates.append(candidate)
+        elif (
+            (parts[0] in _SOURCE_RELEASE_DIRECTORIES and len(parts) >= 2)
+            or (len(parts) == 1 and parts[0] in _SOURCE_RELEASE_FILES)
+        ):
+            core_candidates.append(candidate)
+        else:
+            raise ReviewScopeError("source-index-path-outside-release")
+    return [
+        ("global-core", root, core_candidates),
+        ("release-claude", root / "integrations" / "claude", claude_candidates),
+        ("release-codex", root / "integrations" / "codex", codex_candidates),
+    ]
+
+
 def source_groups(project_root: Path = PROJECT_ROOT, profile_root: Path = PROFILE_ROOT, core_root: Path = CORE_ROOT) -> list[tuple[str, Path, Iterable[Path]]]:
     # Never externalize user settings, hook registries, project manifests, or
     # prompt-bearing state. The immutable workspace binding carries only hashes
     # and paths; externally reviewed source comes from the release snapshot.
-    core_candidates: list[Path] = []
-    for relative in (
-        "supervisor_core",
-        "schemas",
-        "tests",
-        "bin",
-        "README.md",
-        "pyproject.toml",
-        "VERSION",
-        ".gitignore",
-    ):
-        candidate = core_root / relative
-        if candidate.is_dir():
-            core_candidates.extend(files_under(candidate))
-        elif candidate.is_file():
-            core_candidates.append(candidate)
+    if _BOUND_CORE_MANIFEST_SHA256 is not None:
+        # CORE_ROOT is a freshly materialized, hash-verified resource map in
+        # bound mode. Include every member so the observed global-core
+        # manifest is exactly the one supplied by the trusted core.
+        core_candidates = files_under(core_root)
+    else:
+        core_candidates = []
+        for relative in (
+            "supervisor_core",
+            "schemas",
+            "tests",
+            "bin",
+            "README.md",
+            "pyproject.toml",
+            "VERSION",
+            ".gitignore",
+        ):
+            candidate = core_root / relative
+            if candidate.is_dir():
+                core_candidates.extend(files_under(candidate))
+            elif candidate.is_file():
+                core_candidates.append(candidate)
 
     # Bind adapters to the same release snapshot as the core.  Reading the
     # user's installed skill trees would both review different bytes and risk
@@ -671,11 +794,97 @@ def source_groups(project_root: Path = PROJECT_ROOT, profile_root: Path = PROFIL
     claude_candidates = files_under(claude_root) if claude_root.is_dir() else []
     codex_root = core_root / "integrations" / "codex"
     codex_candidates = files_under(codex_root) if codex_root.is_dir() else []
+    adapter_prefix = "global" if _BOUND_CORE_MANIFEST_SHA256 is not None else "release"
     return [
         ("global-core", core_root, core_candidates),
-        ("release-claude", claude_root, claude_candidates),
-        ("release-codex", codex_root, codex_candidates),
+        (f"{adapter_prefix}-claude", claude_root, claude_candidates),
+        (f"{adapter_prefix}-codex", codex_root, codex_candidates),
     ]
+
+
+def _opened_file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(stat.S_IFMT(metadata.st_mode)),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _stable_regular_bytes(
+    path: Path,
+    *,
+    maximum: int = MAX_REVIEW_FILE_BYTES,
+    allow_empty: bool = False,
+    reason: str = "source-mutated-during-scan",
+) -> bytes:
+    """Read bytes through the descriptor whose identity was checked.
+
+    Path-stat/open/path-stat accepts an ABA substitution when the opened handle
+    is redirected to another same-sized file.  Bind all checks to the opened
+    descriptor and then prove the path still names that descriptor identity.
+    """
+    candidate = _absolute_path(path)
+    if _path_has_reparse(candidate):
+        raise ReviewScopeError(reason)
+    descriptor: int | None = None
+    try:
+        before = candidate.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_size < 1 and not allow_empty)
+            or before.st_size > maximum
+        ):
+            raise ReviewScopeError(reason)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(candidate, flags)
+        opened_before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(_SUBPROCESS_READ_CHUNK, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise ReviewScopeError(reason)
+        opened_after = os.fstat(descriptor)
+    except ReviewScopeError:
+        raise
+    except OSError:
+        raise ReviewScopeError(reason) from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    try:
+        after = candidate.lstat()
+    except OSError:
+        raise ReviewScopeError(reason) from None
+    identities = {
+        _opened_file_identity(before),
+        _opened_file_identity(opened_before),
+        _opened_file_identity(opened_after),
+        _opened_file_identity(after),
+    }
+    content = b"".join(chunks)
+    if (
+        len(identities) != 1
+        or not stat.S_ISREG(after.st_mode)
+        or len(content) != after.st_size
+        or _path_has_reparse(candidate)
+    ):
+        raise ReviewScopeError(reason)
+    return content
 
 
 def _review_category_instructions(category: str) -> bytes:
@@ -699,25 +908,21 @@ def prepare_review_tree(destination: Path, groups: list[tuple[str, Path, Iterabl
     prepared: list[tuple[str, Path, bytes]] = []
     manifest: list[dict[str, str]] = []
     total_bytes = 0
-    for label, source_root, candidates in groups or source_groups():
+    selected_groups = groups
+    if selected_groups is None:
+        selected_groups = (
+            _source_checkout_groups(CORE_ROOT)
+            if _SOURCE_CHECKOUT
+            else source_groups()
+        )
+    for label, source_root, candidates in selected_groups:
         for source in sorted(set(candidates)):
             if not source.exists() and not source.is_symlink():
                 continue
             source_resolved, relative = _safe_source(source_root, source)
             if excluded(relative):
                 continue
-            before = os.stat(source_resolved, follow_symlinks=False)
-            if before.st_size < 1 or before.st_size > MAX_REVIEW_FILE_BYTES:
-                raise ReviewScopeError("review-source-file-size-limit")
-            with source_resolved.open("rb") as handle:
-                content = handle.read(MAX_REVIEW_FILE_BYTES + 1)
-            if len(content) > MAX_REVIEW_FILE_BYTES:
-                raise ReviewScopeError("review-source-file-size-limit")
-            after = os.stat(source_resolved, follow_symlinks=False)
-            identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            if identity_before != identity_after or len(content) != after.st_size:
-                raise ReviewScopeError("source-mutated-during-scan")
+            content = _stable_regular_bytes(source_resolved)
             if credential_finding(content):
                 raise ReviewScopeError("credential-literal")
             if len(prepared) >= MAX_REVIEW_FILES:
@@ -806,59 +1011,106 @@ def _verified_full_snapshot_manifest(
     baseline: str,
     head: str,
     manifest: list[dict[str, str]],
+    workspace_delta_manifest: dict[str, dict[str, str | None]],
 ) -> dict[str, str]:
-    """Prove the artifact range is an empty tree followed by the exact payload."""
+    """Prove both trees and their A/M/D set equal the bound workspace delta."""
+
+    def tree_manifest(revision: str) -> dict[str, str]:
+        try:
+            tree = _run_bytes(
+                ["git", "ls-tree", "-rz", "--full-tree", revision],
+                repo,
+                timeout=60,
+                env=_git_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise ReviewArtifactError("review-artifact-tree-unavailable") from None
+        if tree.returncode:
+            raise ReviewArtifactError("review-artifact-tree-unavailable")
+        observed: dict[str, str] = {}
+        casefolded: set[str] = set()
+        for raw in tree.stdout.split(b"\0"):
+            if not raw:
+                continue
+            try:
+                metadata, path_bytes = raw.split(b"\t", 1)
+                mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
+                path = path_bytes.decode("utf-8")
+            except (UnicodeError, ValueError):
+                raise ReviewArtifactError("review-artifact-tree-invalid") from None
+            folded = path.casefold()
+            if (
+                mode != "100644"
+                or object_type != "blob"
+                or not _valid_delta_path(path)
+                or path in observed
+                or folded in casefolded
+            ):
+                raise ReviewArtifactError("review-artifact-tree-invalid")
+            blob = _run_bytes(
+                ["git", "cat-file", "blob", oid],
+                repo,
+                timeout=60,
+                env=_git_environment(),
+            )
+            if blob.returncode:
+                raise ReviewArtifactError("review-artifact-tree-unavailable")
+            observed[path] = hashlib.sha256(blob.stdout).hexdigest()
+            casefolded.add(folded)
+        return dict(sorted(observed.items()))
+
+    expected_head = _expected_full_snapshot_manifest(manifest)
+    expected_base = dict(expected_head)
+    expected_status: dict[str, str] = {}
+    for path, change in workspace_delta_manifest.items():
+        before = change.get("before")
+        after = change.get("after")
+        if after is None:
+            if path in expected_head:
+                raise ReviewArtifactError("review-artifact-head-delta-mismatch")
+        elif expected_head.get(path) != after:
+            raise ReviewArtifactError("review-artifact-head-delta-mismatch")
+        if before is None:
+            expected_base.pop(path, None)
+            expected_status[path] = "A"
+        else:
+            expected_base[path] = before
+            expected_status[path] = "D" if after is None else "M"
+
+    if tree_manifest(baseline) != dict(sorted(expected_base.items())):
+        raise ReviewArtifactError("review-artifact-base-manifest-mismatch")
+    if tree_manifest(head) != dict(sorted(expected_head.items())):
+        raise ReviewArtifactError("review-artifact-source-manifest-mismatch")
     try:
-        base_tree = _run_bytes(
-            ["git", "ls-tree", "-rz", "--full-tree", baseline],
-            repo,
-            timeout=60,
-            env=_git_environment(),
-        )
-        head_tree = _run_bytes(
-            ["git", "ls-tree", "-rz", "--full-tree", head],
+        changed = _run_bytes(
+            [
+                "git", "diff", "--name-status", "--no-renames", "-z",
+                baseline, head,
+            ],
             repo,
             timeout=60,
             env=_git_environment(),
         )
     except (OSError, subprocess.TimeoutExpired):
-        raise ReviewArtifactError("review-artifact-tree-unavailable") from None
-    if base_tree.returncode or base_tree.stdout:
-        raise ReviewArtifactError("review-artifact-base-not-empty")
-    if head_tree.returncode:
-        raise ReviewArtifactError("review-artifact-tree-unavailable")
-
-    observed: dict[str, str] = {}
-    for raw in head_tree.stdout.split(b"\0"):
-        if not raw:
-            continue
+        raise ReviewArtifactError("review-artifact-delta-unavailable") from None
+    if changed.returncode:
+        raise ReviewArtifactError("review-artifact-delta-unavailable")
+    fields = [field for field in changed.stdout.split(b"\0") if field]
+    if len(fields) % 2:
+        raise ReviewArtifactError("review-artifact-delta-invalid")
+    observed_status: dict[str, str] = {}
+    for offset in range(0, len(fields), 2):
         try:
-            metadata, path_bytes = raw.split(b"\t", 1)
-            mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
-            path = path_bytes.decode("utf-8")
-        except (UnicodeError, ValueError):
-            raise ReviewArtifactError("review-artifact-tree-invalid") from None
-        if (
-            mode != "100644"
-            or object_type != "blob"
-            or not _valid_delta_path(path)
-            or path in observed
-        ):
-            raise ReviewArtifactError("review-artifact-tree-invalid")
-        blob = _run_bytes(
-            ["git", "cat-file", "blob", oid],
-            repo,
-            timeout=60,
-            env=_git_environment(),
-        )
-        if blob.returncode:
-            raise ReviewArtifactError("review-artifact-tree-unavailable")
-        observed[path] = hashlib.sha256(blob.stdout).hexdigest()
-
-    expected = _expected_full_snapshot_manifest(manifest)
-    if dict(sorted(observed.items())) != expected:
-        raise ReviewArtifactError("review-artifact-source-manifest-mismatch")
-    return expected
+            status = fields[offset].decode("ascii")
+            path = fields[offset + 1].decode("utf-8")
+        except UnicodeError:
+            raise ReviewArtifactError("review-artifact-delta-invalid") from None
+        if status not in {"A", "M", "D"} or not _valid_delta_path(path) or path in observed_status:
+            raise ReviewArtifactError("review-artifact-delta-invalid")
+        observed_status[path] = status
+    if observed_status != expected_status:
+        raise ReviewArtifactError("review-artifact-delta-mismatch")
+    return expected_head
 
 
 def _bounded_text(value: Any, *, limit: int) -> str:
@@ -1363,6 +1615,7 @@ def _git_environment() -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_AUTHOR_NAME": "Supervisor Review",
         "GIT_AUTHOR_EMAIL": "supervisor-review@example.invalid",
         "GIT_COMMITTER_NAME": "Supervisor Review",
@@ -1380,9 +1633,59 @@ def _checked_git(command: list[str], repo: Path, phase: str) -> subprocess.Compl
     return completed
 
 
-def prepare_git_repository(repo: Path, manifest: list[dict[str, str]]) -> str:
-    """Create an explicit review-base -> supervisor-changes history."""
+def _stage_review_paths(repo: Path, paths: list[str], phase: str, *, all_changes: bool = False) -> None:
+    for offset in range(0, len(paths), 64):
+        chunk = paths[offset : offset + 64]
+        if not chunk:
+            continue
+        command = ["git", "add"]
+        if all_changes:
+            command.append("-A")
+        else:
+            command.append("-f")
+        command.extend(["--", *chunk])
+        _checked_git(command, repo, phase)
+
+
+def _write_delta_side(repo: Path, materialized: list[dict[str, Any]], side: str) -> None:
+    for row in materialized:
+        path = str(row["path"])
+        target = repo.joinpath(*PurePosixPath(path).parts)
+        content = row[side]
+        if content is None:
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    raise ReviewArtifactError("review-delta-target-directory")
+                target.unlink()
+            continue
+        if target.exists() and target.is_dir():
+            raise ReviewArtifactError("review-delta-target-directory")
+        if _path_has_reparse(target):
+            raise ReviewArtifactError("review-delta-target-indirection")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+
+def prepare_git_repository(
+    repo: Path,
+    manifest: list[dict[str, str]],
+    materialized: list[dict[str, Any]],
+) -> str:
+    """Create a verified real-before -> real-after review history."""
     manifest = _normalized_source_manifest(manifest)
+    if not materialized:
+        raise ReviewArtifactError("review-workspace-delta-empty")
+    delta_paths = [str(row.get("path") or "") for row in materialized]
+    if len(delta_paths) != len(set(delta_paths)):
+        raise ReviewArtifactError("review-workspace-delta-path-invalid")
+    manifest_paths = {row["path"] for row in manifest}
+    for row in materialized:
+        path = str(row["path"])
+        after_hash = row.get("after_sha256")
+        if (after_hash is None and path in manifest_paths) or (
+            after_hash is not None and path not in manifest_paths
+        ):
+            raise ReviewArtifactError("review-workspace-head-manifest-mismatch")
     manifest_file = repo / "REVIEW_MANIFEST.json"
     if manifest_file.exists() and _is_link_or_reparse(manifest_file):
         raise ReviewScopeError("destination-link-or-reparse")
@@ -1399,7 +1702,19 @@ def prepare_git_repository(repo: Path, manifest: list[dict[str, str]]) -> str:
             or any(part in {"", ".", ".."} for part in normalized.split("/"))
         ):
             raise ReviewScopeError("invalid-manifest-path")
-        payload_paths.append(normalized)
+        if normalized not in delta_paths:
+            payload_paths.append(normalized)
+
+    _write_delta_side(repo, materialized, "before")
+    baseline_paths = sorted({
+        *payload_paths,
+        *(
+            str(row["path"])
+            for row in materialized
+            if row.get("before") is not None
+        ),
+        "REVIEW_MANIFEST.json",
+    })
 
     for command, phase in (
         (["git", "init", "-q"], "init"),
@@ -1409,33 +1724,45 @@ def prepare_git_repository(repo: Path, manifest: list[dict[str, str]]) -> str:
         (["git", "config", "core.autocrlf", "false"], "line-endings"),
         (["git", "config", "core.safecrlf", "false"], "safe-line-endings"),
         (["git", "config", "core.filemode", "false"], "file-modes"),
-        (["git", "commit", "--allow-empty", "-qm", "empty review baseline"], "baseline-commit"),
-        (["git", "branch", "-M", "review-base"], "base-branch"),
     ):
         _checked_git(command, repo, phase)
-
+    _stage_review_paths(repo, baseline_paths, "baseline-stage")
+    for offset in range(0, len(baseline_paths), 64):
+        _checked_git(
+            [
+                "git", "update-index", "--chmod=-x", "--",
+                *baseline_paths[offset : offset + 64],
+            ],
+            repo,
+            "baseline-normalize-file-modes",
+        )
+    _checked_git(["git", "commit", "-qm", "Supervisor v3 review baseline"], repo, "baseline-payload-commit")
     baseline = _checked_git(
-        ["git", "rev-parse", "--verify", "refs/heads/review-base"],
+        ["git", "rev-parse", "--verify", "HEAD"],
         repo,
         "base-revision",
     ).stdout.strip()
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", baseline):
         raise RuntimeError("git-invalid-base-revision")
+    _checked_git(["git", "branch", "-M", "review-base"], repo, "base-branch")
     _checked_git(["git", "checkout", "-q", "-b", "supervisor-changes"], repo, "change-branch")
-    _checked_git(
-        ["git", "add", "-f", "--", *payload_paths, "REVIEW_MANIFEST.json"],
-        repo,
-        "stage",
+    _write_delta_side(repo, materialized, "after")
+    _stage_review_paths(repo, sorted(delta_paths), "delta-stage", all_changes=True)
+    after_paths = sorted(
+        str(row["path"])
+        for row in materialized
+        if row.get("after") is not None
     )
-    _checked_git(
-        [
-            "git", "update-index", "--chmod=-x", "--",
-            *payload_paths, "REVIEW_MANIFEST.json",
-        ],
-        repo,
-        "normalize-file-modes",
-    )
-    _checked_git(["git", "commit", "-qm", "Supervisor v3 review payload"], repo, "payload-commit")
+    for offset in range(0, len(after_paths), 64):
+        _checked_git(
+            [
+                "git", "update-index", "--chmod=-x", "--",
+                *after_paths[offset : offset + 64],
+            ],
+            repo,
+            "delta-normalize-file-modes",
+        )
+    _checked_git(["git", "commit", "-qm", "Supervisor v3 reviewed workspace delta"], repo, "delta-commit")
 
     current = _checked_git(["git", "branch", "--show-current"], repo, "current-branch").stdout.strip()
     verified_base = _checked_git(
@@ -1617,6 +1944,226 @@ def load_review_binding(path_value: str | os.PathLike[str] | None) -> dict[str, 
     return binding
 
 
+def _project_git_bytes(
+    root: Path,
+    arguments: list[str],
+    reason: str,
+) -> bytes:
+    try:
+        completed = _run_bytes(
+            ["git", *arguments],
+            root,
+            timeout=60,
+            env=_git_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ReviewArtifactError(reason) from None
+    if completed.returncode:
+        raise ReviewArtifactError(reason)
+    value = completed.stdout
+    if not isinstance(value, bytes):
+        raise ReviewArtifactError(reason)
+    return value
+
+
+def _project_repository_head(root: Path) -> str:
+    top_raw = _project_git_bytes(
+        root,
+        ["rev-parse", "--show-toplevel"],
+        "review-workspace-git-unavailable",
+    )
+    try:
+        top = Path(top_raw.decode("utf-8").strip()).resolve(strict=True)
+        expected = root.resolve(strict=True)
+    except (OSError, UnicodeError):
+        raise ReviewArtifactError("review-workspace-git-unavailable") from None
+    if (
+        os.path.normcase(str(top)) != os.path.normcase(str(expected))
+        or _path_has_reparse(expected)
+    ):
+        raise ReviewArtifactError("review-workspace-git-root-mismatch")
+    head_raw = _project_git_bytes(
+        expected,
+        ["rev-parse", "--verify", "HEAD"],
+        "review-workspace-head-unavailable",
+    )
+    try:
+        head = head_raw.decode("ascii").strip().casefold()
+    except UnicodeError:
+        raise ReviewArtifactError("review-workspace-head-unavailable") from None
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise ReviewArtifactError("review-workspace-head-unavailable")
+    return head
+
+
+def _indexed_project_paths(root: Path) -> set[str]:
+    raw = _project_git_bytes(
+        root,
+        ["ls-files", "--cached", "-z"],
+        "review-workspace-index-unavailable",
+    )
+    result: set[str] = set()
+    casefolded: set[str] = set()
+    for encoded in (item for item in raw.split(b"\0") if item):
+        try:
+            path = encoded.decode("utf-8")
+        except UnicodeError:
+            raise ReviewArtifactError("review-workspace-index-path-invalid") from None
+        folded = path.casefold()
+        if not _valid_delta_path(path) or path in result or folded in casefolded:
+            raise ReviewArtifactError("review-workspace-index-path-invalid")
+        result.add(path)
+        casefolded.add(folded)
+    return result
+
+
+def _base_blob(root: Path, head: str, path: str) -> bytes | None:
+    tree = _project_git_bytes(
+        root,
+        ["ls-tree", "-z", "--full-tree", head, "--", path],
+        "review-workspace-base-unavailable",
+    )
+    rows = [row for row in tree.split(b"\0") if row]
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise ReviewArtifactError("review-workspace-base-path-ambiguous")
+    try:
+        metadata, raw_path = rows[0].split(b"\t", 1)
+        mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
+        observed_path = raw_path.decode("utf-8")
+    except (UnicodeError, ValueError):
+        raise ReviewArtifactError("review-workspace-base-path-invalid") from None
+    if (
+        observed_path != path
+        or object_type != "blob"
+        or mode not in {"100644", "100755"}
+        or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid)
+    ):
+        raise ReviewArtifactError("review-workspace-base-path-invalid")
+    blob = _project_git_bytes(
+        root,
+        ["cat-file", "blob", oid],
+        "review-workspace-base-unavailable",
+    )
+    if len(blob) > MAX_REVIEW_FILE_BYTES:
+        raise ReviewArtifactError("review-workspace-file-size-limit")
+    return blob
+
+
+def _workspace_path(root: Path, relative: str) -> Path:
+    candidate = _absolute_path(root.joinpath(*PurePosixPath(relative).parts))
+    try:
+        candidate.relative_to(root)
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        raise ReviewArtifactError("review-workspace-path-invalid") from None
+    if _path_has_reparse(candidate):
+        raise ReviewArtifactError("review-workspace-path-indirection")
+    return candidate
+
+
+def materialize_workspace_delta(
+    project_root: Path,
+    binding: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Bind every declared before/after hash to exact bytes for external review."""
+    root = _absolute_path(project_root)
+    delta = binding.get("workspace_delta_manifest")
+    if not isinstance(delta, dict) or not delta:
+        raise ReviewArtifactError("review-workspace-delta-empty")
+    if len(delta) > MAX_REVIEW_FILES:
+        raise ReviewArtifactError("review-workspace-file-count-limit")
+    head = _project_repository_head(root)
+    indexed = _indexed_project_paths(root)
+    seen_casefolded: set[str] = set()
+    materialized: list[dict[str, Any]] = []
+    total_bytes = 0
+    for path in sorted(delta):
+        change = delta[path]
+        folded = path.casefold() if isinstance(path, str) else ""
+        if (
+            not _valid_delta_path(path)
+            or len(PurePosixPath(path).parts) > MAX_REVIEW_DEPTH
+            or folded in seen_casefolded
+            or not isinstance(change, dict)
+            or set(change) != {"before", "after"}
+        ):
+            raise ReviewArtifactError("review-workspace-delta-path-invalid")
+        seen_casefolded.add(folded)
+        before_hash = change.get("before")
+        after_hash = change.get("after")
+        if before_hash is None and after_hash is None:
+            raise ReviewArtifactError("review-workspace-delta-invalid")
+        if before_hash == after_hash:
+            raise ReviewArtifactError("review-workspace-delta-unchanged")
+
+        before = _base_blob(root, head, path)
+        if before_hash is None:
+            if before is not None:
+                raise ReviewArtifactError("review-workspace-before-presence-mismatch")
+        elif before is None or hashlib.sha256(before).hexdigest() != before_hash:
+            raise ReviewArtifactError("review-workspace-before-hash-mismatch")
+
+        candidate = _workspace_path(root, path)
+        after: bytes | None
+        if after_hash is None:
+            if candidate.exists() or candidate.is_symlink():
+                raise ReviewArtifactError("review-workspace-after-presence-mismatch")
+            after = None
+        else:
+            if path not in indexed:
+                raise ReviewArtifactError("review-workspace-after-not-indexed")
+            try:
+                after = _stable_regular_bytes(
+                    candidate,
+                    allow_empty=True,
+                    reason="review-workspace-after-unstable",
+                )
+            except ReviewScopeError as exc:
+                raise ReviewArtifactError(str(exc)) from None
+            if hashlib.sha256(after).hexdigest() != after_hash:
+                raise ReviewArtifactError("review-workspace-after-hash-mismatch")
+
+        for content in (before, after):
+            if content is None:
+                continue
+            if credential_finding(content):
+                raise ReviewArtifactError("review-workspace-credential-literal")
+            total_bytes += len(content)
+            if total_bytes > MAX_REVIEW_TOTAL_BYTES:
+                raise ReviewArtifactError("review-workspace-total-size-limit")
+        materialized.append({
+            "path": path,
+            "before": before,
+            "after": after,
+            "before_sha256": before_hash,
+            "after_sha256": after_hash,
+        })
+    if _project_repository_head(root) != head:
+        raise ReviewArtifactError("review-workspace-head-changed")
+    return materialized
+
+
+def review_manifest_with_workspace_delta(
+    context_manifest: list[dict[str, str]],
+    materialized: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    rows = _normalized_source_manifest(context_manifest)
+    by_path = {row["path"]: row["sha256"] for row in rows}
+    for row in materialized:
+        path = str(row.get("path") or "")
+        after_hash = row.get("after_sha256")
+        if path in {"REVIEW_MANIFEST.json", "REVIEW_CATEGORY.md"} or path in by_path:
+            raise ReviewArtifactError("review-workspace-context-path-collision")
+        if after_hash is not None:
+            by_path[path] = str(after_hash)
+    return _normalized_source_manifest([
+        {"path": path, "sha256": digest}
+        for path, digest in sorted(by_path.items())
+    ])
+
+
 def resolve_artifact_root(path_value: str | os.PathLike[str] | None) -> Path:
     configured = path_value or SUPERVISOR_DATA_ROOT / "review-artifacts"
     if "\x00" in str(configured):
@@ -1744,7 +2291,11 @@ def persist_review_artifact(
 
     source_manifest = _normalized_source_manifest(source_manifest)
     full_snapshot_manifest = _verified_full_snapshot_manifest(
-        repo, baseline, head, source_manifest
+        repo,
+        baseline,
+        head,
+        source_manifest,
+        workspace_binding["workspace_delta_manifest"],
     )
     source_manifest_sha256 = _canonical_sha256(full_snapshot_manifest)
     try:
@@ -2153,7 +2704,18 @@ def _review_result(repo: Path) -> tuple[dict[str, Any], int]:
             "reason": review_artifact_failure_reason(exc),
         }, 4
     try:
-        manifest = prepare_review_tree(repo, review_category=_ACTIVE_REVIEW_CATEGORY)
+        context_manifest = prepare_review_tree(
+            repo,
+            review_category=_ACTIVE_REVIEW_CATEGORY,
+        )
+        materialized_delta = materialize_workspace_delta(
+            PROJECT_ROOT,
+            workspace_binding,
+        )
+        manifest = review_manifest_with_workspace_delta(
+            context_manifest,
+            materialized_delta,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return {
             "status": "degraded",
@@ -2188,7 +2750,7 @@ def _review_result(repo: Path) -> tuple[dict[str, Any], int]:
                 "reason": "review-core-manifest-mismatch",
             }, 4
     try:
-        baseline = prepare_git_repository(repo, manifest)
+        baseline = prepare_git_repository(repo, manifest, materialized_delta)
         head, diff_sha256 = review_revision_binding(repo, baseline)
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         return {

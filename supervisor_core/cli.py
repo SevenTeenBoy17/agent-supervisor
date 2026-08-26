@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from pathlib import Path, PurePosixPath
@@ -1755,83 +1756,47 @@ def _review_profile_root(snapshot_roots: Any) -> str:
     return str(candidates[0])
 
 
-def _review_adapter_manifest(snapshot_roots: dict[str, Any]) -> dict[str, str]:
-    """Freeze every adapter file selected by the independent review runner."""
-    codex_scripts = Path(str(snapshot_roots["codex-adapter"]))
-    claude_scripts = Path(str(snapshot_roots["claude-adapter"]))
-    codex_root = codex_scripts.parent
-    claude_root = claude_scripts.parent
-    excluded_directories = {
-        ".git", "__pycache__", ".pytest_cache", ".codex-supervisor",
-        "state", "logs", "cache", "handoffs", "review-artifacts",
-        "test-results", ".next", "node_modules",
-    }
+def _review_adapter_manifest(resources: dict[str, bytes]) -> dict[str, str]:
+    """Bind adapters to the same immutable release resources as the core.
 
-    def excluded(path: Path) -> bool:
-        lowered = [part.casefold() for part in path.parts]
-        name = path.name.casefold()
-        return (
-            any(part in excluded_directories for part in lowered)
-            or any(part.startswith(".pytest-tmp") for part in lowered)
-            or name == "settings.local.json"
-            or name.startswith("settings.local.")
-            or name.endswith((".key", ".pem", ".pfx", ".log"))
-            or name.startswith(".env")
-        )
-
-    codex_candidates: list[Path] = []
-    for current, directories, files in os.walk(codex_root):
-        current_path = Path(current)
-        directories[:] = [
-            name
-            for name in directories
-            if not excluded((current_path / name).relative_to(codex_root))
-        ]
-        codex_candidates.extend(
-            current_path / name
-            for name in files
-            if not excluded((current_path / name).relative_to(codex_root))
-        )
-    claude_candidates = [
-        claude_root / "SKILL.md",
-        *(claude_scripts / name for name in (
-            "sup-v3-hook.py", "sup-selftest.py", "sup-discover.py", "sup-log.py",
-            "sup-plan.py", "configure-v3-hooks.py",
-        )),
-        *(claude_root / "tests" / name for name in (
-            "test_dispatch_ledger.py", "test_precision.py", "test_retrieval.py",
-            "test_v3_adapter.py", "test_verifier.py",
-        )),
-    ]
+    The review payload must never reopen an ambient user skill directory.  The
+    installer deploys these bundled integration members as the thin adapters,
+    so projecting them into the historical ``global-*`` logical namespace
+    preserves the review contract without externalizing machine-local files.
+    """
     manifest: dict[str, str] = {}
-    for label, root, candidates in (
-        ("global-codex", codex_root, codex_candidates),
-        ("global-claude", claude_root, claude_candidates),
+    casefolded: set[str] = set()
+    for raw_name, content in sorted(resources.items()):
+        if not isinstance(raw_name, str) or not isinstance(content, bytes):
+            raise InvalidState("review adapter resource map is invalid")
+        label: str | None = None
+        relative: str | None = None
+        for runtime in ("codex", "claude"):
+            prefix = f"integrations/{runtime}/"
+            if raw_name.startswith(prefix):
+                label = f"global-{runtime}"
+                relative = raw_name.removeprefix(prefix)
+                break
+        if label is None:
+            continue
+        logical = f"{label}/{relative}"
+        path = PurePosixPath(logical)
+        folded = logical.casefold()
+        if (
+            path.is_absolute()
+            or path.as_posix() != logical
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or folded in casefolded
+            or not content
+        ):
+            raise InvalidState("review adapter resource map is invalid")
+        casefolded.add(folded)
+        manifest[logical] = sha256_bytes(content)
+    if not manifest or not all(
+        any(path.startswith(f"global-{runtime}/") for path in manifest)
+        for runtime in ("codex", "claude")
     ):
-        absolute_root = Path(os.path.abspath(os.fspath(root)))
-        for candidate in sorted(set(candidates)):
-            if not candidate.exists() and not candidate.is_symlink():
-                continue
-            absolute = Path(os.path.abspath(os.fspath(candidate)))
-            try:
-                relative = absolute.relative_to(absolute_root)
-                if excluded(relative) or _path_contains_link_or_reparse(absolute):
-                    raise InvalidState("review adapter source contains indirection")
-                before = absolute.stat(follow_symlinks=False)
-                content = absolute.read_bytes()
-                after = absolute.stat(follow_symlinks=False)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise InvalidState("review adapter source could not be frozen") from exc
-            if (
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                or not stat.S_ISREG(after.st_mode)
-                or len(content) != after.st_size
-            ):
-                raise InvalidState("review adapter source changed while freezing")
-            manifest[f"{label}/{relative.as_posix()}"] = sha256_bytes(content)
-    if not manifest:
-        raise InvalidState("review adapter source manifest is empty")
+        raise InvalidState("review adapter source manifest is incomplete")
     return dict(sorted(manifest.items()))
 
 
@@ -1881,7 +1846,7 @@ def _frozen_review_resources(
         for name, content in sorted(resources.items())
     }
     profile_root = _review_profile_root(roots)
-    adapter_manifest = _review_adapter_manifest(roots)
+    adapter_manifest = _review_adapter_manifest(resources)
     return (
         resources,
         profile_root,
@@ -3643,6 +3608,7 @@ def _execute_selftest(
     root: Path,
     base_temp: Path,
     *,
+    python_executable: str,
     environment: dict[str, str] | None = None,
 ) -> int:
     tests_root = root / "tests"
@@ -3656,7 +3622,7 @@ def _execute_selftest(
         )
     )
     collect_command = [
-        sys.executable, "-m", "pytest", "--collect-only", "-q",
+        python_executable, "-m", "pytest", "--collect-only", "-q",
         "--basetemp", str(base_temp / "collect"), str(tests_root),
     ]
     collection_timed_out = False
@@ -3705,7 +3671,10 @@ def _execute_selftest(
         for suite in [suite_relative_to_test_root(line.split("::", 1)[0])]
         if suite is not None
     })
-    command = [sys.executable, "-m", "pytest", "-q", "--basetemp", str(base_temp / "run"), str(tests_root)]
+    command = [
+        python_executable, "-m", "pytest", "-q",
+        "--basetemp", str(base_temp / "run"), str(tests_root),
+    ]
     timed_out = False
     try:
         completed = subprocess.run(
@@ -3754,6 +3723,440 @@ def _execute_selftest(
     return EXIT_COMPLETE if completed.returncode == 0 and all_child_suites_invoked else EXIT_INCOMPLETE
 
 
+_SELFTEST_MAX_WINDOWS_BASE_TEMP_CHARS = 96
+_SELFTEST_POWERSHELL_PATH_ENV = "AGENT_SUPERVISOR_SELFTEST_POWERSHELL"
+_SELFTEST_POWERSHELL_SHA256_ENV = "AGENT_SUPERVISOR_SELFTEST_POWERSHELL_SHA256"
+_SELFTEST_SITE_PROBE = (
+    "import json,os,site,sys;"
+    "paths=[*getattr(site,'getsitepackages',lambda:[])(),site.getusersitepackages()];"
+    "print(json.dumps({'executable':os.path.realpath(sys.executable),"
+    "'prefixes':[os.path.abspath(sys.prefix),os.path.abspath(sys.base_prefix)],"
+    "'site_paths':[os.path.abspath(p) for p in paths if p],"
+    "'user_base':os.path.abspath(site.getuserbase()),"
+    "'user_site':os.path.abspath(site.getusersitepackages())},separators=(',',':')))"
+)
+_SELFTEST_RUNTIME_PACKAGES = (
+    "yaml",
+    "jsonschema",
+    "attrs",
+    "attr",
+    "jsonschema_specifications",
+    "referencing",
+    "rpds",
+)
+_SELFTEST_RUNTIME_MODULE_FILES = ("typing_extensions.py",)
+_SELFTEST_MAX_RUNTIME_PACKAGE_FILES = 512
+_SELFTEST_MAX_RUNTIME_PACKAGE_DIRECTORIES = 512
+_SELFTEST_MAX_RUNTIME_PACKAGE_DEPTH = 32
+_SELFTEST_MAX_RUNTIME_PACKAGE_FILE_BYTES = 4 * 1024 * 1024
+_SELFTEST_MAX_RUNTIME_PACKAGE_BYTES = 16 * 1024 * 1024
+
+
+def _selftest_temp_path_within_budget(path: Path) -> bool:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    return os.name != "nt" or len(str(absolute)) <= _SELFTEST_MAX_WINDOWS_BASE_TEMP_CHARS
+
+
+def _trusted_selftest_executable(
+    registry: dict[str, Any],
+    aliases: tuple[str, ...],
+) -> tuple[str, str] | None:
+    """Resolve a selftest dependency only through machine-owned policy."""
+    for alias in aliases:
+        try:
+            return resolve_trusted_executable(alias, registry)
+        except (ExecutableTrustError, OSError, RuntimeError, ValueError):
+            continue
+    return None
+
+
+def _selftest_temp_parent(
+    data_root: Path,
+    release_identity: dict[str, Any] | None,
+) -> Path | None:
+    try:
+        candidate = Path(tempfile.gettempdir()).resolve(strict=True)
+        if not candidate.is_dir() or _path_contains_link_or_reparse(candidate):
+            return None
+        install_home = data_root.parent.resolve(strict=True)
+        protected = [data_root.resolve(strict=True)]
+        release_path = (
+            release_identity.get("path")
+            if isinstance(release_identity, dict)
+            else None
+        )
+        if isinstance(release_path, str) and release_path:
+            protected.append(Path(release_path).resolve(strict=True))
+        if any(candidate.is_relative_to(path) for path in protected):
+            return None
+        if candidate.is_relative_to(install_home):
+            # Windows normally places its OS-selected per-user temp directory
+            # below the profile that also contains the Supervisor registry.
+            # Permit only that fixed, link-free layout; arbitrary siblings such
+            # as <install-home>/tmp remain installation-owned and are rejected.
+            windows_user_temp = install_home / "AppData" / "Local" / "Temp"
+            if (
+                os.name != "nt"
+                or not windows_user_temp.exists()
+                or _path_contains_link_or_reparse(windows_user_temp)
+                or candidate != windows_user_temp.resolve(strict=True)
+            ):
+                return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate
+
+
+def _trusted_selftest_dependency_paths(
+    python_executable: str,
+    environment: dict[str, str],
+) -> list[str] | None:
+    """Ask the registry-bound interpreter for its own package roots.
+
+    The isolated fixed probe deliberately ignores parent ``sys.path`` and
+    ``PYTHONPATH``.  Reported system roots must remain under an interpreter
+    prefix; the one user root must remain under the interpreter-reported user
+    base.  Existing roots are then reparse-checked before use.
+    """
+    command = [
+        python_executable, "-I", "-S", "-X", "utf8", "-c", _SELFTEST_SITE_PROBE,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(Path(python_executable).resolve(strict=True).parent),
+            env=environment,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=15,
+            check=False,
+        )
+        lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        if completed.returncode != 0 or completed.stderr or len(lines) != 1:
+            return None
+        payload = json.loads(lines[0])
+        if not isinstance(payload, dict) or set(payload) != {
+            "executable", "prefixes", "site_paths", "user_base", "user_site",
+        }:
+            return None
+        executable = Path(str(payload["executable"])).resolve(strict=True)
+        expected_executable = Path(python_executable).resolve(strict=True)
+        if executable != expected_executable:
+            return None
+        raw_prefixes = payload["prefixes"]
+        raw_sites = payload["site_paths"]
+        if (
+            not isinstance(raw_prefixes, list)
+            or not raw_prefixes
+            or len(raw_prefixes) > 2
+            or not isinstance(raw_sites, list)
+            or len(raw_sites) > 8
+        ):
+            return None
+        prefixes: list[Path] = []
+        for raw_prefix in raw_prefixes:
+            lexical_prefix = Path(str(raw_prefix))
+            if (
+                not lexical_prefix.is_absolute()
+                or _path_contains_link_or_reparse(lexical_prefix)
+            ):
+                return None
+            resolved_prefix = lexical_prefix.resolve(strict=True)
+            if not resolved_prefix.is_dir() or resolved_prefix != lexical_prefix:
+                return None
+            prefixes.append(resolved_prefix)
+        if not any(executable.is_relative_to(prefix) for prefix in prefixes):
+            return None
+        user_base_lexical = Path(str(payload["user_base"]))
+        if not user_base_lexical.is_absolute():
+            return None
+        if user_base_lexical.exists() and _path_contains_link_or_reparse(user_base_lexical):
+            return None
+        user_base = (
+            user_base_lexical.resolve(strict=True)
+            if user_base_lexical.exists()
+            else Path(os.path.abspath(os.fspath(user_base_lexical)))
+        )
+        user_site_raw = Path(str(payload["user_site"]))
+        if not user_site_raw.is_absolute():
+            return None
+        if user_site_raw.exists() and _path_contains_link_or_reparse(user_site_raw):
+            return None
+        user_site_resolved = (
+            user_site_raw.resolve(strict=True) if user_site_raw.exists() else None
+        )
+        result: list[str] = []
+        observed: set[str] = set()
+        for raw in raw_sites:
+            lexical = Path(str(raw))
+            if not lexical.is_absolute() or not lexical.exists():
+                continue
+            if _path_contains_link_or_reparse(lexical):
+                return None
+            resolved = lexical.resolve(strict=True)
+            if resolved != lexical:
+                return None
+            if resolved.name.casefold() not in {"site-packages", "dist-packages"}:
+                continue
+            if (
+                not resolved.is_dir()
+                or _path_contains_link_or_reparse(resolved)
+            ):
+                return None
+            is_user_site = lexical == user_site_raw or resolved == user_site_resolved
+            within_trusted_root = any(resolved.is_relative_to(prefix) for prefix in prefixes)
+            if is_user_site:
+                within_trusted_root = resolved.is_relative_to(user_base)
+            if not within_trusted_root:
+                return None
+            key = os.path.normcase(str(resolved))
+            if key not in observed:
+                observed.add(key)
+                result.append(str(resolved))
+        return result or None
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _selftest_isolated_user_site(
+    session_root: Path,
+    appdata_root: Path,
+) -> tuple[Path, Path] | None:
+    """Return a session-owned user base and its interpreter-specific site path."""
+    try:
+        user_base = appdata_root / "Python" if os.name == "nt" else session_root / "python-user"
+        scheme = sysconfig.get_preferred_scheme("user")
+        site_path = Path(sysconfig.get_path(
+            "purelib",
+            scheme=scheme,
+            vars={"userbase": str(user_base)},
+        ))
+        absolute_base = Path(os.path.abspath(os.fspath(user_base)))
+        absolute_site = Path(os.path.abspath(os.fspath(site_path)))
+        if (
+            not absolute_base.is_relative_to(session_root)
+            or not absolute_site.is_relative_to(session_root)
+        ):
+            return None
+        absolute_site.mkdir(parents=True, exist_ok=False)
+        if _path_contains_link_or_reparse(absolute_site):
+            return None
+        return absolute_base, absolute_site
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _selftest_required_runtime_module_files() -> tuple[str, ...]:
+    return _SELFTEST_RUNTIME_MODULE_FILES if sys.version_info < (3, 13) else ()
+
+
+def _validated_selftest_dependency_roots(
+    dependency_paths: list[str],
+) -> list[Path] | None:
+    roots: list[Path] = []
+    for dependency_path in dependency_paths:
+        dependency_lexical = Path(os.path.abspath(dependency_path))
+        if (
+            _path_contains_link_or_reparse(dependency_lexical)
+            or not dependency_lexical.is_dir()
+        ):
+            return None
+        dependency_root = dependency_lexical.resolve(strict=True)
+        if dependency_root != dependency_lexical or not dependency_root.is_dir():
+            return None
+        roots.append(dependency_root)
+    return roots or None
+
+
+def _read_selftest_runtime_file(source: Path) -> bytes | None:
+    if _path_contains_link_or_reparse(source):
+        return None
+    before_path = source.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(before_path.st_mode)
+        or before_path.st_size > _SELFTEST_MAX_RUNTIME_PACKAGE_FILE_BYTES
+    ):
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(source, flags)
+    try:
+        before_handle = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(
+                    1024 * 1024,
+                    _SELFTEST_MAX_RUNTIME_PACKAGE_FILE_BYTES + 1 - total,
+                ),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _SELFTEST_MAX_RUNTIME_PACKAGE_FILE_BYTES:
+                return None
+        after_handle = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    after_path = source.stat(follow_symlinks=False)
+    if _path_contains_link_or_reparse(source):
+        return None
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+    if (
+        identity(before_path) != identity(before_handle)
+        or identity(before_handle) != identity(after_handle)
+        or identity(after_handle) != identity(after_path)
+        or len(content) != before_path.st_size
+    ):
+        return None
+    return content
+
+
+def _materialize_selftest_runtime_packages(
+    dependency_paths: list[str],
+    isolated_site: Path,
+) -> bool:
+    """Copy the bounded core-only dependencies into the isolated user site."""
+    total_files = 0
+    total_directories = 0
+    total_bytes = 0
+    try:
+        dependency_roots = _validated_selftest_dependency_roots(dependency_paths)
+        if dependency_roots is None:
+            return False
+        for package in _SELFTEST_RUNTIME_PACKAGES:
+            source_root: Path | None = None
+            for dependency_root in dependency_roots:
+                candidate = dependency_root / package
+                try:
+                    candidate_details = candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                # Check the lexical package path before Resolve-Path can erase
+                # a symlink or junction identity, then bind the resolved source
+                # back to the already verified dependency root.
+                if (
+                    not stat.S_ISDIR(candidate_details.st_mode)
+                    or _path_contains_link_or_reparse(candidate)
+                ):
+                    return False
+                resolved_candidate = candidate.resolve(strict=True)
+                if not resolved_candidate.is_relative_to(dependency_root):
+                    return False
+                source_root = resolved_candidate
+                break
+            if source_root is None:
+                return False
+            target_root = isolated_site / package
+            total_directories += 1
+            if total_directories > _SELFTEST_MAX_RUNTIME_PACKAGE_DIRECTORIES:
+                return False
+            target_root.mkdir(parents=False, exist_ok=False)
+
+            def fail_walk(error: OSError) -> None:
+                raise error
+
+            for current, directories, files in os.walk(
+                source_root,
+                topdown=True,
+                followlinks=False,
+                onerror=fail_walk,
+            ):
+                current_path = Path(current)
+                directories[:] = sorted(
+                    name for name in directories if name != "__pycache__"
+                )
+                for directory in directories:
+                    source_directory = current_path / directory
+                    relative_directory = source_directory.relative_to(source_root)
+                    total_directories += 1
+                    if (
+                        total_directories > _SELFTEST_MAX_RUNTIME_PACKAGE_DIRECTORIES
+                        or len(relative_directory.parts)
+                        > _SELFTEST_MAX_RUNTIME_PACKAGE_DEPTH
+                        or _path_contains_link_or_reparse(source_directory)
+                    ):
+                        return False
+                    (target_root / relative_directory).mkdir(parents=False, exist_ok=False)
+                for name in sorted(files):
+                    if name.endswith((".pyc", ".pyo")):
+                        continue
+                    source = current_path / name
+                    content = _read_selftest_runtime_file(source)
+                    if content is None:
+                        return False
+                    total_files += 1
+                    total_bytes += len(content)
+                    if (
+                        total_files > _SELFTEST_MAX_RUNTIME_PACKAGE_FILES
+                        or total_bytes > _SELFTEST_MAX_RUNTIME_PACKAGE_BYTES
+                    ):
+                        return False
+                    relative = source.relative_to(source_root)
+                    atomic_write_bytes(target_root / relative, content)
+            if not (target_root / "__init__.py").is_file():
+                return False
+        for module_file in _selftest_required_runtime_module_files():
+            source: Path | None = None
+            for dependency_root in dependency_roots:
+                candidate = dependency_root / module_file
+                try:
+                    candidate_details = candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                if (
+                    not stat.S_ISREG(candidate_details.st_mode)
+                    or _path_contains_link_or_reparse(candidate)
+                ):
+                    return False
+                resolved_candidate = candidate.resolve(strict=True)
+                if (
+                    resolved_candidate != candidate
+                    or not resolved_candidate.is_relative_to(dependency_root)
+                ):
+                    return False
+                source = resolved_candidate
+                break
+            if source is None:
+                return False
+            content = _read_selftest_runtime_file(source)
+            if content is None:
+                return False
+            total_files += 1
+            total_bytes += len(content)
+            if (
+                total_files > _SELFTEST_MAX_RUNTIME_PACKAGE_FILES
+                or total_bytes > _SELFTEST_MAX_RUNTIME_PACKAGE_BYTES
+            ):
+                return False
+            atomic_write_bytes(isolated_site / module_file, content)
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def command_selftest(args: argparse.Namespace) -> int:
     try:
         registry = load_trusted_executable_registry()
@@ -3761,18 +4164,48 @@ def command_selftest(args: argparse.Namespace) -> int:
         _emit({"ok": False, "health": "degraded", "reason": type(exc).__name__})
         return EXIT_DEGRADED
     data_root = Path(str(registry["registry_path"])).parent
-    temp_parent = data_root / ".selftest-tmp"
-    temp_parent.mkdir(parents=True, exist_ok=True)
-    base_temp = temp_parent / f"selftest-{os.getpid()}-{sha256_text(utc_now())[:8]}"
-    base_temp.mkdir(parents=False, exist_ok=False)
+    release_identity = bound_release_identity()
+    temp_parent = _selftest_temp_parent(data_root, release_identity)
+    if temp_parent is None:
+        _emit({
+            "ok": False,
+            "health": "degraded",
+            "reason": "selftest-temp-parent-untrusted",
+        })
+        return EXIT_DEGRADED
+    try:
+        session_temp = tempfile.TemporaryDirectory(
+            prefix="as-st-",
+            dir=temp_parent,
+        )
+    except OSError:
+        _emit({
+            "ok": False,
+            "health": "degraded",
+            "reason": "selftest-temp-root-unavailable",
+        })
+        return EXIT_DEGRADED
+    session_root = Path(session_temp.name)
+    base_temp = session_root / "p"
     extracted: tempfile.TemporaryDirectory[str] | None = None
     try:
+        base_temp.mkdir(parents=False, exist_ok=False)
+        if (
+            not _selftest_temp_path_within_budget(base_temp)
+            or _path_contains_link_or_reparse(session_root)
+        ):
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-temp-path-budget-exceeded",
+            })
+            return EXIT_DEGRADED
         resources = bound_resource_map()
         if resources is None:
             root = Path(__file__).resolve().parents[1]
         else:
             extracted = tempfile.TemporaryDirectory(
-                prefix="bound-runtime-", dir=temp_parent
+                prefix="r-", dir=session_root
             )
             root = Path(extracted.name)
             for relative, content in sorted(resources.items()):
@@ -3794,19 +4227,126 @@ def command_selftest(args: argparse.Namespace) -> int:
                 })
                 return EXIT_DEGRADED
         environment = _isolated_review_environment(registry)
+        trusted_python = _trusted_selftest_executable(
+            registry,
+            ("python", "python3"),
+        )
+        if trusted_python is None:
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-trusted-python-unavailable",
+            })
+            return EXIT_DEGRADED
+        python_path, _python_sha256 = trusted_python
+        try:
+            current_python = Path(sys.executable).resolve(strict=True)
+            registry_python = Path(python_path).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            current_python = Path()
+            registry_python = Path("__registry-python-unavailable__")
+        if current_python != registry_python:
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-python-runtime-mismatch",
+            })
+            return EXIT_DEGRADED
+        trusted_powershell = _trusted_selftest_executable(
+            registry,
+            ("pwsh", "powershell"),
+        )
+        if trusted_powershell is None:
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-trusted-powershell-unavailable",
+            })
+            return EXIT_DEGRADED
+        powershell_path, powershell_sha256 = trusted_powershell
+        dependency_paths = _trusted_selftest_dependency_paths(
+            python_path,
+            environment,
+        )
+        if dependency_paths is None:
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-trusted-dependencies-unavailable",
+            })
+            return EXIT_DEGRADED
+        profile_root = data_root.parent
+        appdata_root = session_root / "profile-data" / "roaming"
+        localappdata_root = session_root / "profile-data" / "local"
+        appdata_root.mkdir(parents=True)
+        localappdata_root.mkdir(parents=True)
+        isolated_user_site = _selftest_isolated_user_site(
+            session_root,
+            appdata_root,
+        )
+        if isolated_user_site is None:
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-isolated-user-site-unavailable",
+            })
+            return EXIT_DEGRADED
+        user_base, user_site = isolated_user_site
+        if not _materialize_selftest_runtime_packages(
+            dependency_paths,
+            user_site,
+        ):
+            _emit({
+                "ok": False,
+                "health": "degraded",
+                "reason": "selftest-runtime-dependency-mirror-failed",
+            })
+            return EXIT_DEGRADED
+        environment.pop("AGENT_SUPERVISOR_INSTALL_HOME", None)
         environment.update({
+            "APPDATA": str(appdata_root),
+            "HOME": str(profile_root),
+            "LOCALAPPDATA": str(localappdata_root),
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": str(root),
+            "PYTHONPATH": os.pathsep.join([
+                str(root),
+                *dependency_paths,
+            ]),
+            "PYTHONUSERBASE": str(user_base),
             "TEMP": str(base_temp),
             "TMP": str(base_temp),
+            "USERPROFILE": str(profile_root),
         })
-        return _execute_selftest(root, base_temp, environment=environment)
+        if os.name == "nt":
+            home_drive, home_path = os.path.splitdrive(str(profile_root))
+            environment["HOMEDRIVE"] = home_drive
+            environment["HOMEPATH"] = home_path
+        tool_directories = [str(Path(python_path).parent)]
+        environment["AGENT_SUPERVISOR_PYTHON"] = python_path
+        tool_directories.append(str(Path(powershell_path).parent))
+        environment[_SELFTEST_POWERSHELL_PATH_ENV] = powershell_path
+        environment[_SELFTEST_POWERSHELL_SHA256_ENV] = powershell_sha256
+        tool_directories.extend(environment["PATH"].split(os.pathsep))
+        normalized_directories: list[str] = []
+        observed_directories: set[str] = set()
+        for directory in tool_directories:
+            key = os.path.normcase(directory)
+            if directory and key not in observed_directories:
+                observed_directories.add(key)
+                normalized_directories.append(directory)
+        environment["PATH"] = os.pathsep.join(normalized_directories)
+        return _execute_selftest(
+            root,
+            base_temp,
+            python_executable=python_path,
+            environment=environment,
+        )
     finally:
-        # Collection failures, execution failures, result processing, and
-        # output failures all share the same bounded cleanup guarantee.
-        shutil.rmtree(base_temp, ignore_errors=True)
         if extracted is not None:
             extracted.cleanup()
+        # Collection failures, execution failures, result processing, and
+        # output failures all share the same bounded cleanup guarantee.
+        session_temp.cleanup()
 
 
 def _hook_context(

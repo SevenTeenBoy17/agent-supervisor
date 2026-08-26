@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 import tempfile
-from typing import Any
+from typing import Any, NamedTuple
 import uuid
 
 
@@ -47,11 +47,32 @@ class InstallError(ValueError):
     pass
 
 
+class _FrozenAdapter(NamedTuple):
+    source: Path
+    destination: Path
+    content: bytes
+    sha256: str
+
+
 def _is_link_or_reparse(path: Path) -> bool:
     details = path.lstat()
+    return _stat_is_link_or_reparse(details)
+
+
+def _stat_is_link_or_reparse(details: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(details, "st_file_attributes", 0)
     return stat.S_ISLNK(details.st_mode) or bool(reparse_flag and attributes & reparse_flag)
+
+
+def _portable_file_identity(details: os.stat_result) -> tuple[int, ...]:
+    return (
+        details.st_mode,
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+    )
 
 
 def _lexical_absolute(path: Path) -> Path:
@@ -88,20 +109,64 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _stable_bytes(path: Path, *, maximum: int, label: str) -> bytes:
     candidate = _lexical_absolute(path)
     _reject_existing_indirection(candidate, label=label)
+    descriptor = -1
     try:
-        before = candidate.stat(follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_size < 1 or before.st_size > maximum:
+        path_before = candidate.lstat()
+        if (
+            _stat_is_link_or_reparse(path_before)
+            or not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_size < 1
+            or path_before.st_size > maximum
+        ):
             raise InstallError(f"{label} size is invalid")
-        with candidate.open("rb") as handle:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(candidate, flags)
+        descriptor_before = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_before.st_mode):
+            raise InstallError(f"{label} is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
             content = handle.read(maximum + 1)
-        after = candidate.stat(follow_symlinks=False)
+        descriptor_after = os.fstat(descriptor)
     except InstallError:
         raise
     except OSError as exc:
         raise InstallError(f"{label} is unreadable") from exc
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after or len(content) != before.st_size:
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    try:
+        path_after = candidate.lstat()
+        _reject_existing_indirection(candidate, label=label)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError(f"{label} is unreadable") from exc
+
+    # Windows reports creation time through path stat but aliases descriptor
+    # ctime to mtime. Compare ctime within each observation channel and bind
+    # the path to the descriptor with the portable identity fields.
+    cross_identities = {
+        _portable_file_identity(path_before),
+        _portable_file_identity(descriptor_before),
+        _portable_file_identity(descriptor_after),
+        _portable_file_identity(path_after),
+    }
+    if (
+        _stat_is_link_or_reparse(path_after)
+        or len(cross_identities) != 1
+        or path_before.st_ctime_ns != path_after.st_ctime_ns
+        or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
+        or len(content) != descriptor_before.st_size
+    ):
         raise InstallError(f"{label} changed during read")
     return content
 
@@ -227,7 +292,7 @@ def _validated_existing_pointer(path: Path, install_home: Path) -> dict[str, Any
     return value
 
 
-def _adapter_files(source_root: Path) -> list[tuple[Path, Path]]:
+def _adapter_files(source_root: Path) -> list[_FrozenAdapter]:
     mappings = (
         (
             source_root / "integrations" / "codex",
@@ -238,7 +303,7 @@ def _adapter_files(source_root: Path) -> list[tuple[Path, Path]]:
             Path(".claude/skills/supervisor"),
         ),
     )
-    result: list[tuple[Path, Path]] = []
+    result: list[_FrozenAdapter] = []
     total = 0
     for source_base, destination_base in mappings:
         _reject_existing_indirection(source_base, label="adapter source")
@@ -260,11 +325,100 @@ def _adapter_files(source_root: Path) -> list[tuple[Path, Path]]:
                 label="adapter source file",
             )
             total += len(content)
-            result.append((source, destination_base / relative))
+            result.append(
+                _FrozenAdapter(
+                    source=source,
+                    destination=destination_base / relative,
+                    content=content,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
+            )
             if len(result) > _MAX_ADAPTER_FILES or total > _MAX_ADAPTER_TOTAL_BYTES:
                 raise InstallError("adapter source exceeds installation budget")
     if not result:
         raise InstallError("adapter source is empty")
+    return result
+
+
+def _bundle_member_bytes(
+    inspected: dict[str, Any],
+    name: str,
+    *,
+    maximum: int,
+    label: str,
+) -> bytes:
+    members = inspected.get("members") if isinstance(inspected, dict) else None
+    content = members.get(name) if isinstance(members, dict) else None
+    if (
+        not isinstance(content, bytes)
+        or len(content) < 1
+        or len(content) > maximum
+    ):
+        raise InstallError(f"{label} is missing or invalid in runtime bundle")
+    return content
+
+
+def _adapter_files_from_bundle(
+    source_root: Path,
+    inspected: dict[str, Any],
+) -> list[_FrozenAdapter]:
+    members = inspected.get("members") if isinstance(inspected, dict) else None
+    if not isinstance(members, dict):
+        raise InstallError("runtime bundle members are unavailable")
+    mappings = (
+        (
+            ("integrations", "codex"),
+            Path(".codex/skills/dev-supervisor"),
+            "codex",
+        ),
+        (
+            ("integrations", "claude"),
+            Path(".claude/skills/supervisor"),
+            "claude",
+        ),
+    )
+    result: list[_FrozenAdapter] = []
+    total = 0
+    seen_runtimes: set[str] = set()
+    destinations: set[str] = set()
+    for name in sorted(members):
+        content = members[name]
+        if not isinstance(name, str) or not isinstance(content, bytes):
+            raise InstallError("runtime bundle member map is invalid")
+        member = PurePosixPath(name)
+        for prefix, destination_base, runtime in mappings:
+            if member.parts[:len(prefix)] != prefix:
+                continue
+            relative_parts = member.parts[len(prefix):]
+            if (
+                not relative_parts
+                or member.suffix.casefold() not in _ADAPTER_SUFFIXES
+                or any(part.casefold() in {"tests", "__pycache__"} for part in relative_parts)
+                or any(part.startswith(".pytest-tmp-") for part in relative_parts)
+                or len(content) < 1
+                or len(content) > _MAX_ADAPTER_FILE_BYTES
+            ):
+                raise InstallError("runtime bundle adapter member is invalid")
+            destination = destination_base.joinpath(*relative_parts)
+            folded = destination.as_posix().casefold()
+            if folded in destinations:
+                raise InstallError("runtime bundle adapter destination is duplicated")
+            destinations.add(folded)
+            total += len(content)
+            result.append(
+                _FrozenAdapter(
+                    source=source_root.joinpath(*member.parts),
+                    destination=destination,
+                    content=content,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
+            )
+            seen_runtimes.add(runtime)
+            if len(result) > _MAX_ADAPTER_FILES or total > _MAX_ADAPTER_TOTAL_BYTES:
+                raise InstallError("runtime bundle adapters exceed installation budget")
+            break
+    if seen_runtimes != {"codex", "claude"} or not result:
+        raise InstallError("runtime bundle adapter snapshot is incomplete")
     return result
 
 
@@ -314,9 +468,27 @@ def install_release(
     bundle = build_runtime_bundle(source, version)
     release_root = release_parent / version
     identity = _release_identity(release_root, version, bundle)
-    adapters = _adapter_files(source) if install_adapters else []
-    launcher = _stable_bytes(
-        source / "bin" / "agent-supervisor.py",
+    inspected = inspect_runtime_bundle(bundle, expected_identity=identity)
+    bundled_version = _bundle_member_bytes(
+        inspected,
+        "VERSION",
+        maximum=128,
+        label="release version",
+    )
+    try:
+        parsed_bundle_version = bundled_version.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise InstallError("runtime bundle version is not ASCII") from exc
+    if parsed_bundle_version != version or not _VERSION.fullmatch(parsed_bundle_version):
+        raise InstallError("runtime bundle version does not match release version")
+    adapters = (
+        _adapter_files_from_bundle(source, inspected)
+        if install_adapters
+        else []
+    )
+    launcher = _bundle_member_bytes(
+        inspected,
+        "bin/agent-supervisor.py",
         maximum=_MAX_ADAPTER_FILE_BYTES,
         label="stage-zero launcher",
     )
@@ -389,20 +561,17 @@ def install_release(
     if changed:
         _atomic_write(data_root / "bin" / "agent-supervisor.py", launcher)
 
-    for source_path, relative_target in adapters:
-        content = _stable_bytes(
-            source_path,
-            maximum=_MAX_ADAPTER_FILE_BYTES,
-            label="adapter source file",
-        )
-        target = home / relative_target
+    for adapter in adapters:
+        if hashlib.sha256(adapter.content).hexdigest() != adapter.sha256:
+            raise InstallError("frozen adapter digest mismatch")
+        target = home / adapter.destination
         if _backup_if_changed(
             target,
-            content,
+            adapter.content,
             install_home=home,
             backup_root=backup_root,
         ):
-            _atomic_write(target, content)
+            _atomic_write(target, adapter.content)
 
     if pointer_path.exists() or pointer_path.is_symlink():
         pointer_bytes = _stable_bytes(

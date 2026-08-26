@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -98,7 +99,11 @@ def test_selftest_suite_integrity_uses_recursive_relative_paths(
     ]
     monkeypatch.setattr(cli_module.subprocess, "run", lambda *_args, **_kwargs: responses.pop(0))
 
-    exit_code = cli_module._execute_selftest(tmp_path, tmp_path / "selftest-temp")
+    exit_code = cli_module._execute_selftest(
+        tmp_path,
+        tmp_path / "selftest-temp",
+        python_executable=sys.executable,
+    )
     result = json.loads(capsys.readouterr().out)
 
     assert exit_code == EXIT_INCOMPLETE
@@ -122,7 +127,9 @@ def test_selftest_suite_integrity_uses_recursive_relative_paths(
         subprocess.CompletedProcess([], 0, stdout="2 passed\n", stderr=""),
     ])
     complete_code = cli_module._execute_selftest(
-        tmp_path, tmp_path / "selftest-temp-complete"
+        tmp_path,
+        tmp_path / "selftest-temp-complete",
+        python_executable=sys.executable,
     )
     complete = json.loads(capsys.readouterr().out)
 

@@ -368,6 +368,7 @@ def _acquire_state_lock(timeout_seconds: float = 1.5, lock_path: Path | None = N
     """Acquire an exclusive lock for state or another Supervisor-owned file."""
     lock = lock_path if lock_path is not None else _state_lock_file()
     deadline = time.monotonic() + timeout_seconds
+    windows_permission_retries = 0
     try:
         lock.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -393,6 +394,15 @@ def _acquire_state_lock(timeout_seconds: float = 1.5, lock_path: Path | None = N
                     continue
             except OSError:
                 pass
+            time.sleep(0.01)
+        except PermissionError:
+            # Windows can report access denied while the prior owner has closed
+            # and unlinked the lock but NTFS is still completing delete-pending.
+            # Treat that bounded platform state as contention; other platforms
+            # retain the immediate fail-open behavior for a real permission fault.
+            if os.name != "nt" or windows_permission_retries >= 3:
+                return None, lock
+            windows_permission_retries += 1
             time.sleep(0.01)
         except OSError:
             return None, lock

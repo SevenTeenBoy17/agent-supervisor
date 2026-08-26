@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import time
 from argparse import Namespace
@@ -617,7 +618,57 @@ def test_finalize_exception_persists_degraded_incomplete_and_returns_four(tmp_pa
     assert any(row.get("event_type") == "round_finalize_degraded" for row in ctx.events())
 
 
-def test_selftest_invocation_flag_is_independent_of_test_success(monkeypatch) -> None:
+def _selftest_registry(registry_path: Path) -> dict[str, object]:
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    python = Path(cli_module.sys.executable).resolve(strict=True)
+    powershell_command = next(
+        (
+            cli_module.shutil.which(name)
+            for name in ("pwsh.exe", "powershell.exe", "pwsh", "powershell")
+            if cli_module.shutil.which(name)
+        ),
+        None,
+    )
+    assert powershell_command is not None
+    powershell = Path(powershell_command).resolve(strict=True)
+    return {
+        "registry_path": str(registry_path),
+        "registry_sha256": "a" * 64,
+        "entries": {
+            "powershell": {
+                "kind": "local",
+                "path": str(powershell),
+                "sha256": cli_module.sha256_file(powershell),
+            },
+            "python": {
+                "kind": "local",
+                "path": str(python),
+                "sha256": cli_module.sha256_file(python),
+            },
+        },
+    }
+
+
+def _selftest_dependency_fixture(tmp_path: Path) -> Path:
+    site = tmp_path / "trusted-dependencies" / "site-packages"
+    for name in cli_module._SELFTEST_RUNTIME_PACKAGES:
+        package = site / name
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "FIXTURE = True\n",
+            encoding="utf-8",
+        )
+    (site / "typing_extensions.py").write_text(
+        "FIXTURE = True\n",
+        encoding="utf-8",
+    )
+    return site
+
+
+def test_selftest_invocation_flag_is_independent_of_test_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     tests_root = Path(cli_module.__file__).resolve().parents[1] / "tests"
     suites = sorted(path.name for path in tests_root.glob("test_*.py"))
     collect_output = "\n".join(f"tests/{name}::test_collected" for name in suites)
@@ -633,6 +684,20 @@ def test_selftest_invocation_flag_is_independent_of_test_success(monkeypatch) ->
         return subprocess.CompletedProcess(command, 1, stdout="one test failed", stderr="")
 
     emitted: list[dict[str, object]] = []
+    registry = _selftest_registry(
+        tmp_path / "data" / ".agent-supervisor" / "trusted-executables.json"
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_trusted_executable_registry",
+        lambda: registry,
+    )
+    dependency_site = _selftest_dependency_fixture(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "_trusted_selftest_dependency_paths",
+        lambda *_args, **_kwargs: [str(dependency_site)],
+    )
     monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_module, "_emit", emitted.append)
 
@@ -649,9 +714,6 @@ def test_installed_selftest_uses_bound_tests_and_never_writes_release(
 ) -> None:
     data_root = tmp_path / "data" / ".agent-supervisor"
     data_root.mkdir(parents=True)
-    trusted = tmp_path / "trusted" / "python.exe"
-    trusted.parent.mkdir()
-    trusted.write_bytes(b"trusted-python\n")
     release = tmp_path / "releases" / "v3.1.1"
     release.mkdir(parents=True)
     sentinel = release / "immutable.txt"
@@ -660,38 +722,419 @@ def test_installed_selftest_uses_bound_tests_and_never_writes_release(
         "supervisor_core/__init__.py": b"BOUND = True\n",
         "tests/test_bound_canary.py": b"def test_bound_canary():\n    assert True\n",
     }
-    registry = {
-        "registry_path": str(data_root / "trusted-executables.json"),
-        "registry_sha256": "a" * 64,
-        "entries": {
-            "python": {
-                "kind": "local",
-                "path": str(trusted.resolve()),
-                "sha256": "b" * 64,
-            }
-        },
-    }
+    registry = _selftest_registry(data_root / "trusted-executables.json")
+    dependency_site = _selftest_dependency_fixture(tmp_path)
     observed: dict[str, object] = {}
 
-    def fake_execute(root: Path, base_temp: Path, *, environment=None) -> int:
+    def fake_execute(
+        root: Path,
+        base_temp: Path,
+        *,
+        python_executable: str,
+        environment=None,
+    ) -> int:
         observed["root"] = root
         observed["base_temp"] = base_temp
         assert root != Path(cli_module.__file__).resolve().parents[1]
-        assert root.is_relative_to(data_root / ".selftest-tmp")
+        assert root.parent == base_temp.parent
+        assert not root.is_relative_to(data_root)
         assert (root / "tests" / "test_bound_canary.py").read_bytes() == resources[
             "tests/test_bound_canary.py"
         ]
-        assert base_temp.is_relative_to(data_root / ".selftest-tmp")
-        assert environment["PYTHONPATH"] == str(root)
+        assert not base_temp.is_relative_to(data_root)
+        assert environment["PYTHONPATH"].split(os.pathsep)[0] == str(root)
+        assert str(dependency_site) in environment["PYTHONPATH"].split(os.pathsep)
+        assert "PYTHONNOUSERSITE" not in environment
+        assert Path(environment["PYTHONUSERBASE"]).is_relative_to(base_temp.parent)
         assert environment["TEMP"] == str(base_temp)
+        assert environment["HOME"] == str(data_root.parent)
+        assert environment["USERPROFILE"] == str(data_root.parent)
+        assert Path(environment["APPDATA"]).is_relative_to(base_temp.parent)
+        assert Path(environment["LOCALAPPDATA"]).is_relative_to(base_temp.parent)
+        assert "AGENT_SUPERVISOR_INSTALL_HOME" not in environment
+        trusted_python = Path(environment["AGENT_SUPERVISOR_PYTHON"])
+        assert trusted_python == Path(cli_module.sys.executable).resolve(strict=True)
+        assert Path(python_executable) == trusted_python
+        assert str(trusted_python.parent) in environment["PATH"].split(os.pathsep)
+        if "AGENT_SUPERVISOR_SELFTEST_POWERSHELL" in environment:
+            trusted_powershell = Path(
+                environment["AGENT_SUPERVISOR_SELFTEST_POWERSHELL"]
+            )
+            assert str(trusted_powershell.parent) in environment["PATH"].split(
+                os.pathsep
+            )
         assert not any(path.is_relative_to(release) for path in (root, base_temp))
         return 0
 
     monkeypatch.setattr(cli_module, "load_trusted_executable_registry", lambda: registry)
     monkeypatch.setattr(cli_module, "bound_resource_map", lambda: resources)
+    monkeypatch.setattr(
+        cli_module,
+        "_trusted_selftest_dependency_paths",
+        lambda *_args, **_kwargs: [str(dependency_site)],
+    )
     monkeypatch.setattr(cli_module, "_execute_selftest", fake_execute)
 
     assert cli_module.command_selftest(Namespace()) == 0
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
     assert not Path(observed["root"]).exists()
     assert not Path(observed["base_temp"]).exists()
+
+
+def test_selftest_rejects_ambient_unregistered_powershell(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = _selftest_registry(
+        tmp_path / "data" / ".agent-supervisor" / "trusted-executables.json"
+    )
+    registry["entries"].pop("powershell")
+    poisoned = tmp_path / "poisoned-path" / "powershell.exe"
+    poisoned.parent.mkdir()
+    poisoned.write_bytes(b"untrusted-powershell")
+    monkeypatch.setattr(
+        cli_module,
+        "load_trusted_executable_registry",
+        lambda: registry,
+    )
+    monkeypatch.setattr(cli_module.shutil, "which", lambda *_args: str(poisoned))
+    monkeypatch.setattr(
+        cli_module,
+        "_execute_selftest",
+        lambda *_args, **_kwargs: pytest.fail("selftest execution must not start"),
+    )
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(cli_module, "_emit", emitted.append)
+
+    assert cli_module.command_selftest(Namespace()) == 4
+    assert emitted == [{
+        "ok": False,
+        "health": "degraded",
+        "reason": "selftest-trusted-powershell-unavailable",
+    }]
+
+
+def test_selftest_rejects_temp_parent_inside_installation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry_path = (
+        tmp_path / "data" / ".agent-supervisor" / "trusted-executables.json"
+    )
+    registry = _selftest_registry(registry_path)
+    monkeypatch.setattr(
+        cli_module,
+        "load_trusted_executable_registry",
+        lambda: registry,
+    )
+    install_temp = registry_path.parent.parent / "tmp"
+    install_temp.mkdir()
+    monkeypatch.setattr(
+        cli_module.tempfile,
+        "gettempdir",
+        lambda: str(install_temp),
+    )
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(cli_module, "_emit", emitted.append)
+
+    assert cli_module.command_selftest(Namespace()) == 4
+    assert emitted == [{
+        "ok": False,
+        "health": "degraded",
+        "reason": "selftest-temp-parent-untrusted",
+    }]
+
+
+@pytest.mark.skipif(cli_module.os.name != "nt", reason="Windows profile temp layout")
+def test_selftest_allows_canonical_windows_profile_temp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    install_home = tmp_path / "profile"
+    data_root = install_home / ".agent-supervisor"
+    data_root.mkdir(parents=True)
+    windows_temp = install_home / "AppData" / "Local" / "Temp"
+    windows_temp.mkdir(parents=True)
+    monkeypatch.setattr(
+        cli_module.tempfile,
+        "gettempdir",
+        lambda: str(windows_temp),
+    )
+
+    assert cli_module._selftest_temp_parent(
+        data_root,
+        None,
+    ) == windows_temp.resolve(strict=True)
+
+
+def test_selftest_rejects_registry_python_that_is_not_the_running_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = _selftest_registry(
+        tmp_path / "data" / ".agent-supervisor" / "trusted-executables.json"
+    )
+    current = Path(cli_module.sys.executable).resolve(strict=True)
+    alternate = tmp_path / "alternate-runtime" / current.name
+    alternate.parent.mkdir()
+    shutil.copy2(current, alternate)
+    registry["entries"]["python"] = {
+        "kind": "local",
+        "path": str(alternate),
+        "sha256": cli_module.sha256_file(alternate),
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "load_trusted_executable_registry",
+        lambda: registry,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_execute_selftest",
+        lambda *_args, **_kwargs: pytest.fail("mismatched Python must not run"),
+    )
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(cli_module, "_emit", emitted.append)
+
+    assert cli_module.command_selftest(Namespace()) == 4
+    assert emitted == [{
+        "ok": False,
+        "health": "degraded",
+        "reason": "selftest-python-runtime-mismatch",
+    }]
+
+
+def test_selftest_rejects_temp_parent_inside_active_release(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "profile" / ".agent-supervisor"
+    data_root.mkdir(parents=True)
+    release = tmp_path / "detached-releases" / "v3.1.6"
+    candidate = release / "tmp"
+    candidate.mkdir(parents=True)
+    monkeypatch.setattr(
+        cli_module.tempfile,
+        "gettempdir",
+        lambda: str(candidate),
+    )
+
+    assert cli_module._selftest_temp_parent(
+        data_root,
+        {"path": str(release)},
+    ) is None
+
+
+def test_trusted_selftest_dependency_probe_ignores_ambient_sys_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    poisoned = tmp_path / "workspace" / "site-packages"
+    poisoned.mkdir(parents=True)
+    monkeypatch.setattr(cli_module.sys, "path", [str(poisoned), *cli_module.sys.path])
+    system_site = Path(cli_module.sysconfig.get_path("purelib")).resolve(strict=True)
+    user_base = Path(cli_module.sysconfig.get_config_var("userbase") or tmp_path)
+    user_site = user_base / "missing-user-site" / "site-packages"
+    payload = {
+        "executable": str(Path(cli_module.sys.executable).resolve(strict=True)),
+        "prefixes": [
+            str(Path(cli_module.sys.prefix).resolve(strict=True)),
+            str(Path(cli_module.sys.base_prefix).resolve(strict=True)),
+        ],
+        "site_paths": [str(system_site)],
+        "user_base": str(user_base.absolute()),
+        "user_site": str(user_site.absolute()),
+    }
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload, separators=(",", ":")) + "\n",
+            stderr="",
+        ),
+    )
+
+    observed = cli_module._trusted_selftest_dependency_paths(
+        str(Path(cli_module.sys.executable).resolve(strict=True)),
+        {},
+    )
+
+    assert observed == [str(system_site)]
+    assert str(poisoned) not in observed
+
+
+def test_selftest_dependency_mirror_supports_a_pythonpath_free_child(
+    tmp_path: Path,
+) -> None:
+    registry = _selftest_registry(
+        tmp_path / "profile" / ".agent-supervisor" / "trusted-executables.json"
+    )
+    python_path = str(Path(cli_module.sys.executable).resolve(strict=True))
+    probe_environment = cli_module._isolated_review_environment(registry)
+    dependency_paths = cli_module._trusted_selftest_dependency_paths(
+        python_path,
+        probe_environment,
+    )
+    assert dependency_paths is not None
+    session_root = tmp_path / "session"
+    appdata_root = session_root / "profile-data" / "roaming"
+    appdata_root.mkdir(parents=True)
+    isolated = cli_module._selftest_isolated_user_site(
+        session_root,
+        appdata_root,
+    )
+    assert isolated is not None
+    user_base, user_site = isolated
+    assert cli_module._materialize_selftest_runtime_packages(
+        dependency_paths,
+        user_site,
+    )
+    child_environment = probe_environment | {
+        "APPDATA": str(appdata_root),
+        "HOME": str(tmp_path / "profile"),
+        "PYTHONUSERBASE": str(user_base),
+        "USERPROFILE": str(tmp_path / "profile"),
+    }
+    child_environment.pop("PYTHONPATH", None)
+    child_environment.pop("PYTHONNOUSERSITE", None)
+
+    child = subprocess.run(
+        [
+            python_path,
+            "-S",
+            "-c",
+            (
+                f"import site;site.addsitedir({str(user_site)!r});"
+                "import jsonschema,yaml;"
+                "jsonschema.validate({'ok':True},{'type':'object','required':['ok']});"
+                "print(yaml.__name__,jsonschema.__name__)"
+            ),
+        ],
+        cwd=tmp_path,
+        env=child_environment,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip() == "yaml jsonschema"
+    assert Path(user_site).is_relative_to(session_root)
+    conditional_module = Path(user_site) / "typing_extensions.py"
+    if cli_module.sys.version_info < (3, 13):
+        assert conditional_module.is_file()
+    else:
+        assert not conditional_module.exists()
+
+
+def test_selftest_dependency_mirror_copies_conditional_single_file_module(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dependency_site = _selftest_dependency_fixture(tmp_path)
+    isolated_site = tmp_path / "isolated" / "site-packages"
+    isolated_site.mkdir(parents=True)
+    monkeypatch.setattr(
+        cli_module,
+        "_selftest_required_runtime_module_files",
+        lambda: ("typing_extensions.py",),
+    )
+
+    assert cli_module._materialize_selftest_runtime_packages(
+        [str(dependency_site)],
+        isolated_site,
+    )
+    assert (isolated_site / "typing_extensions.py").read_text(
+        encoding="utf-8",
+    ) == "FIXTURE = True\n"
+
+
+def test_selftest_dependency_mirror_rejects_single_file_indirection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dependency_site = _selftest_dependency_fixture(tmp_path)
+    module_file = dependency_site / "typing_extensions.py"
+    isolated_site = tmp_path / "isolated" / "site-packages"
+    isolated_site.mkdir(parents=True)
+    original_check = cli_module._path_contains_link_or_reparse
+
+    monkeypatch.setattr(
+        cli_module,
+        "_selftest_required_runtime_module_files",
+        lambda: ("typing_extensions.py",),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_path_contains_link_or_reparse",
+        lambda path: Path(path) == module_file or original_check(Path(path)),
+    )
+
+    assert not cli_module._materialize_selftest_runtime_packages(
+        [str(dependency_site)],
+        isolated_site,
+    )
+    assert not (isolated_site / "typing_extensions.py").exists()
+
+
+def test_selftest_dependency_mirror_rejects_lexical_package_indirection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dependency_site = _selftest_dependency_fixture(tmp_path)
+    lexical_package = dependency_site / "yaml"
+    escaped_package = tmp_path / "outside" / "yaml"
+    escaped_package.mkdir(parents=True)
+    (escaped_package / "__init__.py").write_text(
+        "ESCAPED = True\n",
+        encoding="utf-8",
+    )
+    isolated_site = tmp_path / "isolated" / "site-packages"
+    isolated_site.mkdir(parents=True)
+    original_resolve = Path.resolve
+    escaped_resolved = original_resolve(escaped_package, strict=True)
+    observed_checks: list[Path] = []
+
+    def simulated_resolve(self: Path, strict: bool = False) -> Path:
+        if self == lexical_package:
+            return escaped_resolved
+        return original_resolve(self, strict=strict)
+
+    def simulated_indirection(path: Path) -> bool:
+        candidate = Path(path)
+        observed_checks.append(candidate)
+        return candidate == lexical_package
+
+    monkeypatch.setattr(Path, "resolve", simulated_resolve)
+    monkeypatch.setattr(
+        cli_module,
+        "_path_contains_link_or_reparse",
+        simulated_indirection,
+    )
+
+    assert not cli_module._materialize_selftest_runtime_packages(
+        [str(dependency_site)],
+        isolated_site,
+    )
+    assert lexical_package in observed_checks
+    assert escaped_resolved not in observed_checks
+    assert not (isolated_site / "yaml").exists()
+
+
+def test_selftest_dependency_mirror_rejects_empty_directory_flood(
+    tmp_path: Path,
+) -> None:
+    dependency_site = _selftest_dependency_fixture(tmp_path)
+    package = dependency_site / "yaml"
+    for index in range(cli_module._SELFTEST_MAX_RUNTIME_PACKAGE_DIRECTORIES):
+        (package / f"empty-{index:04d}").mkdir()
+    isolated_site = tmp_path / "isolated" / "site-packages"
+    isolated_site.mkdir(parents=True)
+
+    assert not cli_module._materialize_selftest_runtime_packages(
+        [str(dependency_site)],
+        isolated_site,
+    )

@@ -20,6 +20,17 @@ from supervisor_core.util import sha256_file, sha256_text
 
 
 def _common(tmp_path: Path, *, session: str = "worker-a-session") -> list[str]:
+    skill_root = tmp_path / "skills"
+    skill = skill_root / "dev-supervisor"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: dev-supervisor\n"
+        "description: Supervisor capability routing and registered quality gates\n"
+        "---\n"
+        "# Deterministic test capability\n",
+        encoding="utf-8",
+    )
     return [
         "--runtime", "codex",
         "--workspace", str(tmp_path),
@@ -53,7 +64,8 @@ def _start(tmp_path: Path, capsys: pytest.CaptureFixture[str], *, session: str =
     common = _common(tmp_path, session=session)
     assert main([
         "start", *common,
-        "--message", "run the registered quality gate",
+        "--roots", f"{tmp_path / 'skills'}|test-fixture|true|false",
+        "--message", "Use dev-supervisor to run the registered quality gate",
         "--change-mode", "replace",
         "--execution-mode", "enforce",
     ]) == 0

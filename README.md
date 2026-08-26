@@ -12,12 +12,14 @@ state, and credentials out of the repository and external review inputs.
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 Set-Location agent-supervisor
 git checkout v3.1.6
+python -m pip install .
 python bin/install-agent-supervisor.py
 python bin/install-agent-supervisor.py --apply
 python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
 ```
 
-The first installer call is a read-only plan. `--apply` builds and verifies a
+The package install supplies the declared PyYAML and jsonschema runtime dependencies.
+The first Supervisor installer call is a read-only plan. `--apply` builds and verifies a
 deterministic runtime bundle, installs the core and thin adapters, backs up changed
 managed files, and publishes the v4 active pointer last. It never edits Codex
 `AGENTS.md`/hooks, Claude settings, or the machine-local executable trust registry.
@@ -97,7 +99,7 @@ may compare-and-swap to a validated previous side-by-side release. Unbound failu
 failures observed across different active versions do not combine into a rollback
 streak. State and migrated legacy snapshots are append-only and are not deleted.
 
-`ActiveVersionPointer/v4` binds the complete `SupervisorReleaseIdentity/v1`: version, canonical release path, runtime-bundle path, bundle hash, manifest hash, and source-tree hash. The pointer has exactly `contract`, `active`, and `previous`; rollback is compare-and-swap and records audit metadata only in the ledger. A release is built as a deterministic, uncompressed runtime ZIP whose manifest covers every executable core module, schema, launcher, CodeRabbit runner, and selftest module. Codex freezes the pointer and bundle once, creates the Windows kill-on-close Job Object, then sends a bounded binary frame over stdin. A deny-disk-fallback importer verifies every member and loads `supervisor_core.*` from those frozen bytes; a pointer or module swap can affect only a later invocation. Bound selftests extract their exact bundled test payload to a temporary data-root directory and never write into the immutable release. The CodeRabbit runner and complete reviewed core are likewise taken from the bound bundle and executed from a bounded stdin frame instead of reopening mutable core scripts from disk.
+`ActiveVersionPointer/v4` binds the complete `SupervisorReleaseIdentity/v1`: version, canonical release path, runtime-bundle path, bundle hash, manifest hash, and source-tree hash. The pointer has exactly `contract`, `active`, and `previous`; rollback is compare-and-swap and records audit metadata only in the ledger. A release is built as a deterministic, uncompressed runtime ZIP whose manifest covers every executable core module, schema, launcher, CodeRabbit runner, release scanner, installer, and selftest module. Codex freezes the pointer and bundle once, creates the Windows kill-on-close Job Object, then sends a bounded binary frame over stdin. A deny-disk-fallback importer verifies every member and loads `supervisor_core.*` from those frozen bytes; a pointer or module swap can affect only a later invocation. Bound selftests extract their exact bundled payload under a short OS-temporary session root, bind the child profile to the installation home, execute pytest with the registry-bound Python, derive dependency roots with an isolated fixed probe, mirror only the core's bounded declared runtime package closure into session-local user storage for nested processes, and never write into the immutable release or installation profile. The CodeRabbit runner and complete reviewed core are likewise taken from the bound bundle and executed from a bounded stdin frame instead of reopening mutable core scripts from disk.
 
 Registered command gates must be executed through the core's `gate_run` event (or the Codex `supervisor-gate.ps1` wrapper). A Codex caller supplies only the gate id, criterion id, and optional evidence id; the core mints the one-use execution identity, executes the exact argv from the active `QualityProfile`, captures bounded/redacted output, hashes it, and signs a `GateExecution/v3` attestation. Caller-authored actor/group/invocation/timeout/command fields, exit codes, free-form evidence, or a manually injected `gate_execution` event cannot satisfy completion. The compatibility wrapper still accepts the former identity parameters, but ignores them.
 

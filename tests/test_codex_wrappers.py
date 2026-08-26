@@ -1841,6 +1841,135 @@ def test_hook_oversized_stdin_is_rejected_without_parsing_or_echoing_payload() -
     assert b"private" not in json.dumps(captured, default=str).encode("utf-8")
 
 
+def test_hook_payload_parser_rejects_ambiguous_and_complex_json_at_boundaries() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="strict_hook_payload_boundaries",
+    )
+
+    with pytest.raises(ValueError, match="invalid"):
+        hook["_parse_payload"](b'{"private":"\xff"}')
+    with pytest.raises(ValueError, match="duplicate"):
+        hook["_parse_payload"](b'{"session_id":"first","session_id":"second"}')
+    with pytest.raises(ValueError, match="duplicate"):
+        hook["_parse_payload"](
+            br'{"session_id":"first","\u0073ession_id":"second"}'
+        )
+    for raw in (
+        br'{"tool_name":"secret-\ud800"}',
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":-Infinity}',
+        b'{"value":1e400}',
+    ):
+        with pytest.raises(ValueError):
+            hook["_parse_payload"](raw)
+    assert hook["_parse_payload"](
+        br'{"value":1e308,"tool_name":"\ud83d\ude80"}'
+    ) == {"value": 1e308, "tool_name": "🚀"}
+
+    depth_value: object = 0
+    for _ in range(hook["MAX_HOOK_JSON_DEPTH"] - 2):
+        depth_value = [depth_value]
+    at_depth_limit = json.dumps(
+        {"value": depth_value}, separators=(",", ":")
+    ).encode("utf-8")
+    assert isinstance(hook["_parse_payload"](at_depth_limit), dict)
+    depth_value = [depth_value]
+    over_depth_limit = json.dumps(
+        {"value": depth_value}, separators=(",", ":")
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="complexity"):
+        hook["_parse_payload"](over_depth_limit)
+
+    boundary_items = hook["MAX_HOOK_JSON_NODES"] - 3
+    at_node_limit = json.dumps(
+        {"items": [0] * boundary_items}, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(hook["_parse_payload"](at_node_limit)["items"]) == boundary_items
+    over_node_limit = json.dumps(
+        {"items": [0] * (boundary_items + 1)}, separators=(",", ":")
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="complexity"):
+        hook["_parse_payload"](over_node_limit)
+
+
+def test_invalid_hook_payloads_fail_open_with_empty_metadata_only_record() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="privacy_safe_invalid_hook_payloads",
+    )
+    hook_globals = hook["main"].__globals__
+    secret = "adapter-boundary-secret-must-not-persist"
+    depth_value: object = secret
+    for _ in range(hook["MAX_HOOK_JSON_DEPTH"] - 1):
+        depth_value = [depth_value]
+    boundary_items = hook["MAX_HOOK_JSON_NODES"] - 2
+    cases = {
+        "invalid-utf8": b'{"private":"' + secret.encode("ascii") + b'\xff"}',
+        "duplicate-key": (
+            b'{"private":"'
+            + secret.encode("ascii")
+            + b'","private":"second"}'
+        ),
+        "lone-surrogate": (
+            b'{"tool_name":"'
+            + secret.encode("ascii")
+            + br'-\ud800"}'
+        ),
+        "nonfinite-constant": (
+            b'{"session_id":NaN,"private":"'
+            + secret.encode("ascii")
+            + b'"}'
+        ),
+        "nonfinite-overflow": (
+            b'{"session_id":1e400,"private":"'
+            + secret.encode("ascii")
+            + b'"}'
+        ),
+        "over-depth": json.dumps(
+            {"value": depth_value}, separators=(",", ":")
+        ).encode("utf-8"),
+        "over-node": json.dumps(
+            {"items": [secret] * boundary_items}, separators=(",", ":")
+        ).encode("utf-8"),
+    }
+
+    for label, raw in cases.items():
+        captured: dict[str, object] = {}
+
+        def record(event: str, payload: dict, reason: str, input_bytes: int) -> bool:
+            captured.update({
+                "event": event,
+                "payload": payload,
+                "reason": reason,
+                "input_bytes": input_bytes,
+            })
+            return True
+
+        hook_globals["sys"] = _ModuleProxy(
+            sys,
+            stdin=_ModuleProxy(sys.stdin, buffer=io.BytesIO(raw)),
+        )
+        hook_globals["_record_degraded"] = record
+        hook_globals["_emit_fail_open"] = lambda marker_recorded: captured.update({
+            "marker_recorded": marker_recorded,
+        })
+        hook_globals["_forward"] = lambda *_args, **_kwargs: pytest.fail(
+            f"{label} invalid payload reached forwarding"
+        )
+
+        assert hook["main"](["--event", "SessionStart"]) == 0
+        assert captured == {
+            "event": "SessionStart",
+            "payload": {},
+            "reason": "invalid_input",
+            "input_bytes": len(raw),
+            "marker_recorded": True,
+        }
+        assert secret not in repr(captured)
+
+
 def test_hook_registry_accepts_only_valid_optional_argv_approvals() -> None:
     hook = runpy.run_path(
         str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),

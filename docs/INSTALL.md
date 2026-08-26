@@ -11,10 +11,12 @@ previous version, backs up changed managed files, copies the thin adapters, and 
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 Set-Location agent-supervisor
 git checkout v3.1.6
+python -m pip install .
 python bin/install-agent-supervisor.py
 ```
 
-Review the JSON plan. Then apply it:
+The package install supplies the declared PyYAML and jsonschema dependencies used by
+the isolated runtime. Review the JSON plan. Then apply it:
 
 ```powershell
 python bin/install-agent-supervisor.py --apply
@@ -93,4 +95,3 @@ prior valid release in the v4 pointer. No automatic repository-triggered rollbac
 Before changing an active pointer, stop running hooks, preserve the current pointer, and
 validate both release bundles. There is intentionally no recursive uninstall command;
 remove only explicitly inspected installation paths when you choose to uninstall.
-

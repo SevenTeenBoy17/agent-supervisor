@@ -6,7 +6,9 @@
    package metadata checks in a clean checkout.
 3. Scan the current tree and full Git history for credentials, private keys, tokens,
    webhooks, raw prompts, state, logs, and personal paths. Rotate any real secret ever
-   committed.
+   committed. The scanner resolves Git only through the machine-local trusted executable
+   registry described in the installation guide; CI creates a job-local, ephemeral,
+   runner-owned registry immediately before scanning and never commits it.
 4. Review the exact base/head/diff. Test changes require a separate integrity review.
 5. Build without publishing a pointer:
 
@@ -22,4 +24,3 @@
 
 Never build from an ambient global adapter installation. Release tests and review inputs
 must resolve to this repository snapshot.
-

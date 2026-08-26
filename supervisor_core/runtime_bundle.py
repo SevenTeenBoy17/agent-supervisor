@@ -20,6 +20,7 @@ MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_MEMBERS = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ADAPTER_SUFFIXES = frozenset({".json", ".md", ".ps1", ".py"})
 _TRANSIENT_DIRECTORY_NAMES = {
     ".pytest_cache",
     ".tmp",
@@ -115,9 +116,23 @@ def _safe_relative_path(value: str) -> PurePosixPath:
 
 def _is_link_or_reparse(path: Path) -> bool:
     details = path.lstat()
+    return _stat_is_link_or_reparse(details)
+
+
+def _stat_is_link_or_reparse(details: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(details, "st_file_attributes", 0)
     return stat.S_ISLNK(details.st_mode) or bool(reparse_flag and attributes & reparse_flag)
+
+
+def _portable_file_identity(details: os.stat_result) -> tuple[int, ...]:
+    return (
+        details.st_mode,
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+    )
 
 
 def _is_transient_runtime_path(path: PurePosixPath) -> bool:
@@ -131,28 +146,80 @@ def _is_transient_runtime_path(path: PurePosixPath) -> bool:
 
 
 def _read_stable_file(root: Path, relative: PurePosixPath) -> bytes:
+    root = root.resolve(strict=True)
+    relative = _safe_relative_path(relative.as_posix())
     candidate = root.joinpath(*relative.parts)
-    current = root
-    for part in (None, *relative.parts):
-        if part is not None:
-            current /= part
-        if _is_link_or_reparse(current):
-            raise RuntimeBundleError("source-link-or-reparse")
-    resolved_root = root.resolve(strict=True)
-    resolved = candidate.resolve(strict=True)
+
+    def reject_indirection() -> None:
+        current = root
+        for part in (None, *relative.parts):
+            if part is not None:
+                current /= part
+            if _is_link_or_reparse(current):
+                raise RuntimeBundleError("source-link-or-reparse")
+
+    reject_indirection()
+    descriptor = -1
     try:
-        resolved.relative_to(resolved_root)
-    except ValueError as exc:
-        raise RuntimeBundleError("source-root-escape") from exc
-    before = resolved.stat(follow_symlinks=False)
-    if not stat.S_ISREG(before.st_mode) or before.st_size < 1 or before.st_size > MAX_MEMBER_BYTES:
-        raise RuntimeBundleError("invalid-source-file")
-    with resolved.open("rb") as handle:
-        content = handle.read(MAX_MEMBER_BYTES + 1)
-    after = resolved.stat(follow_symlinks=False)
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after or len(content) != before.st_size:
+        path_before = candidate.lstat()
+        if (
+            _stat_is_link_or_reparse(path_before)
+            or not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_size < 1
+            or path_before.st_size > MAX_MEMBER_BYTES
+        ):
+            raise RuntimeBundleError("invalid-source-file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(candidate, flags)
+        descriptor_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or descriptor_before.st_size < 1
+            or descriptor_before.st_size > MAX_MEMBER_BYTES
+        ):
+            raise RuntimeBundleError("invalid-source-file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read(MAX_MEMBER_BYTES + 1)
+        descriptor_after = os.fstat(descriptor)
+    except RuntimeBundleError:
+        raise
+    except OSError as exc:
+        raise RuntimeBundleError("source-file-unreadable") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    try:
+        path_after = candidate.lstat()
+        reject_indirection()
+    except RuntimeBundleError:
+        raise
+    except OSError as exc:
+        raise RuntimeBundleError("source-file-unreadable") from exc
+
+    identities = {
+        _portable_file_identity(path_before),
+        _portable_file_identity(descriptor_before),
+        _portable_file_identity(descriptor_after),
+        _portable_file_identity(path_after),
+    }
+    # Windows exposes creation time through path stat while descriptor ctime
+    # aliases mtime.  Bind path to descriptor with portable fields, then check
+    # ctime for drift within each observation channel.
+    if (
+        len(identities) != 1
+        or path_before.st_ctime_ns != path_after.st_ctime_ns
+        or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
+        or len(content) != descriptor_before.st_size
+    ):
         raise RuntimeBundleError("source-changed-during-read")
     return content
 
@@ -167,7 +234,9 @@ def _runtime_paths(root: Path) -> list[PurePosixPath]:
             "pyproject.toml",
             "bin/agent-supervisor.py",
             "bin/build-core-release-manifest.py",
+            "bin/install-agent-supervisor.py",
             "bin/run-coderabbit-review.py",
+            "bin/scan-release-secrets.py",
         )
         if root.joinpath(*PurePosixPath(relative).parts).is_file()
     }
@@ -191,6 +260,23 @@ def _runtime_paths(root: Path) -> list[PurePosixPath]:
                 and not _is_transient_runtime_path(relative)
             ):
                 paths.add(relative)
+    integrations_root = root / "integrations"
+    for runtime in ("codex", "claude"):
+        adapter_root = integrations_root / runtime
+        if not adapter_root.is_dir() or _is_link_or_reparse(adapter_root):
+            continue
+        for candidate in adapter_root.rglob("*"):
+            relative = PurePosixPath(candidate.relative_to(root).as_posix())
+            adapter_relative = candidate.relative_to(adapter_root)
+            if (
+                not candidate.is_file()
+                or _is_link_or_reparse(candidate)
+                or candidate.suffix.casefold() not in _ADAPTER_SUFFIXES
+                or any(part.casefold() == "tests" for part in adapter_relative.parts)
+                or _is_transient_runtime_path(relative)
+            ):
+                continue
+            paths.add(relative)
     tests_root = root / "tests"
     if tests_root.is_dir() and not _is_link_or_reparse(tests_root):
         for candidate in tests_root.rglob("*.py"):

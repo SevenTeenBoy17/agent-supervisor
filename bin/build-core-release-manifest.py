@@ -30,17 +30,49 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    details = path.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(details, "st_file_attributes", 0)
+    return stat.S_ISLNK(details.st_mode) or bool(reparse_flag and attributes & reparse_flag)
+
+
+def _reject_existing_indirection(path: Path) -> None:
+    lexical = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    anchor = Path(lexical.anchor)
+    current = anchor
+    for part in lexical.relative_to(anchor).parts:
+        current /= part
+        if not current.exists() and not current.is_symlink():
+            continue
+        try:
+            if _is_link_or_reparse(current):
+                raise ValueError(
+                    "output path is outside release root or contains a symlink or reparse point"
+                )
+        except OSError as exc:
+            raise ValueError("output path component is unavailable") from exc
+
+
 def _contained_output(root: Path, candidate: Path) -> Path:
     """Resolve one output beneath the physical release root."""
-    release_root = Path(root).expanduser().resolve(strict=True)
+    root_lexical = Path(os.path.abspath(os.fspath(Path(root).expanduser())))
+    _reject_existing_indirection(root_lexical)
+    release_root = root_lexical.resolve(strict=True)
     requested = Path(candidate).expanduser()
     if not requested.is_absolute():
         requested = release_root / requested
     lexical = Path(os.path.abspath(os.fspath(requested)))
     try:
+        lexical_relative = lexical.relative_to(release_root)
+        if not lexical_relative.parts:
+            raise ValueError("output path must name a file within release root")
+        _reject_existing_indirection(lexical)
         resolved = lexical.resolve(strict=False)
         relative = resolved.relative_to(release_root)
     except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and "output path" in str(exc):
+            raise
         raise ValueError("output path is outside release root") from exc
     if not relative.parts:
         raise ValueError("output path must name a file within release root")
@@ -69,7 +101,9 @@ def _validate_distinct_outputs(output: Path, identity_output: Path) -> None:
 
 def _stage_bytes(path: Path, content: bytes) -> Path:
     """Durably stage bytes beside their destination without publishing them."""
+    _reject_existing_indirection(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_existing_indirection(path.parent)
     descriptor, temporary = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -113,7 +147,11 @@ def _discard_stage(path: Path | None) -> None:
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
+    _reject_existing_indirection(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_existing_indirection(path.parent)
+    if path.exists() or path.is_symlink():
+        _reject_existing_indirection(path)
     descriptor, temporary = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -124,6 +162,9 @@ def _atomic_write(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        _reject_existing_indirection(path.parent)
+        if path.exists() or path.is_symlink():
+            _reject_existing_indirection(path)
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -141,7 +182,9 @@ def main() -> int:
     parser.add_argument("--identity-output", type=Path)
     args = parser.parse_args()
 
-    root = args.root.expanduser().resolve(strict=True)
+    root_lexical = Path(os.path.abspath(os.fspath(args.root.expanduser())))
+    _reject_existing_indirection(root_lexical)
+    root = root_lexical.resolve(strict=True)
     output = _contained_output(root, args.output)
     identity_output = (
         _contained_output(root, args.identity_output)

@@ -19,6 +19,16 @@ from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from supervisor_core.executable_trust import (
+    ExecutableTrustError,
+    load_trusted_executable_registry,
+    resolve_trusted_executable,
+)
+
+
 MAX_FILES = 4096
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
@@ -27,6 +37,11 @@ MAX_HISTORY_OBJECTS = 100_000
 MAX_HISTORY_BYTES = 512 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 60
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_SAFE_ENV_NAMES = {
+    "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+    "OS", "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP",
+    "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+}
 
 
 class SecretScanError(RuntimeError):
@@ -46,20 +61,50 @@ def _credential_detector(root: Path) -> Callable[[bytes], str | None]:
     return detector
 
 
+def _trusted_git(root: Path) -> str:
+    try:
+        registry = load_trusted_executable_registry()
+        executable, _ = resolve_trusted_executable(
+            "git",
+            registry,
+            cwd=str(root),
+        )
+    except (ExecutableTrustError, OSError, ValueError) as exc:
+        raise SecretScanError("trusted Git executable is unavailable") from exc
+    if not Path(executable).is_absolute():
+        raise SecretScanError("trusted Git executable is invalid")
+    return executable
+
+
+def _minimal_git_environment(executable: str) -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in _SAFE_ENV_NAMES and isinstance(value, str)
+    }
+    environment.update({
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NoDefaultCurrentDirectoryInExePath": "1",
+        "PATH": str(Path(executable).parent),
+    })
+    return environment
+
+
 def _run_git(root: Path, args: list[str], *, maximum: int) -> bytes:
-    environment = os.environ.copy()
-    for name in (
-        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    ):
-        environment.pop(name, None)
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    environment["GIT_CONFIG_GLOBAL"] = os.devnull
     if maximum < 1:
         raise SecretScanError("git scan output budget is invalid")
+    repository = Path(root).expanduser().resolve(strict=True)
+    executable = _trusted_git(repository)
+    environment = _minimal_git_environment(executable)
     try:
         process = subprocess.Popen(
-            ["git", "-C", str(root), *args],
+            [executable, "-C", str(repository), *args],
+            cwd=repository,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -138,12 +183,80 @@ def _run_git(root: Path, args: list[str], *, maximum: int) -> bytes:
 
 def _is_link_or_reparse(path: Path) -> bool:
     details = path.lstat()
+    return _stat_is_link_or_reparse(details)
+
+
+def _stat_is_link_or_reparse(details: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(details, "st_file_attributes", 0)
     return stat.S_ISLNK(details.st_mode) or bool(reparse_flag and attributes & reparse_flag)
 
 
+def _portable_file_identity(details: os.stat_result) -> tuple[int, ...]:
+    return (
+        details.st_mode,
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+    )
+
+
+def _reject_publishable_indirection(root: Path, relative: Path) -> None:
+    current = root
+    for part in (None, *relative.parts):
+        if part is not None:
+            current /= part
+        if _is_link_or_reparse(current):
+            raise SecretScanError("publishable path contains a link or reparse point")
+
+
+def _has_git_metadata(root: Path) -> bool:
+    marker = root / ".git"
+    present = marker.exists() or marker.is_symlink()
+    if present:
+        _reject_publishable_indirection(root, Path(".git"))
+    return present
+
+
+def _filesystem_publishable_paths(root: Path) -> list[tuple[str, Path]]:
+    root_resolved = root.resolve(strict=True)
+    result: list[tuple[str, Path]] = []
+
+    def fail_closed(error: OSError) -> None:
+        raise SecretScanError("publishable directory enumeration failed") from error
+
+    for current, directories, files in os.walk(
+        root_resolved,
+        followlinks=False,
+        onerror=fail_closed,
+    ):
+        current_path = Path(current)
+        relative_directory = current_path.relative_to(root_resolved)
+        _reject_publishable_indirection(root_resolved, relative_directory)
+        directories.sort()
+        files.sort()
+        for directory in directories:
+            candidate = current_path / directory
+            if _is_link_or_reparse(candidate):
+                raise SecretScanError(
+                    "publishable path contains a link or reparse point"
+                )
+        for filename in files:
+            path = current_path / filename
+            relative = path.relative_to(root_resolved)
+            _reject_publishable_indirection(root_resolved, relative)
+            if not path.is_file():
+                continue
+            result.append((relative.as_posix(), path))
+            if len(result) > MAX_FILES:
+                raise SecretScanError("publishable file count exceeds budget")
+    return result
+
+
 def _publishable_paths(root: Path) -> list[tuple[str, Path]]:
+    if not _has_git_metadata(root):
+        return _filesystem_publishable_paths(root)
     raw = _run_git(
         root,
         ["ls-files", "-co", "--exclude-standard", "-z"],
@@ -162,28 +275,75 @@ def _publishable_paths(root: Path) -> list[tuple[str, Path]]:
         path = root / relative
         if not path.exists() and not path.is_symlink():
             continue
-        if _is_link_or_reparse(path):
-            raise SecretScanError("publishable path contains a link or reparse point")
+        _reject_publishable_indirection(root, relative)
         resolved = path.resolve(strict=True)
         try:
             resolved.relative_to(root_resolved)
         except ValueError as exc:
             raise SecretScanError("publishable path escapes repository") from exc
         if resolved.is_file():
-            result.append((name.replace("\\", "/"), resolved))
+            # Read the indexed lexical path, not the resolution target observed
+            # during enumeration. Descriptor identity checks bind this name to
+            # the bytes scanned even if a path component races afterward.
+            result.append((name.replace("\\", "/"), path))
     return sorted(result)
 
 
 def _stable_file(path: Path) -> bytes:
-    before = path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE_BYTES:
-        raise SecretScanError("publishable file exceeds size budget")
-    with path.open("rb") as handle:
-        content = handle.read(MAX_FILE_BYTES + 1)
-    after = path.stat(follow_symlinks=False)
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after or len(content) != before.st_size:
+    candidate = Path(path)
+    descriptor = -1
+    try:
+        path_before = candidate.lstat()
+        if (
+            _stat_is_link_or_reparse(path_before)
+            or not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_size > MAX_FILE_BYTES
+        ):
+            raise SecretScanError("publishable file exceeds size budget")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(candidate, flags)
+        descriptor_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or descriptor_before.st_size > MAX_FILE_BYTES
+        ):
+            raise SecretScanError("publishable file exceeds size budget")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read(MAX_FILE_BYTES + 1)
+        descriptor_after = os.fstat(descriptor)
+    except SecretScanError:
+        raise
+    except OSError as exc:
+        raise SecretScanError("publishable file is unreadable") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    try:
+        path_after = candidate.lstat()
+    except OSError as exc:
+        raise SecretScanError("publishable file is unreadable") from exc
+    identities = {
+        _portable_file_identity(path_before),
+        _portable_file_identity(descriptor_before),
+        _portable_file_identity(descriptor_after),
+        _portable_file_identity(path_after),
+    }
+    if (
+        _stat_is_link_or_reparse(path_after)
+        or len(identities) != 1
+        or path_before.st_ctime_ns != path_after.st_ctime_ns
+        or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
+        or len(content) != descriptor_before.st_size
+    ):
         raise SecretScanError("publishable file changed during scan")
     return content
 
@@ -217,12 +377,16 @@ def _history_blob_index(root: Path) -> list[tuple[str, int]]:
 
 def scan_repository(root: Path, *, include_history: bool) -> dict[str, Any]:
     repository = Path(root).expanduser().resolve(strict=True)
+    has_git_metadata = _has_git_metadata(repository)
+    if include_history and not has_git_metadata:
+        raise SecretScanError("Git history is unavailable for a non-Git tree")
     detector = _credential_detector(ROOT)
     findings: list[dict[str, str]] = []
     total = 0
     current_count = 0
     for relative, path in _publishable_paths(repository):
         content = _stable_file(path)
+        _reject_publishable_indirection(repository, path.relative_to(repository))
         total += len(content)
         current_count += 1
         if total > MAX_TOTAL_BYTES:

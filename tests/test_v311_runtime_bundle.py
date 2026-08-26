@@ -11,7 +11,7 @@ import sys
 import textwrap
 import zipfile
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import pytest
@@ -258,6 +258,28 @@ def test_runtime_bundle_public_contract_exists() -> None:
     assert callable(module.inspect_runtime_bundle)
 
 
+def test_runtime_source_read_rejects_same_length_open_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _runtime_bundle_module()
+    source = tmp_path / "source.py"
+    replacement = tmp_path / "replacement.py"
+    source.write_bytes(b"trusted-content\n")
+    replacement.write_bytes(b"hostile-content\n")
+    assert source.stat().st_size == replacement.stat().st_size
+    real_open = module.os.open
+
+    def redirected_open(path, flags, *args):
+        target = replacement if Path(path) == source else path
+        return real_open(target, flags, *args)
+
+    monkeypatch.setattr(module.os, "open", redirected_open)
+
+    with pytest.raises(module.RuntimeBundleError, match="source-changed-during-read"):
+        module._read_stable_file(tmp_path, PurePosixPath("source.py"))
+
+
 def test_runtime_bundle_is_deterministic_and_manifest_is_canonical(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -286,6 +308,29 @@ def test_runtime_bundle_is_deterministic_and_manifest_is_canonical(tmp_path: Pat
     assert all(set(item) == {"path", "size", "sha256", "kind", "module"} for item in files)
     assert all("\\" not in item["path"] and not item["path"].startswith("/") for item in files)
     assert "supervisor_core/schemas/probe.json" in {item["path"] for item in files}
+
+
+def test_runtime_bundle_contains_deterministic_non_test_adapter_snapshot() -> None:
+    first_blob = _build(ROOT, "3.1.6")
+    second_blob = _build(ROOT, "3.1.6")
+
+    assert first_blob == second_blob
+    paths = {item["path"] for item in _manifest(first_blob)["files"]}
+    assert {
+        "integrations/codex/scripts/codex-supervisor-hook.py",
+        "integrations/codex/scripts/supervisor-core.ps1",
+        "integrations/codex/scripts/supervisor-process-job.py",
+        "integrations/claude/scripts/configure-v3-hooks.py",
+        "integrations/claude/scripts/sup-selftest.py",
+        "integrations/claude/scripts/sup-v3-hook.py",
+    } <= paths
+    integration_paths = {
+        path for path in paths if path.startswith("integrations/")
+    }
+    assert integration_paths
+    assert all("tests" not in path.casefold().split("/") for path in integration_paths)
+    assert all("__pycache__" not in path.casefold().split("/") for path in integration_paths)
+    assert all(not path.casefold().endswith((".pyc", ".pyo")) for path in integration_paths)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +435,20 @@ def test_release_identity_and_pointer_v4_have_no_ambient_fields(tmp_path: Path) 
 
 
 def _powershell() -> str:
+    configured = os.environ.get("AGENT_SUPERVISOR_SELFTEST_POWERSHELL")
+    expected_sha256 = os.environ.get(
+        "AGENT_SUPERVISOR_SELFTEST_POWERSHELL_SHA256"
+    )
+    if configured or expected_sha256:
+        if not configured or not expected_sha256:
+            pytest.fail("Bound selftest PowerShell identity is incomplete")
+        candidate = Path(configured)
+        if not candidate.is_absolute() or not candidate.is_file():
+            pytest.fail("Bound selftest PowerShell path is invalid")
+        observed_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if observed_sha256 != expected_sha256:
+            pytest.fail("Bound selftest PowerShell digest changed")
+        return str(candidate)
     for candidate in ("pwsh.exe", "powershell.exe", "pwsh", "powershell"):
         resolved = shutil.which(candidate)
         if resolved:

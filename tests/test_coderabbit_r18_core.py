@@ -178,6 +178,17 @@ def test_corrupt_changes_collection_is_treated_as_no_file_change_by_goal_finaliz
 def test_finalize_handles_persisted_non_object_changes_as_incomplete(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    skill_root = tmp_path / "skills"
+    skill = skill_root / "dev-supervisor"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: dev-supervisor\n"
+        "description: Supervisor capability routing state verification\n"
+        "---\n"
+        "# Deterministic test capability\n",
+        encoding="utf-8",
+    )
     common = [
         "--runtime", "codex",
         "--workspace", str(tmp_path),
@@ -187,7 +198,8 @@ def test_finalize_handles_persisted_non_object_changes_as_incomplete(
     ]
     assert main([
         "start", *common,
-        "--message", "verify corrupt persisted state",
+        "--roots", f"{skill_root}|test-fixture|true|false",
+        "--message", "Use dev-supervisor to verify corrupt persisted state",
         "--change-mode", "replace",
         "--execution-mode", "observe",
     ]) == 0

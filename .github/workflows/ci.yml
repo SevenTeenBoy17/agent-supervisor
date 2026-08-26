@@ -40,6 +40,45 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Scan publishable tree and Git history
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          git_command = shutil.which("git")
+          if not git_command:
+              raise SystemExit("Git is unavailable on this runner")
+          git = Path(git_command).resolve(strict=True)
+          install_home = Path(os.environ["RUNNER_TEMP"]) / "agent-supervisor-ci"
+          registry = install_home / ".agent-supervisor" / "trusted-executables.json"
+          registry.parent.mkdir(parents=True, exist_ok=True)
+          registry.write_text(
+              json.dumps(
+                  {
+                      "contract": "TrustedExecutableRegistry/v1",
+                      "entries": {
+                          "git": {
+                              "kind": "local",
+                              "path": str(git),
+                              "sha256": hashlib.sha256(git.read_bytes()).hexdigest(),
+                          }
+                      },
+                      "generated_at": "2000-01-01T00:00:00Z",
+                  },
+                  sort_keys=True,
+              ),
+              encoding="utf-8",
+          )
+          PY
+          AGENT_SUPERVISOR_INSTALL_HOME="$RUNNER_TEMP/agent-supervisor-ci" \
+            python bin/scan-release-secrets.py --history
+
       - name: Install project
         run: python -m pip install -e .
 
@@ -48,10 +87,6 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
-
-      - name: Scan publishable tree and Git history
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        run: python bin/scan-release-secrets.py --history
 
       - name: Verify dry-run installation
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
@@ -66,7 +101,67 @@ jobs:
           --output .ci-artifacts/supervisor-runtime.zip
           --identity-output .ci-artifacts/release-identity.json
 
+      - name: Verify installed bound selftest
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        shell: bash
+        env:
+          AGENT_SUPERVISOR_CI_HOME: ${{ runner.temp }}/agent-supervisor-installed
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          def digest(path: Path) -> str:
+              value = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.hexdigest()
+
+          selected = {
+              "git": shutil.which("git"),
+              "python": sys.executable,
+              "pwsh": shutil.which("pwsh") or shutil.which("powershell"),
+          }
+          if any(not value for value in selected.values()):
+              raise SystemExit("installed selftest dependencies are unavailable")
+          executables = {
+              name: Path(str(value)).resolve(strict=True)
+              for name, value in selected.items()
+          }
+          install_home = Path(os.environ["AGENT_SUPERVISOR_CI_HOME"])
+          registry = install_home / ".agent-supervisor" / "trusted-executables.json"
+          registry.parent.mkdir(parents=True, exist_ok=True)
+          registry.write_text(
+              json.dumps(
+                  {
+                      "contract": "TrustedExecutableRegistry/v1",
+                      "entries": {
+                          name: {
+                              "kind": "local",
+                              "path": str(path),
+                              "sha256": digest(path),
+                          }
+                          for name, path in executables.items()
+                      },
+                      "generated_at": "2000-01-01T00:00:00Z",
+                  },
+                  sort_keys=True,
+              ),
+              encoding="utf-8",
+          )
+          PY
+          python bin/install-agent-supervisor.py \
+            --source "$GITHUB_WORKSPACE" \
+            --install-home "$AGENT_SUPERVISOR_CI_HOME" \
+            --apply
+          AGENT_SUPERVISOR_INSTALL_HOME="$AGENT_SUPERVISOR_CI_HOME" \
+            python "$AGENT_SUPERVISOR_CI_HOME/.agent-supervisor/bin/agent-supervisor.py" selftest
+
       - name: Build wheel
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         run: python -m pip wheel . --no-deps --wheel-dir .ci-artifacts
-

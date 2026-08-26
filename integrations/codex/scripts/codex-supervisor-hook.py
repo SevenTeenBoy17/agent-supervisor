@@ -48,6 +48,8 @@ MARKER_PERSISTENCE_WARNING = (
 MAX_SPOOL_BYTES = 64 * 1024
 MAX_SPOOL_RECORDS = 64
 MAX_STDIN_BYTES = 4 * 1024 * 1024
+MAX_HOOK_JSON_NODES = 50_000
+MAX_HOOK_JSON_DEPTH = 64
 MAX_APPROVED_COMMANDS = 256
 RETENTION_SECONDS = 14 * 86400
 MAX_MARKERS = 200
@@ -1208,10 +1210,62 @@ def _record_degraded(event: str, payload: dict[str, Any], reason: str, input_byt
     return marker_recorded
 
 
+class _HookPayloadError(ValueError):
+    """The untrusted host envelope violates the adapter input contract."""
+
+
+def _reject_hook_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _HookPayloadError("hook-payload-duplicate-key")
+        value[key] = item
+    return value
+
+
+def _reject_hook_nonfinite_constant(_value: str) -> Any:
+    raise _HookPayloadError("hook-payload-nonfinite-number")
+
+
+def _validate_hook_payload_complexity(value: Any) -> None:
+    """Apply additive node and depth budgets without recursive traversal."""
+    nodes = 0
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_HOOK_JSON_NODES or depth > MAX_HOOK_JSON_DEPTH:
+            raise _HookPayloadError("hook-payload-complexity-limit")
+        if isinstance(current, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
+                raise _HookPayloadError("hook-payload-invalid-unicode-scalar")
+        elif isinstance(current, float) and not math.isfinite(current):
+            raise _HookPayloadError("hook-payload-nonfinite-number")
+        elif isinstance(current, dict):
+            pending.extend((key, depth + 1) for key in current)
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+
+
 def _parse_payload(raw: bytes) -> dict[str, Any]:
-    decoded = json.loads(raw.decode("utf-8"))
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _HookPayloadError("hook-payload-invalid") from exc
+    try:
+        decoded = json.loads(
+            text,
+            object_pairs_hook=_reject_hook_duplicate_keys,
+            parse_constant=_reject_hook_nonfinite_constant,
+        )
+    except _HookPayloadError:
+        raise
+    except (ValueError, RecursionError) as exc:
+        raise _HookPayloadError("hook-payload-invalid") from exc
     if not isinstance(decoded, dict):
-        raise ValueError("hook stdin must be a JSON object")
+        raise _HookPayloadError("hook-payload-object-required")
+    _validate_hook_payload_complexity(decoded)
     return decoded
 
 
