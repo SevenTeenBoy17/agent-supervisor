@@ -221,10 +221,11 @@ def test_complete_confirmed_dead_owner_is_reclaimed_after_atomic_publication(
 
 def test_raw_path_encoding_is_utf8_safe_and_namespace_injective() -> None:
     raw_text = b"raw-\xff.txt".decode("utf-8", errors="surrogateescape")
+    raw_hex = b"raw-\xff.txt".hex()
     raw_key = _persistent_workspace_path(raw_text)
     colliding_valid_name = raw_key
     escaped_valid_key = _persistent_workspace_path(colliding_valid_name)
-    assert raw_key == f"{_RAW_WORKSPACE_PATH_PREFIX}{b'raw-\xff.txt'.hex()}"
+    assert raw_key == f"{_RAW_WORKSPACE_PATH_PREFIX}{raw_hex}"
     assert escaped_valid_key.startswith(_ESCAPED_WORKSPACE_PATH_PREFIX)
     assert escaped_valid_key != raw_key
     json.dumps(
