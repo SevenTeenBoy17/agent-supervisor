@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import json
@@ -10,6 +11,7 @@ import re
 import runpy
 import shutil
 import site
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -2121,6 +2123,26 @@ def _ci_runtime_copy_script_for_test() -> str:
     return script
 
 
+def _ci_powershell_trust_probe_namespace() -> dict[str, object]:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r"\$powerShellTrustProbe = @'\n(?P<script>.*?)\n\s*'@",
+        workflow,
+        re.DOTALL,
+    )
+    assert match is not None
+    tree = ast.parse(textwrap.dedent(match.group("script")))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    namespace: dict[str, object] = {"os": os, "Path": Path, "stat": stat}
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), "ci-trust-probe", "exec"),
+        namespace,
+    )
+    return namespace
+
+
 def test_ci_runtime_rebinds_loader_exports_path_and_uses_setup_python_identity() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
@@ -2179,6 +2201,11 @@ def test_ci_hardens_posix_powershell_before_executing_repository_code() -> None:
     assert "not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)" in body
     assert "info.st_uid != 0" in body
     assert "not stat.S_ISREG(executable_info.st_mode)" in body
+    assert "def validate_missing_link_target(" in body
+    assert "def validate_ci_link(" in body
+    assert "os.path.lexists(current)" in body
+    assert "current.resolve(strict=True) != current" in body
+    assert "broken CI PowerShell link contains parent traversal" in body
     assert body.count("$powerShellTrustProbe | & $sourcePython -") == 2
 
     preflight = body.index("AGENT_SUPERVISOR_CI_POWERSHELL_PHASE = 'pre'")
@@ -2195,6 +2222,113 @@ def test_ci_hardens_posix_powershell_before_executing_repository_code() -> None:
     assert opt_harden < microsoft_harden < powershell_harden < tree_harden
     assert tree_harden < postflight < postflight_run
     assert 'print("CI_POWERSHELL_TRUST_TREE_PASS")' in body
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink trust regression")
+def test_ci_powershell_broken_link_validator_rejects_future_activation_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = _ci_powershell_trust_probe_namespace()["validate_ci_link"]
+    required_uid = os.getuid()
+    anchor = tmp_path / "anchor"
+    root = anchor / "opt" / "microsoft" / "powershell" / "7"
+    trusted_lib = anchor / "usr" / "lib64"
+    root.mkdir(parents=True)
+    trusted_lib.mkdir(parents=True)
+    for directory in (
+        anchor,
+        anchor / "opt",
+        anchor / "opt" / "microsoft",
+        anchor / "opt" / "microsoft" / "powershell",
+        root,
+        anchor / "usr",
+        trusted_lib,
+    ):
+        directory.chmod(0o755)
+
+    trusted_broken = root / "trusted-broken"
+    trusted_broken.symlink_to(trusted_lib / "missing.so")
+    assert validate(
+        trusted_broken,
+        root,
+        trusted_anchor=anchor,
+        required_uid=required_uid,
+    ) is None
+
+    writable = anchor / "world"
+    writable.mkdir()
+    writable.chmod(0o777)
+    bridge = writable / "bridge"
+    bridge.symlink_to(trusted_lib, target_is_directory=True)
+    writable_parent = root / "writable-parent"
+    writable_parent.symlink_to(bridge / "missing.so")
+    with pytest.raises(SystemExit, match="untrusted directory"):
+        validate(
+            writable_parent,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
+
+    safe_parent = anchor / "safe-parent"
+    safe_parent.mkdir()
+    safe_parent.chmod(0o755)
+    dangling_bridge = safe_parent / "bridge"
+    dangling_bridge.symlink_to(anchor / "absent", target_is_directory=True)
+    dangling_intermediate = root / "dangling-intermediate"
+    dangling_intermediate.symlink_to(dangling_bridge / "missing.so")
+    with pytest.raises(SystemExit, match="untrusted directory"):
+        validate(
+            dangling_intermediate,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
+
+    external = anchor / "external" / "live.so"
+    external.parent.mkdir()
+    external.parent.chmod(0o755)
+    external.write_bytes(b"external")
+    external.chmod(0o644)
+    live_external = root / "live-external"
+    live_external.symlink_to(external)
+    with pytest.raises(SystemExit, match="external CI PowerShell link rejected"):
+        validate(
+            live_external,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
+
+    traversal = root / "parent-traversal"
+    traversal.symlink_to(Path("..") / "missing.so")
+    with pytest.raises(SystemExit, match="parent traversal"):
+        validate(
+            traversal,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
+
+    real_lstat = Path.lstat
+
+    def foreign_owner(path: Path):
+        info = real_lstat(path)
+        if path == trusted_broken:
+            values = list(info)
+            values[4] = required_uid + 1
+            return os.stat_result(values)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", foreign_owner)
+    with pytest.raises(SystemExit, match="not root-owned"):
+        validate(
+            trusted_broken,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
 
 
 def test_powershell_python_allowed_roots_remain_an_array_after_empty_branch() -> None:

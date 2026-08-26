@@ -54,6 +54,72 @@ jobs:
           from pathlib import Path
           import stat
 
+          def trusted_real_directory(path, required_uid):
+              info = path.lstat()
+              if (
+                  not stat.S_ISDIR(info.st_mode)
+                  or stat.S_ISLNK(info.st_mode)
+                  or info.st_uid != required_uid
+                  or info.st_mode & 0o022
+              ):
+                  raise SystemExit("CI trust path contains an untrusted directory")
+
+          def validate_missing_link_target(
+              candidate,
+              *,
+              trusted_anchor=Path("/"),
+              required_uid=0,
+          ):
+              raw_target = Path(os.readlink(candidate))
+              if ".." in raw_target.parts:
+                  raise SystemExit("broken CI PowerShell link contains parent traversal")
+              target = (
+                  raw_target
+                  if raw_target.is_absolute()
+                  else candidate.parent / raw_target
+              )
+              anchor = trusted_anchor
+              if not anchor.is_absolute() or anchor.resolve(strict=True) != anchor:
+                  raise SystemExit("CI missing-link trust anchor is not canonical")
+              try:
+                  relative_parent = target.parent.relative_to(anchor)
+              except ValueError:
+                  raise SystemExit("broken CI PowerShell link escapes its trust anchor") from None
+              trusted_real_directory(anchor, required_uid)
+              current = anchor
+              for component in relative_parent.parts:
+                  current /= component
+                  if not os.path.lexists(current):
+                      return
+                  trusted_real_directory(current, required_uid)
+                  if current.resolve(strict=True) != current:
+                      raise SystemExit("broken CI PowerShell link has a redirected parent")
+              if os.path.lexists(target):
+                  raise SystemExit("broken CI PowerShell link has a dangling target object")
+
+          def validate_ci_link(
+              candidate,
+              root,
+              *,
+              trusted_anchor=Path("/"),
+              required_uid=0,
+          ):
+              info = candidate.lstat()
+              if not stat.S_ISLNK(info.st_mode) or info.st_uid != required_uid:
+                  raise SystemExit("CI PowerShell link is not root-owned")
+              try:
+                  resolved = candidate.resolve(strict=True)
+              except FileNotFoundError:
+                  validate_missing_link_target(
+                      candidate,
+                      trusted_anchor=trusted_anchor,
+                      required_uid=required_uid,
+                  )
+                  return None
+              if not resolved.is_relative_to(root):
+                  raise SystemExit("external CI PowerShell link rejected")
+              return resolved
+
           expected = Path("/opt/microsoft/powershell/7")
           root = expected.resolve(strict=True)
           ancestors = (
@@ -80,9 +146,9 @@ jobs:
               for candidate in candidates:
                   info = candidate.lstat()
                   if stat.S_ISLNK(info.st_mode):
-                      resolved = candidate.resolve(strict=True)
-                      if not resolved.is_relative_to(root):
-                          raise SystemExit("external CI PowerShell link rejected")
+                      resolved = validate_ci_link(candidate, root)
+                      if resolved is None:
+                          continue
                       info = resolved.lstat()
                   if info.st_uid != 0 or info.st_mode & 0o022:
                       raise SystemExit("CI PowerShell trust tree remains writable or unowned")
