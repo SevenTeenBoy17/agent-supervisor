@@ -2003,7 +2003,6 @@ def test_hook_registry_accepts_only_valid_optional_argv_approvals() -> None:
             hook["_parse_trusted_executable_registry"](encoded(invalid))
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows registry bridge validation")
 def test_powershell_registry_accepts_valid_optional_argv_approvals_and_rejects_scalar(
     tmp_path: Path,
 ) -> None:
@@ -2048,11 +2047,151 @@ def test_powershell_registry_accepts_valid_optional_argv_approvals_and_rejects_s
     assert Path(resolve({
         **base_entry,
         "allowed_argv_sha256": ["c" * 64],
-    })) == python_path
+    })).resolve(strict=True) == python_path.resolve(strict=True)
     assert resolve({
         **base_entry,
         "allowed_argv_sha256": "c" * 64,
     }) == ""
+    if os.name != "nt":
+        uppercase_python = tmp_path / "Python3.11"
+        uppercase_python.write_bytes(b"not-a-python-runtime")
+        assert resolve({
+            "kind": "local",
+            "path": str(uppercase_python),
+            "sha256": hashlib.sha256(uppercase_python.read_bytes()).hexdigest(),
+        }) == ""
+
+
+def _ci_runtime_copy_script_for_test() -> str:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r"\$runtimeRelative = @'\n(?P<script>.*?)\n\s*'@ \| python -",
+        workflow,
+        re.DOTALL,
+    )
+    assert match is not None
+    script = textwrap.dedent(match.group("script"))
+    source_assignment = "source = Path(sys.base_prefix).resolve(strict=True)"
+    executable_assignment = (
+        "relative_executable = "
+        "Path(sys.executable).resolve(strict=True).relative_to(source)"
+    )
+    assert source_assignment in script
+    assert executable_assignment in script
+    script = script.replace(
+        source_assignment,
+        'source = Path(os.environ["TEST_RUNTIME_SOURCE"]).resolve(strict=True)',
+        1,
+    ).replace(
+        executable_assignment,
+        "relative_executable = "
+        'Path(os.environ["TEST_RUNTIME_EXECUTABLE"])'
+        ".resolve(strict=True).relative_to(source)",
+        1,
+    )
+    return script
+
+
+def _create_test_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _remove_test_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        link.rmdir()
+    else:
+        link.unlink()
+
+
+def test_ci_runtime_copy_rejects_external_link_or_reparse_point(
+    tmp_path: Path,
+) -> None:
+    script = _ci_runtime_copy_script_for_test()
+
+    source = tmp_path / "source"
+    external = tmp_path / "external"
+    runtime = source / ("python.exe" if os.name == "nt" else "python")
+    target = tmp_path / "target"
+    source.mkdir()
+    external.mkdir()
+    runtime.write_bytes(b"test-runtime")
+    link = source / "external-link"
+    _create_test_directory_link(link, external)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "AGENT_SUPERVISOR_CI_RUNTIME_ROOT": str(target),
+                "TEST_RUNTIME_SOURCE": str(source),
+                "TEST_RUNTIME_EXECUTABLE": str(runtime),
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        if link.exists():
+            _remove_test_directory_link(link)
+
+    assert result.returncode != 0
+    assert "external runtime link or reparse point rejected" in (
+        result.stdout + result.stderr
+    )
+    assert not target.exists()
+
+
+def test_ci_runtime_copy_dereferences_an_internal_link_without_residual_metadata(
+    tmp_path: Path,
+) -> None:
+    script = _ci_runtime_copy_script_for_test()
+    source = tmp_path / "source"
+    internal = source / "runtime-lib"
+    runtime = source / ("python.exe" if os.name == "nt" else "python")
+    target = tmp_path / "target"
+    internal.mkdir(parents=True)
+    (internal / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runtime.write_bytes(b"test-runtime")
+    link = source / "internal-link"
+    _create_test_directory_link(link, internal)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "AGENT_SUPERVISOR_CI_RUNTIME_ROOT": str(target),
+                "TEST_RUNTIME_SOURCE": str(source),
+                "TEST_RUNTIME_EXECUTABLE": str(runtime),
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        if link.exists():
+            _remove_test_directory_link(link)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (target / runtime.name).read_bytes() == b"test-runtime"
+    copied_link = target / "internal-link"
+    assert (copied_link / "module.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not copied_link.is_symlink()
+    if hasattr(copied_link, "is_junction"):
+        assert not copied_link.is_junction()
 
 
 def test_spool_never_writes_partial_json_when_single_record_exceeds_cap(

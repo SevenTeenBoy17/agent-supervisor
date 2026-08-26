@@ -85,19 +85,69 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q supervisor_core bin integrations tests
 
-      - name: Prepare hermetic Supervisor test home
+      - name: Prepare hermetic Supervisor test runtime
         shell: pwsh
         run: |
           $env:AGENT_SUPERVISOR_CI_TEST_HOME = $HOME
-          $ciRoot = Join-Path $HOME ".pyenv/versions/ci"
-          python -m venv --copies $ciRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($IsWindows) {
-            $ciPython = Join-Path $ciRoot "Scripts/python.exe"
+          $runtimeRoot = if ($IsWindows) {
+            Join-Path $HOME "AppData/Local/Programs/Python/agent-supervisor-ci-${{ matrix.python-version }}"
           } else {
-            $ciPython = Join-Path $ciRoot "bin/python"
+            Join-Path $HOME ".pyenv/versions/agent-supervisor-ci-${{ matrix.python-version }}"
           }
-          & $ciPython -m pip install --disable-pip-version-check -e . pytest==8.3.4
+          $env:AGENT_SUPERVISOR_CI_RUNTIME_ROOT = $runtimeRoot
+          $runtimeRelative = @'
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import sys
+
+          REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+          def runtime_tree_entries(root: Path):
+              pending = [root]
+              while pending:
+                  directory = pending.pop()
+                  with os.scandir(directory) as entries:
+                      for entry in entries:
+                          candidate = Path(entry.path)
+                          attributes = getattr(
+                              candidate.lstat(), "st_file_attributes", 0
+                          )
+                          link_like = candidate.is_symlink() or bool(
+                              attributes & REPARSE_POINT
+                          )
+                          yield candidate, link_like
+                          if not link_like and entry.is_dir(follow_symlinks=False):
+                              pending.append(candidate)
+
+          source = Path(sys.base_prefix).resolve(strict=True)
+          target = Path(os.environ["AGENT_SUPERVISOR_CI_RUNTIME_ROOT"])
+          if target.exists():
+              raise SystemExit("CI runtime target already exists")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          for candidate, link_like in runtime_tree_entries(source):
+              if link_like:
+                  resolved = candidate.resolve(strict=True)
+                  if not resolved.is_relative_to(source):
+                      raise SystemExit(
+                          f"external runtime link or reparse point rejected: {candidate}"
+                      )
+          relative_executable = Path(sys.executable).resolve(strict=True).relative_to(source)
+          shutil.copytree(source, target, symlinks=False)
+          if any(link_like for _, link_like in runtime_tree_entries(target)):
+              raise SystemExit("copied CI runtime retained a link or reparse point")
+          runtime = target / relative_executable
+          if not runtime.is_file():
+              raise SystemExit("copied CI runtime executable is missing")
+          print(relative_executable)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $runtimeRelative = [string]($runtimeRelative | Select-Object -Last 1)
+          $ciPython = Join-Path $runtimeRoot $runtimeRelative.Trim()
+          & $ciPython -I -S -c "import os,sys; expected=os.path.realpath(os.environ['AGENT_SUPERVISOR_CI_RUNTIME_ROOT']); raise SystemExit(0 if os.path.realpath(sys.prefix)==expected and os.path.realpath(sys.base_prefix)==expected else 1)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $ciPython -m pip install --disable-pip-version-check --ignore-installed --no-user -e . pytest==8.3.4
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @'
           import hashlib
@@ -153,96 +203,41 @@ jobs:
             --install-home "$env:AGENT_SUPERVISOR_CI_TEST_HOME" `
             --apply
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "AGENT_SUPERVISOR_CI_PYTHON=$ciPython" >> $env:GITHUB_ENV
+          "AGENT_SUPERVISOR_CI_RUNTIME_ROOT=$runtimeRoot" >> $env:GITHUB_ENV
 
       - name: Run tests
         shell: pwsh
         run: |
-          $ciRoot = Join-Path $HOME ".pyenv/versions/ci"
-          if ($IsWindows) {
-            $ciPython = Join-Path $ciRoot "Scripts/python.exe"
-          } else {
-            $ciPython = Join-Path $ciRoot "bin/python"
-          }
           $pytestArgs = @("-m", "pytest", "-q")
           if (-not $IsWindows) {
             $pytestArgs += "--ignore=tests/test_v311_codex_adapter_security.py"
           }
-          & $ciPython @pytestArgs
+          & $env:AGENT_SUPERVISOR_CI_PYTHON @pytestArgs
 
       - name: Verify dry-run installation
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        run: python bin/install-agent-supervisor.py
+        shell: pwsh
+        run: '& $env:AGENT_SUPERVISOR_CI_PYTHON bin/install-agent-supervisor.py'
 
       - name: Build and inspect deterministic release
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        run: >-
-          python bin/build-core-release-manifest.py
-          --root .
-          --version 3.1.6
-          --output .ci-artifacts/supervisor-runtime.zip
-          --identity-output .ci-artifacts/release-identity.json
+        shell: pwsh
+        run: |
+          & $env:AGENT_SUPERVISOR_CI_PYTHON bin/build-core-release-manifest.py `
+            --root . `
+            --version 3.1.6 `
+            --output .ci-artifacts/supervisor-runtime.zip `
+            --identity-output .ci-artifacts/release-identity.json
 
       - name: Verify installed bound selftest
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        shell: bash
-        env:
-          AGENT_SUPERVISOR_CI_HOME: ${{ runner.temp }}/agent-supervisor-installed
+        shell: pwsh
         run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import shutil
-          import sys
-
-          def digest(path: Path) -> str:
-              value = hashlib.sha256()
-              with path.open("rb") as handle:
-                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                      value.update(chunk)
-              return value.hexdigest()
-
-          selected = {
-              "git": shutil.which("git"),
-              "python": sys.executable,
-              "pwsh": shutil.which("pwsh") or shutil.which("powershell"),
-          }
-          if any(not value for value in selected.values()):
-              raise SystemExit("installed selftest dependencies are unavailable")
-          executables = {
-              name: Path(str(value)).resolve(strict=True)
-              for name, value in selected.items()
-          }
-          install_home = Path(os.environ["AGENT_SUPERVISOR_CI_HOME"])
-          registry = install_home / ".agent-supervisor" / "trusted-executables.json"
-          registry.parent.mkdir(parents=True, exist_ok=True)
-          registry.write_text(
-              json.dumps(
-                  {
-                      "contract": "TrustedExecutableRegistry/v1",
-                      "entries": {
-                          name: {
-                              "kind": "local",
-                              "path": str(path),
-                              "sha256": digest(path),
-                          }
-                          for name, path in executables.items()
-                      },
-                      "generated_at": "2000-01-01T00:00:00Z",
-                  },
-                  sort_keys=True,
-              ),
-              encoding="utf-8",
-          )
-          PY
-          python bin/install-agent-supervisor.py \
-            --source "$GITHUB_WORKSPACE" \
-            --install-home "$AGENT_SUPERVISOR_CI_HOME" \
-            --apply
-          AGENT_SUPERVISOR_INSTALL_HOME="$AGENT_SUPERVISOR_CI_HOME" \
-            python "$AGENT_SUPERVISOR_CI_HOME/.agent-supervisor/bin/agent-supervisor.py" selftest
+          $launcher = Join-Path $HOME ".agent-supervisor/bin/agent-supervisor.py"
+          & $env:AGENT_SUPERVISOR_CI_PYTHON $launcher selftest
 
       - name: Build wheel
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        run: python -m pip wheel . --no-deps --wheel-dir .ci-artifacts
+        shell: pwsh
+        run: '& $env:AGENT_SUPERVISOR_CI_PYTHON -m pip wheel . --no-deps --wheel-dir .ci-artifacts'

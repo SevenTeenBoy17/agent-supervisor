@@ -531,7 +531,12 @@ function Get-AgentSupervisorTrustedRegistryPythonPath {
         if (-not [IO.Path]::IsPathRooted($candidate)) { return $null }
         $candidateFull = [IO.Path]::GetFullPath($candidate)
         $candidateLeaf = [IO.Path]::GetFileName($candidateFull)
-        if ($candidateLeaf -notmatch '^(?i:python(?:3)?[.]exe)$') { return $null }
+        $validCandidateLeaf = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            $candidateLeaf -match '^(?i:python(?:3)?[.]exe)$'
+        } else {
+            $candidateLeaf -cmatch '^(?:python|python3(?:[.][0-9]+)*)$'
+        }
+        if (-not $validCandidateLeaf) { return $null }
         $candidateRoot = Split-Path -Parent $candidateFull
         $trusted = Resolve-AgentSupervisorTrustedPythonPath `
             -Candidate $candidateFull `

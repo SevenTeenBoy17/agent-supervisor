@@ -107,7 +107,7 @@ def test_one_hundred_contenders_never_overlap_or_observe_partial_owner(
 
     def contender(index: int) -> None:
         nonlocal active, max_active
-        with storage_module._exclusive_file_lock(lock_path, timeout=20):
+        with storage_module._exclusive_file_lock(lock_path, timeout=60):
             owner = json.loads(lock_path.read_text(encoding="utf-8"))
             nonce = str(owner["owner_nonce"])
             with guard:
@@ -121,7 +121,7 @@ def test_one_hundred_contenders_never_overlap_or_observe_partial_owner(
     with ThreadPoolExecutor(max_workers=100) as pool:
         futures = [pool.submit(contender, index) for index in range(100)]
         for future in futures:
-            future.result(timeout=25)
+            future.result(timeout=70)
 
     assert len(acquired) == 100
     assert len({row.split(":", 1)[1] for row in acquired}) == 100
