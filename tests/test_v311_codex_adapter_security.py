@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -175,6 +176,26 @@ def test_stage_zero_rejects_every_malformed_previous_identity(
 
 def test_outer_deadline_strictly_covers_inner_and_tree_cleanup() -> None:
     module = _hook_module()
+    bridge_source = CORE_BRIDGE.read_text(encoding="utf-8")
+    probe_cap = re.search(
+        r"\$probeTimeout\s*=.*?\[double\](?P<seconds>5\.0)\)\)",
+        bridge_source,
+    )
+    assert probe_cap is not None
+    assert float(probe_cap.group("seconds")) == module[
+        "INNER_PYTHON_IDENTITY_PROBE_SECONDS"
+    ]
+    identity_startup = re.search(
+        r"\$startupGraceSeconds\s*=\s*if\s*\(\$useContainment\).*?"
+        r"elseif\s*\(\$runningOnWindows\)\s*\{\s*"
+        r"\[double\](?P<seconds>1\.0)\s*\}",
+        bridge_source,
+        re.DOTALL,
+    )
+    assert identity_startup is not None
+    assert float(identity_startup.group("seconds")) == module[
+        "INNER_PYTHON_IDENTITY_STARTUP_GRACE_SECONDS"
+    ]
     for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         inner = module["_hook_timeout"](event)
         outer = module["_outer_hook_timeout"](event)
@@ -182,8 +203,10 @@ def test_outer_deadline_strictly_covers_inner_and_tree_cleanup() -> None:
         assert outer > inner + cleanup
         assert outer >= (
             inner
+            + module["INNER_PYTHON_IDENTITY_PROBE_SECONDS"]
+            + module["INNER_PYTHON_IDENTITY_STARTUP_GRACE_SECONDS"]
             + module["INNER_STARTUP_GRACE_SECONDS"]
-            + module["INNER_STREAM_CLEANUP_SECONDS"]
+            + (2 * module["INNER_STREAM_CLEANUP_SECONDS"])
             + module["OUTER_BRIDGE_GRACE_SECONDS"]
         )
 

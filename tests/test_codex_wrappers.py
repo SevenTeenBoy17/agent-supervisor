@@ -27,7 +27,7 @@ from supervisor_core.workspace import capture_workspace_snapshot, workspace_delt
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
-NATIVE_HOOK_TEST_TIMEOUT_SECONDS = 40
+NATIVE_HOOK_TEST_TIMEOUT_SECONDS = 45
 
 
 def _trusted_python_path() -> Path:
@@ -1205,12 +1205,22 @@ def _run_native_hook(
         input=payload,
         capture_output=True,
         check=False,
-        # The production Stop path has a 25-second inner budget plus startup,
-        # stream cleanup, and outer bridge grace. Hosted Windows startup may be
-        # materially slower than a developer workstation, so the harness must
-        # not expire before the production deadline it is exercising.
+        # The production Stop path has a 25-second inner budget plus the serial
+        # five-second identity preflight, both startup/stream cleanup budgets,
+        # and outer bridge grace. The harness also leaves room for tree cleanup
+        # and a degraded marker if that production deadline is exhausted.
         timeout=NATIVE_HOOK_TEST_TIMEOUT_SECONDS,
     )
+
+
+def test_native_hook_harness_timeout_exceeds_maximum_outer_deadline() -> None:
+    hook = runpy.run_path(str(ROOT / "integrations" / "codex" / "scripts" / "codex-supervisor-hook.py"))
+    required = (
+        hook["_outer_hook_timeout"]("Stop")
+        + hook["OUTER_PROCESS_TREE_CLEANUP_SECONDS"]
+        + hook["MARKER_LOCK_RETRY_SECONDS"]
+    )
+    assert NATIVE_HOOK_TEST_TIMEOUT_SECONDS > required
 
 
 def _write_native_fake_core(
@@ -1324,6 +1334,13 @@ def test_native_hook_ignores_workspace_and_pythonpath_module_hijacks(
         "PYTHONPATH": str(malicious),
         "SUPERVISOR_HIJACK_SENTINEL": str(sentinel),
     })
+    capture = tmp_path / "native-event-capture.json"
+    expected_response = b'{"native_core_reached":true}'
+    _write_native_fake_core(
+        home,
+        response=expected_response,
+        capture=capture,
+    )
     payload = json.dumps({
         "session_id": "native-isolation-session",
         "cwd": str(workspace),
@@ -1345,6 +1362,7 @@ def test_native_hook_ignores_workspace_and_pythonpath_module_hijacks(
         "SessionEnd",
     )
     for event in official_events:
+        capture.unlink(missing_ok=True)
         event_payload = json.loads(payload.decode("utf-8"))
         event_payload["hook_event_name"] = event
         completed = _run_native_hook(
@@ -1355,7 +1373,10 @@ def test_native_hook_ignores_workspace_and_pythonpath_module_hijacks(
             event=event,
         )
         assert completed.returncode == 0
-        assert isinstance(json.loads(completed.stdout.decode("utf-8")), dict)
+        assert completed.stdout == expected_response
+        assert capture.is_file()
+        forwarded = json.loads(capture.read_text(encoding="utf-8"))
+        assert forwarded["hook_event_name"] == event
     assert not sentinel.exists()
     source = adapter.read_text(encoding="utf-8")
     assert "_trusted_hook_bridge_source" in source
@@ -2077,7 +2098,7 @@ def _ci_runtime_copy_script_for_test() -> str:
         encoding="utf-8"
     )
     match = re.search(
-        r"\$runtimeRelative = @'\n(?P<script>.*?)\n\s*'@ \| python -",
+        r"\$runtimeRelative = @'\n(?P<script>.*?)\n\s*'@ \| & \$sourcePython -",
         workflow,
         re.DOTALL,
     )
@@ -2114,6 +2135,7 @@ def test_ci_runtime_rebinds_loader_exports_path_and_uses_setup_python_identity()
     body = prepare.group("body")
 
     assert "$ciPython = Join-Path ([string]$env:pythonLocation) 'python.exe'" in body
+    assert "'@ | & $sourcePython -" in body
     assert "[string](Get-Command python -CommandType Application" not in body
     assert "& $patchElf --set-rpath $runtimeLibraryRoot $ciPython" in body
     assert "& $patchElf --print-rpath $ciPython" in body
@@ -2131,6 +2153,48 @@ def test_ci_runtime_rebinds_loader_exports_path_and_uses_setup_python_identity()
     assert target_loader_binding < job_loader_binding
     assert job_loader_binding < body.index("registry.write_text(")
     assert job_loader_binding < body.index("bin/install-agent-supervisor.py")
+
+
+def test_ci_hardens_posix_powershell_before_executing_repository_code() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    setup_index = workflow.index("- name: Set up Python")
+    harden_index = workflow.index("- name: Harden hosted POSIX executable trust chain")
+    scan_index = workflow.index("- name: Scan publishable tree and Git history")
+    install_index = workflow.index("- name: Install project")
+    assert setup_index < harden_index < scan_index < install_index
+
+    harden = re.search(
+        r"- name: Harden hosted POSIX executable trust chain\n(?P<body>.*?)"
+        r"\n\s+- name: Scan publishable tree and Git history",
+        workflow,
+        re.DOTALL,
+    )
+    assert harden is not None
+    body = harden.group("body")
+    assert "if: runner.os != 'Windows'" in body
+    assert 'root = expected.resolve(strict=True)' in body
+    assert 'if root != expected:' in body
+    assert "not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)" in body
+    assert "info.st_uid != 0" in body
+    assert "not stat.S_ISREG(executable_info.st_mode)" in body
+    assert body.count("$powerShellTrustProbe | & $sourcePython -") == 2
+
+    preflight = body.index("AGENT_SUPERVISOR_CI_POWERSHELL_PHASE = 'pre'")
+    preflight_run = body.index("$powerShellTrustProbe | & $sourcePython -", preflight)
+    opt_harden = body.index("& sudo chmod 'go-w' -- '/opt'")
+    microsoft_harden = body.index("& sudo chmod 'go-w' -- '/opt/microsoft'")
+    powershell_harden = body.index(
+        "& sudo chmod 'go-w' -- '/opt/microsoft/powershell'"
+    )
+    tree_harden = body.index("& sudo chmod -R 'go-w' -- $powerShellRoot")
+    postflight = body.index("AGENT_SUPERVISOR_CI_POWERSHELL_PHASE = 'post'")
+    postflight_run = body.index("$powerShellTrustProbe | & $sourcePython -", postflight)
+    assert preflight < preflight_run < opt_harden
+    assert opt_harden < microsoft_harden < powershell_harden < tree_harden
+    assert tree_harden < postflight < postflight_run
+    assert 'print("CI_POWERSHELL_TRUST_TREE_PASS")' in body
 
 
 def test_powershell_python_allowed_roots_remain_an_array_after_empty_branch() -> None:
@@ -2240,6 +2304,42 @@ def test_ci_runtime_copy_dereferences_an_internal_link_without_residual_metadata
     assert not copied_link.is_symlink()
     if hasattr(copied_link, "is_junction"):
         assert not copied_link.is_junction()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime permission regression")
+def test_ci_runtime_copy_removes_group_and_other_write_permissions(
+    tmp_path: Path,
+) -> None:
+    script = _ci_runtime_copy_script_for_test()
+    source = tmp_path / "source"
+    runtime = source / "bin" / "python"
+    library = source / "lib" / "libpython-test.so"
+    target = tmp_path / "target"
+    runtime.parent.mkdir(parents=True)
+    library.parent.mkdir(parents=True)
+    runtime.write_bytes(b"test-runtime")
+    library.write_bytes(b"test-library")
+    for candidate in (source, runtime.parent, runtime, library.parent, library):
+        candidate.chmod(0o777)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "AGENT_SUPERVISOR_CI_RUNTIME_ROOT": str(target),
+            "TEST_RUNTIME_SOURCE": str(source),
+            "TEST_RUNTIME_EXECUTABLE": str(runtime),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    copied_paths = (target, *target.rglob("*"))
+    assert all(path.lstat().st_mode & 0o022 == 0 for path in copied_paths)
 
 
 def test_spool_never_writes_partial_json_when_single_record_exceeds_cap(

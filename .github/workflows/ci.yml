@@ -40,6 +40,71 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Harden hosted POSIX executable trust chain
+        if: runner.os != 'Windows'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace([string]$env:pythonLocation)) { exit 1 }
+          $sourcePython = Join-Path ([string]$env:pythonLocation) 'bin/python'
+          if (-not [IO.Path]::IsPathRooted($sourcePython) -or -not (Test-Path -LiteralPath $sourcePython -PathType Leaf)) { exit 1 }
+          $powerShellRoot = '/opt/microsoft/powershell/7'
+          $env:AGENT_SUPERVISOR_CI_POWERSHELL_ROOT = $powerShellRoot
+          $powerShellTrustProbe = @'
+          import os
+          from pathlib import Path
+          import stat
+
+          expected = Path("/opt/microsoft/powershell/7")
+          root = expected.resolve(strict=True)
+          ancestors = (
+              Path("/opt"),
+              Path("/opt/microsoft"),
+              Path("/opt/microsoft/powershell"),
+              expected,
+          )
+          if root != expected:
+              raise SystemExit("CI PowerShell trust root is not canonical")
+          for candidate in ancestors:
+              info = candidate.lstat()
+              if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                  raise SystemExit("CI PowerShell trust ancestor is not a real directory")
+              if info.st_uid != 0:
+                  raise SystemExit("CI PowerShell trust ancestor is not root-owned")
+          executable = root / "pwsh"
+          executable_info = executable.lstat()
+          if not stat.S_ISREG(executable_info.st_mode) or executable_info.st_uid != 0:
+              raise SystemExit("CI PowerShell executable is not a root-owned regular file")
+
+          if os.environ["AGENT_SUPERVISOR_CI_POWERSHELL_PHASE"] == "post":
+              candidates = (*ancestors, *root.rglob("*"))
+              for candidate in candidates:
+                  info = candidate.lstat()
+                  if stat.S_ISLNK(info.st_mode):
+                      resolved = candidate.resolve(strict=True)
+                      if not resolved.is_relative_to(root):
+                          raise SystemExit("external CI PowerShell link rejected")
+                      info = resolved.lstat()
+                  if info.st_uid != 0 or info.st_mode & 0o022:
+                      raise SystemExit("CI PowerShell trust tree remains writable or unowned")
+              print("CI_POWERSHELL_TRUST_TREE_PASS")
+          '@
+          $env:AGENT_SUPERVISOR_CI_POWERSHELL_PHASE = 'pre'
+          $powerShellTrustProbe | & $sourcePython -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & sudo chmod 'go-w' -- '/opt'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & sudo chmod 'go-w' -- '/opt/microsoft'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & sudo chmod 'go-w' -- '/opt/microsoft/powershell'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & sudo chmod -R 'go-w' -- $powerShellRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:AGENT_SUPERVISOR_CI_POWERSHELL_PHASE = 'post'
+          $powerShellTrustProbe | & $sourcePython -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item Env:AGENT_SUPERVISOR_CI_POWERSHELL_PHASE -ErrorAction SilentlyContinue
+          Remove-Item Env:AGENT_SUPERVISOR_CI_POWERSHELL_ROOT -ErrorAction SilentlyContinue
+
       - name: Scan publishable tree and Git history
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         shell: bash
@@ -90,19 +155,26 @@ jobs:
         run: |
           $env:AGENT_SUPERVISOR_CI_TEST_HOME = $HOME
           $ciPython = ''
+          $sourcePython = ''
+          $runtimeRoot = ''
           if ($IsWindows) {
             if ([string]::IsNullOrWhiteSpace([string]$env:pythonLocation)) { exit 1 }
             $ciPython = Join-Path ([string]$env:pythonLocation) 'python.exe'
           } else {
-          $runtimeRoot = "/usr/local/agent-supervisor-ci/python-${{ matrix.python-version }}"
-          $runtimeParent = Split-Path -Parent $runtimeRoot
-          $uid = [string](& id -u)
-          $gid = [string](& id -g)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          sudo install -d -m 0755 -o $uid.Trim() -g $gid.Trim() -- $runtimeParent
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:AGENT_SUPERVISOR_CI_RUNTIME_ROOT = $runtimeRoot
-          $runtimeRelative = @'
+            if ([string]::IsNullOrWhiteSpace([string]$env:pythonLocation)) { exit 1 }
+            $sourcePython = Join-Path ([string]$env:pythonLocation) 'bin/python'
+            $runtimeRoot = "/usr/local/agent-supervisor-ci/python-${{ matrix.python-version }}"
+            $runtimeParent = Split-Path -Parent $runtimeRoot
+            $uid = [string](& id -u)
+            $gid = [string](& id -g)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            sudo install -d -m 0755 -o $uid.Trim() -g $gid.Trim() -- $runtimeParent
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (-not $IsWindows) {
+            if (-not [IO.Path]::IsPathRooted($sourcePython) -or -not (Test-Path -LiteralPath $sourcePython -PathType Leaf)) { exit 1 }
+            $env:AGENT_SUPERVISOR_CI_RUNTIME_ROOT = $runtimeRoot
+            $runtimeRelative = @'
           import os
           from pathlib import Path
           import shutil
@@ -157,28 +229,39 @@ jobs:
               raise SystemExit("unversioned CI runtime launcher is unavailable")
           relative_executable = runtime_source.relative_to(source)
           shutil.copytree(source, target, symlinks=False)
-          if any(link_like for _, link_like in runtime_tree_entries(target)):
+          if os.name != "nt":
+              target.chmod(stat.S_IMODE(target.lstat().st_mode) & ~0o022)
+              for candidate, link_like in runtime_tree_entries(target):
+                  if link_like:
+                      raise SystemExit("copied CI runtime retained a link or reparse point")
+                  candidate.chmod(stat.S_IMODE(candidate.lstat().st_mode) & ~0o022)
+              if target.lstat().st_mode & 0o022 or any(
+                  candidate.lstat().st_mode & 0o022
+                  for candidate, _ in runtime_tree_entries(target)
+              ):
+                  raise SystemExit("copied CI runtime retained group/other write access")
+          elif any(link_like for _, link_like in runtime_tree_entries(target)):
               raise SystemExit("copied CI runtime retained a link or reparse point")
           runtime = target / relative_executable
           if not runtime.is_file():
               raise SystemExit("copied CI runtime executable is missing")
           print(relative_executable)
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $runtimeRelative = [string]($runtimeRelative | Select-Object -Last 1)
-          $ciPython = Join-Path $runtimeRoot $runtimeRelative.Trim()
-          $patchElf = '/usr/bin/patchelf'
-          if (-not (Test-Path -LiteralPath $patchElf -PathType Leaf)) { exit 1 }
-          $runtimeLibraryRoot = Join-Path $runtimeRoot 'lib'
-          & $patchElf --set-rpath $runtimeLibraryRoot $ciPython
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $observedRpath = [string](& $patchElf --print-rpath $ciPython)
-          if ($LASTEXITCODE -ne 0 -or $observedRpath.Trim() -cne $runtimeLibraryRoot) { exit 1 }
-          Remove-Item Env:LD_LIBRARY_PATH -ErrorAction SilentlyContinue
-          & $ciPython -I -S -c "import os,sys; expected=os.path.realpath(os.environ['AGENT_SUPERVISOR_CI_RUNTIME_ROOT']); raise SystemExit(0 if os.path.realpath(sys.prefix)==expected and os.path.realpath(sys.base_prefix)==expected else 1)"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:LD_LIBRARY_PATH = $runtimeLibraryRoot
-          "LD_LIBRARY_PATH=$runtimeLibraryRoot" >> $env:GITHUB_ENV
+          '@ | & $sourcePython -
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $runtimeRelative = [string]($runtimeRelative | Select-Object -Last 1)
+            $ciPython = Join-Path $runtimeRoot $runtimeRelative.Trim()
+            $patchElf = '/usr/bin/patchelf'
+            if (-not (Test-Path -LiteralPath $patchElf -PathType Leaf)) { exit 1 }
+            $runtimeLibraryRoot = Join-Path $runtimeRoot 'lib'
+            & $patchElf --set-rpath $runtimeLibraryRoot $ciPython
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $observedRpath = [string](& $patchElf --print-rpath $ciPython)
+            if ($LASTEXITCODE -ne 0 -or $observedRpath.Trim() -cne $runtimeLibraryRoot) { exit 1 }
+            Remove-Item Env:LD_LIBRARY_PATH -ErrorAction SilentlyContinue
+            & $ciPython -I -S -c "import os,sys; expected=os.path.realpath(os.environ['AGENT_SUPERVISOR_CI_RUNTIME_ROOT']); raise SystemExit(0 if os.path.realpath(sys.prefix)==expected and os.path.realpath(sys.base_prefix)==expected else 1)"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:LD_LIBRARY_PATH = $runtimeLibraryRoot
+            "LD_LIBRARY_PATH=$runtimeLibraryRoot" >> $env:GITHUB_ENV
           }
           if (-not [IO.Path]::IsPathRooted($ciPython) -or -not (Test-Path -LiteralPath $ciPython -PathType Leaf)) { exit 1 }
           & $ciPython -I -S -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"

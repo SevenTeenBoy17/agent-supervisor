@@ -56,6 +56,8 @@ MAX_MARKERS = 200
 MARKER_LOCK_RETRY_SECONDS = 1.5
 UNIDENTIFIED_SESSION = "unidentified-hook-session"
 INNER_STARTUP_GRACE_SECONDS = 1.5
+INNER_PYTHON_IDENTITY_PROBE_SECONDS = 5.0
+INNER_PYTHON_IDENTITY_STARTUP_GRACE_SECONDS = 1.0
 INNER_STREAM_CLEANUP_SECONDS = 2.0
 OUTER_BRIDGE_GRACE_SECONDS = 1.0
 OUTER_PROCESS_TREE_CLEANUP_SECONDS = 2.0
@@ -1348,11 +1350,13 @@ def _minimal_hook_environment() -> dict[str, str]:
 
 
 def _outer_hook_timeout(event: str) -> float:
-    """Cover the entire inner deadline plus startup and stream-cleanup grace."""
+    """Cover the serial identity probe, inner deadline, and both cleanups."""
     return (
         _hook_timeout(event)
+        + INNER_PYTHON_IDENTITY_PROBE_SECONDS
+        + INNER_PYTHON_IDENTITY_STARTUP_GRACE_SECONDS
         + INNER_STARTUP_GRACE_SECONDS
-        + INNER_STREAM_CLEANUP_SECONDS
+        + (2 * INNER_STREAM_CLEANUP_SECONDS)
         + OUTER_BRIDGE_GRACE_SECONDS
     )
 
