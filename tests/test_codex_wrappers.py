@@ -27,6 +27,7 @@ from supervisor_core.workspace import capture_workspace_snapshot, workspace_delt
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
+NATIVE_HOOK_TEST_TIMEOUT_SECONDS = 40
 
 
 def _trusted_python_path() -> Path:
@@ -1204,7 +1205,11 @@ def _run_native_hook(
         input=payload,
         capture_output=True,
         check=False,
-        timeout=10,
+        # The production Stop path has a 25-second inner budget plus startup,
+        # stream cleanup, and outer bridge grace. Hosted Windows startup may be
+        # materially slower than a developer workstation, so the harness must
+        # not expire before the production deadline it is exercising.
+        timeout=NATIVE_HOOK_TEST_TIMEOUT_SECONDS,
     )
 
 
@@ -1372,6 +1377,11 @@ def test_native_hook_child_environment_drops_poison_and_preserves_os_known_folde
     home = tmp_path / "allowlist home"
     workspace = tmp_path / "allowlist workspace"
     workspace.mkdir()
+    if os.name != "nt":
+        # PowerShell exposes these POSIX profile directories as its safe
+        # APPDATA/LOCALAPPDATA equivalents only when they already exist.
+        (home / ".config").mkdir(parents=True)
+        (home / ".local" / "share").mkdir(parents=True)
     adapter = (
         home / ".codex" / "skills" / "dev-supervisor" / "scripts"
         / "codex-supervisor-hook.py"
@@ -2417,6 +2427,28 @@ def test_posix_real_executable_selection_accepts_an_explicit_fixed_candidate(
         require_running_python=False,
     )
     assert selected == (pwsh, pwsh, None)
+
+
+def test_posix_executable_name_policy_accepts_only_numeric_python_versions() -> None:
+    hook = runpy.run_path(
+        str(CODEX_SCRIPTS / "codex-supervisor-hook.py"),
+        run_name="posix_name_policy",
+    )
+    allowed = hook["_allowed_posix_executable_name"]
+    python_names = frozenset({"python", "python3"})
+
+    for name in ("python", "python3", "python3.11", "python3.14.1"):
+        assert allowed(name, python_names) is True
+    for name in (
+        "python3.",
+        "python3.alpha",
+        "python3.11-config",
+        "python3-config",
+        "python311",
+        "pwsh",
+    ):
+        assert allowed(name, python_names) is False
+    assert allowed("python3.11", frozenset({"pwsh"})) is False
 
 
 @pytest.mark.skipif(

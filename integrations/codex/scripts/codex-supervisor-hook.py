@@ -285,6 +285,22 @@ def _posix_identity_from_path(path: Path) -> tuple[int, int, int, int]:
     )
 
 
+def _allowed_posix_executable_name(
+    name: str, allowed_names: frozenset[str]
+) -> bool:
+    if name in allowed_names:
+        return True
+    if "python3" not in allowed_names or not name.startswith("python3."):
+        return False
+    version = name.removeprefix("python3.")
+    return all(
+        component
+        and component.isascii()
+        and component.isdigit()
+        for component in version.split(".")
+    )
+
+
 def _posix_executable_paths(
     candidate: Path,
     *,
@@ -296,7 +312,9 @@ def _posix_executable_paths(
     if not _supported_posix_platform():
         return None
     lexical = _lexical_absolute(candidate)
-    if not lexical.is_absolute() or lexical.name not in allowed_names:
+    if not lexical.is_absolute() or not _allowed_posix_executable_name(
+        lexical.name, allowed_names
+    ):
         return None
     try:
         # A package-manager executable may be a leaf symlink. Directory symlinks,
