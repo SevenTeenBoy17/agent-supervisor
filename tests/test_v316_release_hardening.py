@@ -547,6 +547,8 @@ def test_runtime_paths_include_release_selftest_support_tools() -> None:
     }
 
     assert {
+        "LICENSE",
+        "NOTICE",
         "bin/install-agent-supervisor.py",
         "bin/scan-release-secrets.py",
     } <= selected

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import supervisor_core.attestation as attestation_module
+import supervisor_core.cli as cli_module
 import supervisor_core.storage as storage_module
 from supervisor_core.attestation import sign_record, verify_record
 from supervisor_core.storage import LockTimeout, StateContext, default_session, exclusive_lock
@@ -89,6 +90,51 @@ def test_100_way_cli_event_updates_keep_state_and_event_ledger(tmp_path):
     events = [json.loads(line) for line in state_file.with_name("events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(events) == 101
     assert [row["sequence"] for row in events] == list(range(1, 102))
+
+
+def test_state_record_uses_one_transaction_without_preload_or_split_writes(tmp_path, monkeypatch, capsys):
+    class TransactionOnlyContext:
+        runtime = "codex"
+        root = tmp_path / "a" / "b" / "c" / "d" / "e" / "f"
+        state_file = root / "state.json"
+
+        def __init__(self):
+            self.state = {"evidence": []}
+            self.event = None
+
+        def load(self):
+            raise AssertionError("state-updating events must not acquire a preload lock")
+
+        def update(self, _mutator):
+            raise AssertionError("state-updating events must not use a split state write")
+
+        def append_event(self, _event):
+            raise AssertionError("state-updating events must not use a split event write")
+
+        def transact(self, mutator, event):
+            mutator(self.state)
+            self.event = {**event, "sequence": 1}
+            return self.state, self.event
+
+    context = TransactionOnlyContext()
+    monkeypatch.setattr(cli_module, "_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(cli_module, "prune_old_state", lambda *_args, **_kwargs: None)
+
+    code = cli_module.main([
+        "event",
+        "--runtime", "codex",
+        "--workspace", str(tmp_path),
+        "--session", "transaction-only",
+        "--round", "round-transaction-only",
+        "--event-type", "evidence_record",
+        "--data-json", json.dumps({"record": {"evidence_id": "e-atomic"}}),
+    ])
+
+    assert code == 0
+    assert context.state["evidence"] == [{"evidence_id": "e-atomic"}]
+    assert context.event["record_id"] == "e-atomic"
+    assert "record" not in context.event
+    assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
 def test_two_sessions_are_fully_isolated(tmp_path):

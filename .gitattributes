@@ -1,0 +1,2 @@
+# Publishable text and integrity-bound sources must be byte-identical everywhere.
+* text=auto eol=lf

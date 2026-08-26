@@ -2074,10 +2074,7 @@ def _ci_runtime_copy_script_for_test() -> str:
     assert match is not None
     script = textwrap.dedent(match.group("script"))
     source_assignment = "source = Path(sys.base_prefix).resolve(strict=True)"
-    executable_assignment = (
-        "relative_executable = "
-        "Path(sys.executable).resolve(strict=True).relative_to(source)"
-    )
+    executable_assignment = "running_executable = Path(sys.executable).resolve(strict=True)"
     assert source_assignment in script
     assert executable_assignment in script
     script = script.replace(
@@ -2086,9 +2083,8 @@ def _ci_runtime_copy_script_for_test() -> str:
         1,
     ).replace(
         executable_assignment,
-        "relative_executable = "
-        'Path(os.environ["TEST_RUNTIME_EXECUTABLE"])'
-        ".resolve(strict=True).relative_to(source)",
+        'running_executable = Path(os.environ["TEST_RUNTIME_EXECUTABLE"])'
+        ".resolve(strict=True)",
         1,
     )
     return script
@@ -2120,9 +2116,9 @@ def test_ci_runtime_copy_rejects_external_link_or_reparse_point(
 
     source = tmp_path / "source"
     external = tmp_path / "external"
-    runtime = source / ("python.exe" if os.name == "nt" else "python")
+    runtime = source / "bin" / "python"
     target = tmp_path / "target"
-    source.mkdir()
+    runtime.parent.mkdir(parents=True)
     external.mkdir()
     runtime.write_bytes(b"test-runtime")
     link = source / "external-link"
@@ -2159,9 +2155,10 @@ def test_ci_runtime_copy_dereferences_an_internal_link_without_residual_metadata
     script = _ci_runtime_copy_script_for_test()
     source = tmp_path / "source"
     internal = source / "runtime-lib"
-    runtime = source / ("python.exe" if os.name == "nt" else "python")
+    runtime = source / "bin" / "python"
     target = tmp_path / "target"
     internal.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True, exist_ok=True)
     (internal / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
     runtime.write_bytes(b"test-runtime")
     link = source / "internal-link"
@@ -2186,7 +2183,7 @@ def test_ci_runtime_copy_dereferences_an_internal_link_without_residual_metadata
             _remove_test_directory_link(link)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (target / runtime.name).read_bytes() == b"test-runtime"
+    assert (target / runtime.relative_to(source)).read_bytes() == b"test-runtime"
     copied_link = target / "internal-link"
     assert (copied_link / "module.py").read_text(encoding="utf-8") == "VALUE = 1\n"
     assert not copied_link.is_symlink()

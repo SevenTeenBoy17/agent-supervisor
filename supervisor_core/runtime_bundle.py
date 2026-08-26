@@ -229,6 +229,8 @@ def _runtime_paths(root: Path) -> list[PurePosixPath]:
         PurePosixPath(relative)
         for relative in (
             "VERSION",
+            "LICENSE",
+            "NOTICE",
             ".gitignore",
             "README.md",
             "pyproject.toml",

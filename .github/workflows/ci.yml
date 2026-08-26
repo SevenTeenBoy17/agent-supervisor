@@ -89,11 +89,17 @@ jobs:
         shell: pwsh
         run: |
           $env:AGENT_SUPERVISOR_CI_TEST_HOME = $HOME
-          $runtimeRoot = if ($IsWindows) {
-            Join-Path $HOME "AppData/Local/Programs/Python/agent-supervisor-ci-${{ matrix.python-version }}"
+          $ciPython = ''
+          if ($IsWindows) {
+            $ciPython = [string](Get-Command python -CommandType Application -ErrorAction Stop).Source
           } else {
-            Join-Path $HOME ".pyenv/versions/agent-supervisor-ci-${{ matrix.python-version }}"
-          }
+          $runtimeRoot = "/usr/local/agent-supervisor-ci/python-${{ matrix.python-version }}"
+          $runtimeParent = Split-Path -Parent $runtimeRoot
+          $uid = [string](& id -u)
+          $gid = [string](& id -g)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo install -d -m 0755 -o $uid.Trim() -g $gid.Trim() -- $runtimeParent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:AGENT_SUPERVISOR_CI_RUNTIME_ROOT = $runtimeRoot
           $runtimeRelative = @'
           import os
@@ -133,7 +139,22 @@ jobs:
                       raise SystemExit(
                           f"external runtime link or reparse point rejected: {candidate}"
                       )
-          relative_executable = Path(sys.executable).resolve(strict=True).relative_to(source)
+          running_executable = Path(sys.executable).resolve(strict=True)
+          runtime_source = next(
+              (
+                  candidate
+                  for candidate in (
+                      source / "bin" / "python",
+                      source / "bin" / "python3",
+                  )
+                  if candidate.is_file()
+                  and candidate.resolve(strict=True) == running_executable
+              ),
+              None,
+          )
+          if runtime_source is None:
+              raise SystemExit("unversioned CI runtime launcher is unavailable")
+          relative_executable = runtime_source.relative_to(source)
           shutil.copytree(source, target, symlinks=False)
           if any(link_like for _, link_like in runtime_tree_entries(target)):
               raise SystemExit("copied CI runtime retained a link or reparse point")
@@ -147,7 +168,9 @@ jobs:
           $ciPython = Join-Path $runtimeRoot $runtimeRelative.Trim()
           & $ciPython -I -S -c "import os,sys; expected=os.path.realpath(os.environ['AGENT_SUPERVISOR_CI_RUNTIME_ROOT']); raise SystemExit(0 if os.path.realpath(sys.prefix)==expected and os.path.realpath(sys.base_prefix)==expected else 1)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $ciPython -m pip install --disable-pip-version-check --ignore-installed --no-user -e . pytest==8.3.4
+          }
+          if (-not [IO.Path]::IsPathRooted($ciPython) -or -not (Test-Path -LiteralPath $ciPython -PathType Leaf)) { exit 1 }
+          & $ciPython -I -S -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @'
           import hashlib
@@ -204,7 +227,9 @@ jobs:
             --apply
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "AGENT_SUPERVISOR_CI_PYTHON=$ciPython" >> $env:GITHUB_ENV
-          "AGENT_SUPERVISOR_CI_RUNTIME_ROOT=$runtimeRoot" >> $env:GITHUB_ENV
+          if (-not $IsWindows) {
+            "AGENT_SUPERVISOR_CI_RUNTIME_ROOT=$runtimeRoot" >> $env:GITHUB_ENV
+          }
 
       - name: Run tests
         shell: pwsh

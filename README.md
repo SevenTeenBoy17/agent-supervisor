@@ -18,12 +18,26 @@ python bin/install-agent-supervisor.py --apply
 python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
 ```
 
+On Linux or macOS, use the equivalent shell commands:
+
+```bash
+git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
+cd agent-supervisor
+git checkout v3.1.6
+python3 -m pip install .
+python3 bin/install-agent-supervisor.py
+python3 bin/install-agent-supervisor.py --apply
+python3 "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
+```
+
 The package install supplies the declared PyYAML and jsonschema runtime dependencies.
 The first Supervisor installer call is a read-only plan. `--apply` builds and verifies a
 deterministic runtime bundle, installs the core and thin adapters, backs up changed
 managed files, and publishes the v4 active pointer last. It never edits Codex
 `AGENTS.md`/hooks, Claude settings, or the machine-local executable trust registry.
 Complete those explicit activation steps in [the installation guide](docs/INSTALL.md).
+The published wheel installs the shared Python core only; use the tagged source tree or
+runtime ZIP installer when you also need Codex and Claude adapters.
 
 ## Stable entry points
 

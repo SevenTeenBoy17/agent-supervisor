@@ -15,6 +15,16 @@ python -m pip install .
 python bin/install-agent-supervisor.py
 ```
 
+Linux and macOS:
+
+```bash
+git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
+cd agent-supervisor
+git checkout v3.1.6
+python3 -m pip install .
+python3 bin/install-agent-supervisor.py
+```
+
 The package install supplies the declared PyYAML and jsonschema dependencies used by
 the isolated runtime. Review the JSON plan. Then apply it:
 
@@ -22,6 +32,13 @@ the isolated runtime. Review the JSON plan. Then apply it:
 python bin/install-agent-supervisor.py --apply
 python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
 ```
+
+Use `python3` for those two commands on Linux and macOS. The published wheel installs
+the Python core and console entry point only; it does not install the Codex or Claude
+adapters. For a full adapter installation, use the tagged source tree or extract the
+runtime ZIP and run its installer. The installer itself makes no network calls, but
+`pip install` may need network access for PyYAML and jsonschema unless those dependencies
+are already available locally.
 
 Use `--install-home <absolute-path>` for an isolated profile and `--core-only` to omit
 adapter copies. The installer does not create or change
@@ -40,6 +57,12 @@ EvidenceRecords, independent review, registered gates, and successful finalizati
 claiming completion. Project AGENTS.md and the current user request remain authoritative.
 ```
 
+Complete the executable-trust step below before enabling lifecycle hooks. On Windows,
+the native Codex adapter requires an exact `python` path and SHA-256 in
+`trusted-executables.json`; without it the hook deliberately fails open as degraded. On
+Linux and macOS, the running Python and `pwsh` must resolve through a supported,
+root-owned fixed path or an exact registry entry.
+
 If your Codex host supports project hooks, configure the installed
 `scripts/codex-supervisor-hook.py` for the supported lifecycle events and confirm the
 result in `/hooks` after starting a fresh task. Host hook availability is a platform
@@ -51,15 +74,23 @@ The Claude files are installed at `~/.claude/skills/supervisor/`. The settings
 configurator preserves unrelated settings and replaces only exact Supervisor-owned hook
 entries. Run it explicitly, inspect its before/after hashes, and restart Claude Code:
 
+The configurator intentionally refuses a missing or invalid settings file. Start Claude
+Code once so it creates `~/.claude/settings.json`. If Claude has never been started, you
+may instead create that file with exactly `{}` after confirming it does not already
+exist; never overwrite existing settings.
+
 ```powershell
 python "$HOME/.claude/skills/supervisor/scripts/configure-v3-hooks.py"
 ```
 
-## 4. Configure executable trust for external gates
+## 4. Configure executable trust for Codex hooks and external gates
 
-External repository-declared commands are disabled until the machine owner registers the
-executable digest and exact canonical argv digest in
-`~/.agent-supervisor/trusted-executables.json`.
+The machine-local registry is used by the Codex lifecycle adapter as well as registered
+external commands. The Windows adapter requires the exact Python executable entry shown
+below. On Linux and macOS, add exact `python` and `pwsh` entries when the trusted,
+root-owned fixed candidates are unavailable or when deterministic selection is desired.
+Repository-declared external commands additionally remain disabled until the machine
+owner registers each exact canonical argv digest.
 
 Compute an executable SHA-256 with your operating-system tooling. Compute an exact argv
 approval from the installed package:
@@ -84,6 +115,19 @@ The registry shape is:
   "generated_at": "2026-08-25T00:00:00Z"
 }
 ```
+
+Resolve and hash the same Python that will run the hook. On Windows PowerShell:
+
+```powershell
+$PythonPath = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+$PythonSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $PythonPath).Hash.ToLowerInvariant()
+[pscustomobject]@{ path = $PythonPath; sha256 = $PythonSha256 }
+```
+
+Review those values, then place them in the `python` entry. A POSIX `pwsh` entry uses
+the same `kind`, absolute `path`, and lowercase SHA-256 fields. `allowed_argv_sha256` is
+not required for the lifecycle adapter itself; add it only for exact registered gate
+commands.
 
 Do not commit this file. Recompute approvals whenever an executable path, executable
 bytes, or gate argv changes.

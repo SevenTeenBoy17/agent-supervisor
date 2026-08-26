@@ -3183,17 +3183,21 @@ def command_event(args: argparse.Namespace) -> int:
     invocation_id = str(payload.get("invocation_id") or "")
     capability = str(payload.get("capability") or "")
     is_result = event_type in {"invocation_result", "skill_result"}
-    invocation_state = ctx.load()
     invocation_assurance = "codex-explicit-audit" if ctx.runtime == "codex" else "declared-runtime"
-    invocation_details = {
-        "phase": payload.get("phase"),
-        "summary": payload.get("summary"),
-        **_invocation_state_binding(invocation_state),
-    }
+    invocation_state: dict[str, Any] | None = None
+    invocation_details: dict[str, Any] = {}
+    if event_type in {"invocation_attempt", "skill_attempt"} or is_result:
+        invocation_state = ctx.load()
+        invocation_details = {
+            "phase": payload.get("phase"),
+            "summary": payload.get("summary"),
+            **_invocation_state_binding(invocation_state),
+        }
     if event_type in {"invocation_attempt", "skill_attempt"}:
         if not invocation_id or not capability:
             raise InvalidState("invocation attempt requires --invocation-id and --capability")
-        breaker_state = ctx.load()
+        assert invocation_state is not None
+        breaker_state = invocation_state
         breaker = breaker_state.get("capability_breakers", {}).get(capability, {})
         if isinstance(breaker, dict) and breaker.get("open") is True:
             fallback_id = _breaker_fallback_id(
@@ -3239,7 +3243,6 @@ def command_event(args: argparse.Namespace) -> int:
                 str(payload.get("responsibility_group") or "").strip() or None
             ),
         )
-    record_id: str | None = None
     needs_state_update = is_result or event_type in {
         "task_record", "task_upsert", "evidence_record", "claim_record",
         "waiver_record", "intent_disposition", "changes_record", "spec_record",
@@ -3247,7 +3250,6 @@ def command_event(args: argparse.Namespace) -> int:
     } or payload.get("status") == "degraded" or payload.get("degraded_prior") is True
     if needs_state_update:
         def mutate(state: dict[str, Any]) -> None:
-            nonlocal record_id
             if is_result:
                 _record_breaker_result(state, capability, str(args.result))
                 record_intent_capability_attempt(
@@ -3257,17 +3259,18 @@ def command_event(args: argparse.Namespace) -> int:
                     invocation_id=invocation_id,
                 )
             record_id = _apply_state_record(state, payload, event_type)
+            if record_id is not None:
+                payload.pop("record", None)
+                payload["record_id"] = record_id
             if payload.get("status") == "degraded" or payload.get("degraded_prior") is True:
                 state["health"] = "degraded"
             state["updated_at"] = utc_now()
 
-        ctx.update(mutate)
-    elif not ctx.load():
-        raise InvalidState("active round state missing")
-    if record_id is not None:
-        payload.pop("record", None)
-        payload["record_id"] = record_id
-    recorded = ctx.append_event(payload)
+        _, recorded = ctx.transact(mutate, payload)
+    else:
+        if not ctx.load():
+            raise InvalidState("active round state missing")
+        recorded = ctx.append_event(payload)
     if event_type == "handoff_requested":
         emit_stage_checkpoint(
             ctx,
