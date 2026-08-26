@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 
 import pytest
 
 import supervisor_core.attestation as attestation_module
-from supervisor_core.cli import _evaluate_builtin_gate, _global_gate_ids, main
+from supervisor_core.cli import (
+    InvalidState,
+    _evaluate_builtin_gate,
+    _global_gate_ids,
+    _json_arg,
+    main,
+)
 from supervisor_core.contracts import build_goal
 from supervisor_core.discovery import _version_key
 from supervisor_core.lifecycle import start_round
@@ -145,6 +152,31 @@ def test_cli_start_does_not_treat_request_or_goal_json_as_trusted_authority(
     result = json.loads(capsys.readouterr().out)
     assert result["goal"]["waiver_authorizations"] == []
     assert result["goal"]["t3_action_authorizations"] == []
+
+
+def test_json_arg_parses_inline_json_when_path_probe_exceeds_filename_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = json.dumps({"payload": "x" * 4096})
+
+    def filename_too_long(_path: Path) -> bool:
+        raise OSError(errno.ENAMETOOLONG, "filename too long")
+
+    monkeypatch.setattr(Path, "exists", filename_too_long)
+
+    assert _json_arg(raw) == {"payload": "x" * 4096}
+
+
+def test_json_arg_path_probe_error_remains_fail_closed_for_non_json_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def permission_denied(_path: Path) -> bool:
+        raise PermissionError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(Path, "exists", permission_denied)
+
+    with pytest.raises(InvalidState, match="invalid JSON argument"):
+        _json_arg("blocked.json")
 
 
 def test_blank_workspace_degrades_without_resolving_process_cwd(

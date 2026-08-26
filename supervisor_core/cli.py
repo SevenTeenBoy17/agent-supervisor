@@ -395,8 +395,13 @@ def _json_arg(raw: str | None, default: Any = None) -> Any:
     if raw is None:
         return default
     candidate = Path(raw)
-    if candidate.exists() and candidate.is_file():
-        return json_load(candidate, default)
+    try:
+        if candidate.exists() and candidate.is_file():
+            return json_load(candidate, default)
+    except OSError:
+        # Long inline JSON can exceed the host filesystem's filename limit.
+        # Treat it as JSON input instead of failing during the optional path probe.
+        pass
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
