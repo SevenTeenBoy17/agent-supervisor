@@ -408,19 +408,20 @@ function Get-AgentSupervisorPythonAllowedRoots {
     $roots = @()
     $profileHome = Get-AgentSupervisorProfileHome
     $runningOnWindows = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
-    $rawRoots = if ($runningOnWindows) {
-        @(
+    [string[]]$rawRoots = @()
+    if ($runningOnWindows) {
+        $rawRoots += @(
             [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
             [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
         )
-    } else { @() }
+    }
     if (-not [string]::IsNullOrWhiteSpace($profileHome)) {
         if ($runningOnWindows) {
             # Trust only the conventional per-user Python installation subtree,
             # never the whole writable profile as an executable root.
-            $rawRoots += Join-Path $profileHome 'AppData\Local\Programs\Python'
+            $rawRoots += (Join-Path $profileHome 'AppData\Local\Programs\Python')
         } else {
-            $rawRoots += Join-Path $profileHome '.pyenv/versions'
+            $rawRoots += (Join-Path $profileHome '.pyenv/versions')
         }
     }
     if (-not $runningOnWindows) {

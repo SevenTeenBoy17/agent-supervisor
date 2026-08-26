@@ -91,7 +91,8 @@ jobs:
           $env:AGENT_SUPERVISOR_CI_TEST_HOME = $HOME
           $ciPython = ''
           if ($IsWindows) {
-            $ciPython = [string](Get-Command python -CommandType Application -ErrorAction Stop).Source
+            if ([string]::IsNullOrWhiteSpace([string]$env:pythonLocation)) { exit 1 }
+            $ciPython = Join-Path ([string]$env:pythonLocation) 'python.exe'
           } else {
           $runtimeRoot = "/usr/local/agent-supervisor-ci/python-${{ matrix.python-version }}"
           $runtimeParent = Split-Path -Parent $runtimeRoot
@@ -166,8 +167,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $runtimeRelative = [string]($runtimeRelative | Select-Object -Last 1)
           $ciPython = Join-Path $runtimeRoot $runtimeRelative.Trim()
+          $patchElf = '/usr/bin/patchelf'
+          if (-not (Test-Path -LiteralPath $patchElf -PathType Leaf)) { exit 1 }
+          $runtimeLibraryRoot = Join-Path $runtimeRoot 'lib'
+          & $patchElf --set-rpath $runtimeLibraryRoot $ciPython
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $observedRpath = [string](& $patchElf --print-rpath $ciPython)
+          if ($LASTEXITCODE -ne 0 -or $observedRpath.Trim() -cne $runtimeLibraryRoot) { exit 1 }
+          Remove-Item Env:LD_LIBRARY_PATH -ErrorAction SilentlyContinue
           & $ciPython -I -S -c "import os,sys; expected=os.path.realpath(os.environ['AGENT_SUPERVISOR_CI_RUNTIME_ROOT']); raise SystemExit(0 if os.path.realpath(sys.prefix)==expected and os.path.realpath(sys.base_prefix)==expected else 1)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:LD_LIBRARY_PATH = $runtimeLibraryRoot
+          "LD_LIBRARY_PATH=$runtimeLibraryRoot" >> $env:GITHUB_ENV
           }
           if (-not [IO.Path]::IsPathRooted($ciPython) -or -not (Test-Path -LiteralPath $ciPython -PathType Leaf)) { exit 1 }
           & $ciPython -I -S -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
@@ -229,6 +240,7 @@ jobs:
           "AGENT_SUPERVISOR_CI_PYTHON=$ciPython" >> $env:GITHUB_ENV
           if (-not $IsWindows) {
             "AGENT_SUPERVISOR_CI_RUNTIME_ROOT=$runtimeRoot" >> $env:GITHUB_ENV
+            (Join-Path $runtimeRoot 'bin') >> $env:GITHUB_PATH
           }
 
       - name: Run tests

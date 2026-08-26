@@ -2090,6 +2090,47 @@ def _ci_runtime_copy_script_for_test() -> str:
     return script
 
 
+def test_ci_runtime_rebinds_loader_exports_path_and_uses_setup_python_identity() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    prepare = re.search(
+        r"- name: Prepare hermetic Supervisor test runtime\n(?P<body>.*?)"
+        r"\n\s+- name: Run tests",
+        workflow,
+        re.DOTALL,
+    )
+    assert prepare is not None
+    body = prepare.group("body")
+
+    assert "$ciPython = Join-Path ([string]$env:pythonLocation) 'python.exe'" in body
+    assert "[string](Get-Command python -CommandType Application" not in body
+    assert "& $patchElf --set-rpath $runtimeLibraryRoot $ciPython" in body
+    assert "& $patchElf --print-rpath $ciPython" in body
+    assert "Remove-Item Env:LD_LIBRARY_PATH" in body
+    assert "$env:LD_LIBRARY_PATH = $runtimeLibraryRoot" in body
+    assert "$inheritedLdLibraryPath" not in body
+    assert '"LD_LIBRARY_PATH=$runtimeLibraryRoot" >> $env:GITHUB_ENV' in body
+    assert "(Join-Path $runtimeRoot 'bin') >> $env:GITHUB_PATH" in body
+    assert body.index("& $patchElf --set-rpath") < body.index("registry.write_text(")
+    target_loader_binding = body.index("$env:LD_LIBRARY_PATH = $runtimeLibraryRoot")
+    job_loader_binding = body.index(
+        '"LD_LIBRARY_PATH=$runtimeLibraryRoot" >> $env:GITHUB_ENV'
+    )
+    assert body.index("Remove-Item Env:LD_LIBRARY_PATH") < target_loader_binding
+    assert target_loader_binding < job_loader_binding
+    assert job_loader_binding < body.index("registry.write_text(")
+    assert job_loader_binding < body.index("bin/install-agent-supervisor.py")
+
+
+def test_powershell_python_allowed_roots_remain_an_array_after_empty_branch() -> None:
+    source = (CODEX_SCRIPTS / "supervisor-core.ps1").read_text(encoding="utf-8")
+
+    assert "[string[]]$rawRoots = @()" in source
+    assert "$rawRoots = if ($runningOnWindows)" not in source
+    assert "$rawRoots += (Join-Path $profileHome '.pyenv/versions')" in source
+
+
 def _create_test_directory_link(link: Path, target: Path) -> None:
     if os.name == "nt":
         subprocess.run(
@@ -2744,16 +2785,13 @@ def test_powershell_python_command_runs_real_production_identity_probe(
     harness = tmp_path / "real-python-identity-probe.ps1"
     harness.write_text(textwrap.dedent(
         """
-        param([string]$Core, [string]$PythonPath)
+        param([string]$Core, [string]$PythonPath, [string]$RuntimeRoot)
         . $Core
         function Get-Command { @() }
-        function Get-AgentSupervisorPythonAllowedRoots {
-            return @((Split-Path -Parent $PythonPath))
-        }
         function Get-AgentSupervisorTrustedRegistryPythonPath {
             return Resolve-AgentSupervisorTrustedPythonPath `
                 -Candidate $PythonPath `
-                -AllowedRoots @((Split-Path -Parent $PythonPath)) `
+                -AllowedRoots @($RuntimeRoot) `
                 -KnownExecutables @($PythonPath)
         }
         $resolved = Get-AgentSupervisorPythonCommand
@@ -2775,7 +2813,7 @@ def test_powershell_python_command_runs_real_production_identity_probe(
     completed = subprocess.run(
         [
             _powershell(), "-NoLogo", "-NoProfile", "-File", str(harness),
-            str(core_script), str(python_path),
+            str(core_script), str(python_path), str(Path(sys.base_prefix).resolve()),
         ],
         capture_output=True,
         text=True,
