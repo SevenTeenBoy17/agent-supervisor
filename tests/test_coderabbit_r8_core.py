@@ -70,6 +70,24 @@ def test_nullable_reviews_fail_closed_on_zero_skill_and_test_integrity_paths(val
     assert "test deletion/skip/threshold/assertion change lacks separate test-integrity review" in report["errors"]
 
 
+def test_current_review_category_satisfies_test_integrity_check(valid_bundle) -> None:
+    state, events = valid_bundle
+    state["changes"]["test_changes"] = {"assertions_changed": True}
+    integrity_review = copy.deepcopy(state["reviews"][0])
+    integrity_review["review_id"] = "review-test-integrity"
+    integrity_review["review_category"] = "test-integrity"
+    integrity_review.pop("category", None)
+    integrity_review["attestation"] = sign_record(integrity_review)
+    state["reviews"].append(integrity_review)
+
+    report = validate_state(state, events)
+
+    assert (
+        "test deletion/skip/threshold/assertion change lacks separate test-integrity review"
+        not in report["errors"]
+    )
+
+
 def test_nullable_criteria_and_events_fail_closed_without_raising(valid_bundle) -> None:
     state, _ = valid_bundle
     state["goal"]["acceptance_criteria"] = None

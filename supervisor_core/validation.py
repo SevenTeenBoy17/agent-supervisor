@@ -1936,7 +1936,14 @@ def _validate_changes_and_reviews(
         observed_test_change = bool(observed and any(_is_test_path(path) for path in observed.get("files", [])))
         risky = declared_risky or observed_test_change
         if risky:
-            integrity = [r for r in reviews if isinstance(r, dict) and r.get("category") == "test-integrity" and r.get("verdict") == "APPROVE"]
+            integrity = [
+                r
+                for r in reviews
+                if isinstance(r, dict)
+                and (r.get("review_category") or r.get("category"))
+                == "test-integrity"
+                and r.get("verdict") == "APPROVE"
+            ]
             if not integrity:
                 errors.append("test deletion/skip/threshold/assertion change lacks separate test-integrity review")
 
