@@ -1151,6 +1151,8 @@ def _validate_evidence(
             else:
                 binding_input = {
                     "contract": "ReviewArtifactBindingInput/v1",
+                    "base": record.get("base"),
+                    "head": record.get("head"),
                     "workspace_base_sha256": record.get("workspace_base_sha256"),
                     "workspace_head_sha256": record.get("workspace_head_sha256"),
                     "diff_hash": record.get("diff_hash"),
