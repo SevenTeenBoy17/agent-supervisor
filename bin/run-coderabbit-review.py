@@ -2089,6 +2089,21 @@ def materialize_workspace_delta(
         and re.fullmatch(object_id_pattern, bound_head)
     ):
         raise ReviewArtifactError("review-workspace-git-binding-invalid")
+    for label, revision in (("base", base_head), ("head", bound_head)):
+        resolved = _project_git_bytes(
+            root,
+            ["rev-parse", "--verify", f"{revision}^{{commit}}"],
+            f"review-workspace-{label}-commit-invalid",
+        ).decode("ascii", errors="ignore").strip().casefold()
+        if resolved != revision:
+            raise ReviewArtifactError(
+                f"review-workspace-{label}-commit-invalid"
+            )
+    _project_git_bytes(
+        root,
+        ["merge-base", "--is-ancestor", base_head, bound_head],
+        "review-workspace-base-not-ancestor",
+    )
     if current_head != bound_head:
         raise ReviewArtifactError("review-workspace-head-binding-mismatch")
     indexed = _indexed_project_paths(root)

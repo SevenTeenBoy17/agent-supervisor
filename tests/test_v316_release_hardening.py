@@ -1162,7 +1162,18 @@ def test_coderabbit_review_uses_bound_base_for_committed_delta(
     assert materialized[0]["before"] == before
     assert materialized[0]["after"] == after
 
+    tree = _git(source, "rev-parse", f"{baseline_head}^{{tree}}").stdout.strip()
+    binding["base"] = tree
+    with pytest.raises(runner.ReviewArtifactError, match="base-commit-invalid"):
+        runner.materialize_workspace_delta(source, binding)
+
+    unrelated = _git(source, "commit-tree", tree, "-m", "unrelated").stdout.strip()
+    binding["base"] = unrelated
+    with pytest.raises(runner.ReviewArtifactError, match="base-not-ancestor"):
+        runner.materialize_workspace_delta(source, binding)
+
     binding["head"] = baseline_head
+    binding["base"] = baseline_head
     with pytest.raises(runner.ReviewArtifactError, match="head-binding-mismatch"):
         runner.materialize_workspace_delta(source, binding)
 
