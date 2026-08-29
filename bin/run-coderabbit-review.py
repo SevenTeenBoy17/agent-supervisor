@@ -2074,7 +2074,17 @@ def materialize_workspace_delta(
         raise ReviewArtifactError("review-workspace-delta-empty")
     if len(delta) > MAX_REVIEW_FILES:
         raise ReviewArtifactError("review-workspace-file-count-limit")
-    head = _project_repository_head(root)
+    current_head = _project_repository_head(root)
+    base_head = str(binding.get("base") or "").strip().casefold()
+    bound_head = str(binding.get("head") or "").strip().casefold()
+    object_id_pattern = r"[0-9a-f]{40}|[0-9a-f]{64}"
+    if not (
+        re.fullmatch(object_id_pattern, base_head)
+        and re.fullmatch(object_id_pattern, bound_head)
+    ):
+        raise ReviewArtifactError("review-workspace-git-binding-invalid")
+    if current_head != bound_head:
+        raise ReviewArtifactError("review-workspace-head-binding-mismatch")
     indexed = _indexed_project_paths(root)
     seen_casefolded: set[str] = set()
     materialized: list[dict[str, Any]] = []
@@ -2098,7 +2108,7 @@ def materialize_workspace_delta(
         if before_hash == after_hash:
             raise ReviewArtifactError("review-workspace-delta-unchanged")
 
-        before = _base_blob(root, head, path)
+        before = _base_blob(root, base_head, path)
         if before_hash is None:
             if before is not None:
                 raise ReviewArtifactError("review-workspace-before-presence-mismatch")
@@ -2140,7 +2150,7 @@ def materialize_workspace_delta(
             "before_sha256": before_hash,
             "after_sha256": after_hash,
         })
-    if _project_repository_head(root) != head:
+    if _project_repository_head(root) != current_head:
         raise ReviewArtifactError("review-workspace-head-changed")
     return materialized
 

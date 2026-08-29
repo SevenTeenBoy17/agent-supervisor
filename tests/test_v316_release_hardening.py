@@ -974,6 +974,7 @@ def test_coderabbit_review_reconstructs_exact_workspace_add_modify_delete_delta(
         path.write_bytes(content)
     _git(source, "add", "-A")
     _git(source, "commit", "-qm", "baseline")
+    baseline_head = _git(source, "rev-parse", "HEAD").stdout.strip()
 
     current = {
         "tests/test_guard.py": b"def test_guard():\n    assert 1 == 1\n",
@@ -1007,6 +1008,8 @@ def test_coderabbit_review_reconstructs_exact_workspace_add_modify_delete_delta(
     }
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": baseline_head,
+        "head": baseline_head,
         "workspace_base_sha256": "a" * 64,
         "workspace_head_sha256": "b" * 64,
         "diff_hash": runner._canonical_sha256(delta),
@@ -1089,6 +1092,7 @@ def test_coderabbit_review_fails_closed_when_bound_before_bytes_do_not_match_hea
     target.write_bytes(b"def test_guard():\n    assert True\n")
     _git(source, "add", "-A")
     _git(source, "commit", "-qm", "baseline")
+    baseline_head = _git(source, "rev-parse", "HEAD").stdout.strip()
     target.write_bytes(b"def test_guard():\n    assert 1 == 1\n")
     _git(source, "add", "-A")
     delta = {
@@ -1099,6 +1103,8 @@ def test_coderabbit_review_fails_closed_when_bound_before_bytes_do_not_match_hea
     }
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": baseline_head,
+        "head": baseline_head,
         "workspace_base_sha256": "a" * 64,
         "workspace_head_sha256": "b" * 64,
         "diff_hash": runner._canonical_sha256(delta),
@@ -1108,6 +1114,56 @@ def test_coderabbit_review_fails_closed_when_bound_before_bytes_do_not_match_hea
     monkeypatch.setattr(runner, "_git_environment", _review_git_environment)
 
     with pytest.raises(runner.ReviewArtifactError, match="before-hash-mismatch"):
+        runner.materialize_workspace_delta(source, binding)
+
+
+def test_coderabbit_review_uses_bound_base_for_committed_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_review_runner()
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "config", "user.email", "review-test@example.invalid")
+    _git(source, "config", "user.name", "Review Test")
+    target = source / "bin" / "installer.py"
+    target.parent.mkdir()
+    before = b"HOOK_TIMEOUT = 30\n"
+    after = b"HOOK_TIMEOUT = 45\n"
+    target.write_bytes(before)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "baseline")
+    baseline_head = _git(source, "rev-parse", "HEAD").stdout.strip()
+    target.write_bytes(after)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "hotfix")
+    current_head = _git(source, "rev-parse", "HEAD").stdout.strip()
+    delta = {
+        "bin/installer.py": {
+            "before": hashlib.sha256(before).hexdigest(),
+            "after": hashlib.sha256(after).hexdigest(),
+        }
+    }
+    binding = {
+        "contract": "ReviewArtifactBindingInput/v1",
+        "base": baseline_head,
+        "head": current_head,
+        "workspace_base_sha256": "a" * 64,
+        "workspace_head_sha256": "b" * 64,
+        "diff_hash": runner._canonical_sha256(delta),
+        "workspace_delta_manifest": delta,
+    }
+    monkeypatch.setattr(runner, "_resolved_command", lambda command: command)
+    monkeypatch.setattr(runner, "_git_environment", _review_git_environment)
+
+    materialized = runner.materialize_workspace_delta(source, binding)
+
+    assert materialized[0]["before"] == before
+    assert materialized[0]["after"] == after
+
+    binding["head"] = baseline_head
+    with pytest.raises(runner.ReviewArtifactError, match="head-binding-mismatch"):
         runner.materialize_workspace_delta(source, binding)
 
 

@@ -55,6 +55,9 @@ All notable release changes are documented here.
   interpreter identity, process startup, the event-specific core deadline, and bounded
   cleanup. This prevents Codex from terminating healthy cross-project hooks before
   they can return their structured result or final `RoundProcessSummary/v1`.
+- Immutable CodeRabbit review materialization now reads `before` bytes from the bound
+  baseline commit when reviewing an already committed delta, while separately binding
+  the live workspace to the expected reviewed HEAD.
 - The core-owned default registered-gate timeout now matches the existing
   30-minute hard ceiling, allowing the full cross-platform source suite to finish
   without accepting caller-selected timeout overrides.
