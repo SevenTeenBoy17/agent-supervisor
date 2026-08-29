@@ -5257,8 +5257,12 @@ def _stop_response_with_round_summary(
     submitted_summary = (
         last_message[marker_index:].strip() if marker_index >= 0 else ""
     )
-    normalized_summary = unicodedata.normalize("NFC", summary_text)
-    normalized_submitted_summary = unicodedata.normalize("NFC", submitted_summary)
+    normalized_summary = unicodedata.normalize(
+        "NFC", summary_text.replace("\r\n", "\n").replace("\r", "\n")
+    )
+    normalized_submitted_summary = unicodedata.normalize(
+        "NFC", submitted_summary.replace("\r\n", "\n").replace("\r", "\n")
+    )
     accepted_hashes = {sha256_text(normalized_summary)}
     summary_missing = (
         not normalized_submitted_summary

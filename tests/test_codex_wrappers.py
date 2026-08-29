@@ -29,7 +29,7 @@ from supervisor_core.workspace import capture_workspace_snapshot, workspace_delt
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_ADAPTER_TEST_ENV = "AGENT_SUPERVISOR_TEST_INSTALLED_ADAPTERS"
-NATIVE_HOOK_TEST_TIMEOUT_SECONDS = 45
+NATIVE_HOOK_TEST_TIMEOUT_SECONDS = 70
 
 
 def _trusted_python_path() -> Path:
@@ -1142,7 +1142,7 @@ def test_codex_adapters_ignore_environment_core_and_profile_trust_overrides(
         input=payload,
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=NATIVE_HOOK_TEST_TIMEOUT_SECONDS,
     )
     assert native.returncode == 0
     assert json.loads(native.stdout.decode("utf-8")) == {}
@@ -1217,8 +1217,11 @@ def _run_native_hook(
 
 def test_native_hook_harness_timeout_exceeds_maximum_outer_deadline() -> None:
     hook = runpy.run_path(str(ROOT / "integrations" / "codex" / "scripts" / "codex-supervisor-hook.py"))
+    assert hook["_hook_timeout"]("SessionStart") == 40.0
+    assert hook["_hook_timeout"]("PreToolUse") == 40.0
+    assert hook["_hook_timeout"]("SessionEnd") == 25.0
     required = (
-        hook["_outer_hook_timeout"]("Stop")
+        max(hook["_outer_hook_timeout"](event) for event in hook["OFFICIAL_EVENTS"])
         + hook["OUTER_PROCESS_TREE_CLEANUP_SECONDS"]
         + hook["MARKER_LOCK_RETRY_SECONDS"]
     )
@@ -2203,8 +2206,9 @@ def test_ci_hardens_posix_powershell_before_executing_repository_code() -> None:
     assert "not stat.S_ISREG(executable_info.st_mode)" in body
     assert "def validate_missing_link_target(" in body
     assert "def validate_ci_link(" in body
+    assert "def trusted_directory_entry(" in body
     assert "os.path.lexists(current)" in body
-    assert "current.resolve(strict=True) != current" in body
+    assert "resolved.relative_to(anchor).parts" in body
     assert "broken CI PowerShell link contains parent traversal" in body
     assert body.count("$powerShellTrustProbe | & $sourcePython -") == 2
 
@@ -2256,9 +2260,33 @@ def test_ci_powershell_broken_link_validator_rejects_future_activation_paths(
         required_uid=required_uid,
     ) is None
 
+    canonical_lib = trusted_lib
+    standard_lib_alias = anchor / "lib64"
+    standard_lib_alias.symlink_to(Path("usr") / "lib64", target_is_directory=True)
+    standard_alias_broken = root / "standard-alias-broken"
+    standard_alias_broken.symlink_to(standard_lib_alias / "missing.so")
+    assert validate(
+        standard_alias_broken,
+        root,
+        trusted_anchor=anchor,
+        required_uid=required_uid,
+    ) is None
+
     writable = anchor / "world"
     writable.mkdir()
     writable.chmod(0o777)
+    writable_alias = anchor / "writable-alias"
+    writable_alias.symlink_to(writable, target_is_directory=True)
+    unsafe_alias_broken = root / "unsafe-alias-broken"
+    unsafe_alias_broken.symlink_to(writable_alias / "missing.so")
+    with pytest.raises(SystemExit, match="untrusted directory"):
+        validate(
+            unsafe_alias_broken,
+            root,
+            trusted_anchor=anchor,
+            required_uid=required_uid,
+        )
+
     bridge = writable / "bridge"
     bridge.symlink_to(trusted_lib, target_is_directory=True)
     writable_parent = root / "writable-parent"

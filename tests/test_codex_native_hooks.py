@@ -773,6 +773,17 @@ def test_codex_stop_requires_summary_once_even_when_round_is_complete(
     assert ctx.load()["stop_summary_sha256"] == first_hash
     assert ctx.load()["stop_summary_text"] == rendered_summary
 
+    finalized = ctx.load()
+    for line_ending in ("\r\n", "\r"):
+        output = cli_module._stop_response_with_round_summary(
+            finalized,
+            ctx.events(),
+            {
+                "last_assistant_message": rendered_summary.replace("\n", line_ending),
+            },
+        )
+        assert output == {}
+
     composed_summary = rendered_summary + "\nCaf\u00e9"
     ctx.update(
         lambda state: state.update(

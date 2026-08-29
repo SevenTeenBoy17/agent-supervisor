@@ -35,6 +35,10 @@ IDENTITY_FIELDS = {
     "manifest_sha256",
     "source_tree_sha256",
 }
+WINDOWS_ONLY = pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows native adapter security contract",
+)
 
 
 def _hook_module() -> dict[str, object]:
@@ -105,6 +109,7 @@ def _get_stage_zero_root(bridge: Path, pointer: Path, payload: dict[str, object]
     return Path(completed.stdout.decode("utf-8").strip())
 
 
+@WINDOWS_ONLY
 def test_powershell_selection_ignores_systemroot_windir_and_path_poison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -126,6 +131,7 @@ def test_powershell_selection_ignores_systemroot_windir_and_path_poison(
         assert locked[1].read(2) == b"MZ"
 
 
+@WINDOWS_ONLY
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -294,6 +300,7 @@ def test_frozen_stage_zero_windows_job_failure_exits_125_before_frame(
     assert calls == []
 
 
+@WINDOWS_ONLY
 def test_timeout_terminates_complete_process_tree_without_late_state_write(
     tmp_path: Path,
 ) -> None:
@@ -365,6 +372,7 @@ def _write_python_registry(home: Path, executable: Path, digest: str) -> None:
     )
 
 
+@WINDOWS_ONLY
 def test_registry_python_rejects_py_launcher_and_digest_drift(
     tmp_path: Path,
 ) -> None:
@@ -399,6 +407,7 @@ def test_core_rejects_launcher_reparse_and_rechecks_locked_command_digest() -> N
     assert "Python command identity changed before process creation" in source
 
 
+@WINDOWS_ONLY
 @pytest.mark.parametrize(
     "failure_stage",
     ["create", "configure", "assign", "resume"],

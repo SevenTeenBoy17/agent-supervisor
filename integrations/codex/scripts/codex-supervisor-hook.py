@@ -1302,14 +1302,19 @@ def _read_bounded_stdin(stream: Any, *, maximum: int = MAX_STDIN_BYTES) -> bytes
 
 
 def _hook_timeout(event: str) -> float:
-    defaults = {"SessionEnd": 2.0, "Stop": 25.0, "UserPromptSubmit": 20.0}
+    defaults = {
+        "SessionEnd": 25.0,
+        "SessionStart": 40.0,
+        "Stop": 25.0,
+        "UserPromptSubmit": 40.0,
+    }
     raw = os.environ.get("AGENT_SUPERVISOR_HOOK_TIMEOUT")
     try:
-        value = float(raw) if raw is not None else defaults.get(event, 10.0)
+        value = float(raw) if raw is not None else defaults.get(event, 40.0)
     except ValueError:
-        value = defaults.get(event, 10.0)
+        value = defaults.get(event, 40.0)
     if not math.isfinite(value):
-        value = defaults.get(event, 10.0)
+        value = defaults.get(event, 40.0)
     return min(max(value, 0.01), 120.0)
 
 

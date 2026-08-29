@@ -21,6 +21,7 @@ class LockTimeout(RuntimeError):
 
 
 _LOCK_HOST = socket.gethostname().casefold()
+_ROUND_TRANSACTION_LOCK_TIMEOUT_SECONDS = 120.0
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 
@@ -616,7 +617,15 @@ class StateContext:
         orphan event, but never a state mutation with no corresponding record.
         """
         self.initialize()
-        with exclusive_lock(self.root / ".round.lock", timeout=30.0):
+        # A transaction remains small, but Windows hosted runners can take
+        # longer than 30 seconds to service the tail of a 100-process burst.
+        # Keep waiting for the serialized transaction instead of degrading a
+        # healthy round under load; the lock's owner identity still protects
+        # against abandoned locks.
+        with exclusive_lock(
+            self.root / ".round.lock",
+            timeout=_ROUND_TRANSACTION_LOCK_TIMEOUT_SECONDS,
+        ):
             with exclusive_lock(self.root / ".state.lock"):
                 with exclusive_lock(self.root / ".events.lock"):
                     state = json_load(self.state_file, {})

@@ -139,12 +139,12 @@ source and a fresh-session probe reaches the adapter.
 
 The Claude files are installed at `~/.claude/skills/supervisor/`. The settings
 configurator preserves unrelated settings and replaces only exact Supervisor-owned hook
-entries. Run it explicitly, inspect its before/after hashes, and restart Claude Code:
-
-The configurator intentionally refuses a missing or invalid settings file. Start Claude
+entries. The configurator intentionally refuses a missing or invalid settings file. Start Claude
 Code once so it creates `~/.claude/settings.json`. If Claude has never been started, you
 may instead create that file with exactly `{}` after confirming it does not already
 exist; never overwrite existing settings.
+
+Run the configurator explicitly, inspect its before/after hashes, and restart Claude Code:
 
 ```powershell
 python "$HOME/.claude/skills/supervisor/scripts/configure-v3-hooks.py"

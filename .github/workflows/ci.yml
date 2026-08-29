@@ -64,6 +64,31 @@ jobs:
               ):
                   raise SystemExit("CI trust path contains an untrusted directory")
 
+          def trusted_directory_entry(path, *, anchor, required_uid):
+              info = path.lstat()
+              if not stat.S_ISLNK(info.st_mode):
+                  trusted_real_directory(path, required_uid)
+                  return path
+              if info.st_uid != required_uid:
+                  raise SystemExit("CI trust path link is not owned by the required user")
+              raw_target = Path(os.readlink(path))
+              if ".." in raw_target.parts:
+                  raise SystemExit("CI trust path link contains parent traversal")
+              try:
+                  resolved = path.resolve(strict=True)
+              except (FileNotFoundError, RuntimeError):
+                  raise SystemExit(
+                      "CI trust path contains an untrusted directory alias that is not stable"
+                  ) from None
+              if not resolved.is_relative_to(anchor):
+                  raise SystemExit("CI trust path link escapes its trust anchor")
+              trusted_real_directory(anchor, required_uid)
+              current = anchor
+              for component in resolved.relative_to(anchor).parts:
+                  current /= component
+                  trusted_real_directory(current, required_uid)
+              return resolved
+
           def validate_missing_link_target(
               candidate,
               *,
@@ -91,9 +116,11 @@ jobs:
                   current /= component
                   if not os.path.lexists(current):
                       return
-                  trusted_real_directory(current, required_uid)
-                  if current.resolve(strict=True) != current:
-                      raise SystemExit("broken CI PowerShell link has a redirected parent")
+                  trusted_directory_entry(
+                      current,
+                      anchor=anchor,
+                      required_uid=required_uid,
+                  )
               if os.path.lexists(target):
                   raise SystemExit("broken CI PowerShell link has a dangling target object")
 
