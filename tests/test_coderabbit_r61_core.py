@@ -70,6 +70,8 @@ def _binding_and_output(
     delta = {"config.json": {"before": "1" * 64, "after": "2" * 64}}
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "3" * 64,
         "workspace_head_sha256": "4" * 64,
         "diff_hash": canonical_sha256(delta),

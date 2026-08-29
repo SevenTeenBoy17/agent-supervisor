@@ -208,6 +208,8 @@ def test_review_gate_raw_streams_are_transient_and_never_persisted(
     ctx.save(state)
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "b" * 64,
         "workspace_head_sha256": "c" * 64,
         "diff_hash": "d" * 64,

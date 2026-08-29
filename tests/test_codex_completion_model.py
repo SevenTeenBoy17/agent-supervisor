@@ -193,6 +193,8 @@ def _review_binding_and_output(category: str = "independent") -> tuple[dict, dic
     manifest = {"config.json": {"before": "3" * 64, "after": "4" * 64}}
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "5" * 64,
         "workspace_head_sha256": "6" * 64,
         "diff_hash": canonical_sha256(manifest),

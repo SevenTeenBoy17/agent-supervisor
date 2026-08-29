@@ -559,9 +559,11 @@ def test_review_gate_receives_ephemeral_core_observed_binding_file(tmp_path, mon
     state = ctx.load()
     binding = cli_module._review_binding_input(state)
     assert set(binding) == {
-        "contract", "workspace_base_sha256", "workspace_head_sha256",
+        "contract", "base", "head", "workspace_base_sha256", "workspace_head_sha256",
         "diff_hash", "workspace_delta_manifest",
     }
+    assert binding["base"] == delta["base"]
+    assert binding["head"] == delta["head"]
     assert binding["workspace_delta_manifest"] == delta["manifest"]
     output = _review_output_artifact(
         tmp_path, binding, suffix="gate-integration"
@@ -646,6 +648,8 @@ def test_review_gate_output_rejects_missing_malformed_tampered_and_mismatched_ar
     }
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "a" * 64,
         "workspace_head_sha256": "b" * 64,
         "diff_hash": canonical_sha256(delta_manifest),
@@ -719,6 +723,8 @@ def test_review_artifact_git_argv_isolated_from_leading_dash_bundle(
     }
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "a" * 64,
         "workspace_head_sha256": "b" * 64,
         "diff_hash": canonical_sha256(delta_manifest),
@@ -785,6 +791,8 @@ def test_full_snapshot_artifact_rejects_duplicate_manifest_and_bad_base(tmp_path
     }
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "d" * 64,
         "workspace_head_sha256": "e" * 64,
         "diff_hash": canonical_sha256(delta_manifest),
@@ -854,6 +862,8 @@ def test_immutable_full_git_bundle_and_manifest_is_a_valid_alternate_binding(tmp
     diff_hash = canonical_sha256(delta_manifest)
     binding_input = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
         "workspace_base_sha256": "a" * 64,
         "workspace_head_sha256": "b" * 64,
         "diff_hash": diff_hash,

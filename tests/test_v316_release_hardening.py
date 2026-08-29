@@ -1167,6 +1167,34 @@ def test_coderabbit_review_uses_bound_base_for_committed_delta(
         runner.materialize_workspace_delta(source, binding)
 
 
+def test_coderabbit_review_binding_requires_git_base_and_head(tmp_path: Path) -> None:
+    runner = _load_review_runner()
+    delta = {
+        "bin/installer.py": {
+            "before": "a" * 64,
+            "after": "b" * 64,
+        }
+    }
+    binding = {
+        "contract": "ReviewArtifactBindingInput/v1",
+        "base": "1" * 40,
+        "head": "2" * 40,
+        "workspace_base_sha256": "c" * 64,
+        "workspace_head_sha256": "d" * 64,
+        "diff_hash": runner._canonical_sha256(delta),
+        "workspace_delta_manifest": delta,
+    }
+    binding_file = tmp_path / "review-binding.json"
+    binding_file.write_text(json.dumps(binding), encoding="utf-8")
+
+    assert runner.load_review_binding(binding_file) == binding
+
+    del binding["base"]
+    binding_file.write_text(json.dumps(binding), encoding="utf-8")
+    with pytest.raises(runner.ReviewArtifactError, match="contract-invalid"):
+        runner.load_review_binding(binding_file)
+
+
 def test_review_source_descriptor_identity_rejects_same_size_open_redirection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

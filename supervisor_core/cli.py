@@ -1686,6 +1686,8 @@ def _review_binding_input(
         raise InvalidState("review gate binding input failed core verification")
     binding = {
         "contract": "ReviewArtifactBindingInput/v1",
+        "base": observed.get("base"),
+        "head": observed.get("head"),
         "workspace_base_sha256": observed.get("workspace_base_sha256"),
         "workspace_head_sha256": observed.get("workspace_head_sha256"),
         "diff_hash": observed.get("diff_hash"),

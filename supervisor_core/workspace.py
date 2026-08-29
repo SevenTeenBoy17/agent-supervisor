@@ -1092,6 +1092,8 @@ def validate_review_output_artifact(
     binding_fields = set(binding_input) if isinstance(binding_input, dict) else set()
     base_binding_fields = {
         "contract",
+        "base",
+        "head",
         "workspace_base_sha256",
         "workspace_head_sha256",
         "diff_hash",
@@ -1104,6 +1106,12 @@ def validate_review_output_artifact(
         return False, "review-output-binding-input-invalid", None
     if binding_input.get("contract") != "ReviewArtifactBindingInput/v1":
         return False, "review-output-binding-input-contract-invalid", None
+    if any(
+        not isinstance(binding_input.get(field), str)
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", binding_input[field])
+        for field in ("base", "head")
+    ):
+        return False, "review-output-binding-git-identity-invalid", None
     for field in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
         if output.get(field) != binding_input.get(field):
             return False, f"review-output-{field}-mismatch", None

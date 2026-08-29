@@ -1802,6 +1802,8 @@ def review_revision_binding(repo: Path, baseline: str) -> tuple[str, str]:
 
 _BINDING_KEYS = {
     "contract",
+    "base",
+    "head",
     "workspace_base_sha256",
     "workspace_head_sha256",
     "diff_hash",
@@ -1904,6 +1906,10 @@ def load_review_binding(path_value: str | os.PathLike[str] | None) -> dict[str, 
     for key in ("workspace_base_sha256", "workspace_head_sha256", "diff_hash"):
         if not isinstance(binding.get(key), str) or not _SHA256.fullmatch(binding[key]):
             raise ReviewArtifactError("review-binding-hash-invalid")
+    for key in ("base", "head"):
+        value = binding.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
+            raise ReviewArtifactError("review-binding-git-identity-invalid")
     for key in (
         "supervisor_source_snapshot_sha256",
         "review_core_manifest_sha256",
