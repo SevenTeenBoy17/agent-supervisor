@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -41,6 +42,32 @@ _MAX_ADAPTER_FILE_BYTES = 4 * 1024 * 1024
 _MAX_ADAPTER_FILES = 128
 _MAX_ADAPTER_TOTAL_BYTES = 32 * 1024 * 1024
 _ADAPTER_SUFFIXES = {".json", ".md", ".ps1", ".py"}
+_CODEX_HOOK_DESCRIPTION = (
+    "Agent Supervisor v3 lifecycle hooks. Review and trust changes with /hooks. "
+    "Local tool hooks are guardrails; hosted WebSearch is outside their coverage. "
+    "SessionEnd uses the official 3-second maximum."
+)
+_AGENTS_BLOCK_START = "<!-- agent-supervisor:managed:start -->"
+_AGENTS_BLOCK_END = "<!-- agent-supervisor:managed:end -->"
+_GLOBAL_AGENTS_BLOCK = f"""{_AGENTS_BLOCK_START}
+# Agent Supervisor — global Codex activation
+
+For every task with an available workspace, apply the installed `dev-supervisor`
+skill before task work and run its bootstrap with the newest request, current
+`CODEX_THREAD_ID`, and the correct `continue`, `extend`, or `replace` mode.
+
+Before every final answer, run Supervisor finalization. The answer must end with the
+exact rendered `RoundProcessSummary/v1` supplied by Supervisor, including its visual
+timeline of Skill, Agent, Plugin/App, and native-command facts, their task
+contributions, Evidence IDs, quality gates, redundancy counts, and true terminal
+state. If a Stop hook supplies the report, reproduce it verbatim. Missing or degraded
+evidence must remain `MISSING`/`incomplete`; never omit the report or invent success.
+
+Codex user hooks in `~/.codex/hooks.json` apply across projects after they are reviewed
+with `/hooks`. Project rules and the current user request remain authoritative for
+product scope.
+{_AGENTS_BLOCK_END}
+"""
 
 
 class InstallError(ValueError):
@@ -52,6 +79,246 @@ class _FrozenAdapter(NamedTuple):
     destination: Path
     content: bytes
     sha256: str
+
+
+def _safe_command_path(path: Path, *, label: str) -> Path:
+    value = _lexical_absolute(path)
+    rendered = str(value)
+    if not value.is_absolute() or any(
+        char in rendered for char in ('"', "%", "\r", "\n", "\x00")
+    ):
+        raise InstallError(f"{label} path is unsafe")
+    return value
+
+
+def _codex_hook_handler(
+    event: str,
+    *,
+    timeout: int,
+    status: str,
+    install_home: Path,
+    interpreter: Path,
+) -> dict[str, Any]:
+    python_path = _safe_command_path(interpreter, label="Python interpreter")
+    adapter = _safe_command_path(
+        install_home
+        / ".codex"
+        / "skills"
+        / "dev-supervisor"
+        / "scripts"
+        / "codex-supervisor-hook.py",
+        label="Codex adapter",
+    )
+    return {
+        "type": "command",
+        "command": f"{shlex.quote(str(python_path))} {shlex.quote(str(adapter))} --event {event}",
+        "commandWindows": f'"{python_path}" "{adapter}" --event {event}',
+        "timeout": timeout,
+        "statusMessage": status,
+        "async": False,
+    }
+
+
+def _codex_managed_hooks(
+    install_home: Path,
+    interpreter: Path,
+) -> dict[str, list[dict[str, Any]]]:
+    definitions = {
+        "SessionStart": ("startup|resume|clear|compact", 15, "Starting Supervisor"),
+        "UserPromptSubmit": (None, 30, "Aligning goal"),
+        "PreToolUse": ("*", 15, "Checking tool policy"),
+        "PermissionRequest": ("*", 15, "Checking permission"),
+        "PostToolUse": ("*", 15, "Recording tool result"),
+        "PreCompact": ("manual|auto", 15, "Preserving context"),
+        "PostCompact": ("manual|auto", 15, "Restoring context"),
+        "SubagentStart": ("*", 15, "Registering subagent"),
+        "SubagentStop": ("*", 20, "Reviewing subagent"),
+        "Stop": (None, 30, "Running quality gate"),
+        "SessionEnd": ("*", 3, "Closing Supervisor"),
+    }
+    result: dict[str, list[dict[str, Any]]] = {}
+    for event, (matcher, timeout, status) in definitions.items():
+        group: dict[str, Any] = {
+            "hooks": [
+                _codex_hook_handler(
+                    event,
+                    timeout=timeout,
+                    status=status,
+                    install_home=install_home,
+                    interpreter=interpreter,
+                )
+            ]
+        }
+        if matcher is not None:
+            group["matcher"] = matcher
+        result[event] = [group]
+    return result
+
+
+def _legacy_codex_hook_handler(event: str) -> dict[str, str]:
+    return {
+        "command": (
+            'python3 "$HOME/.codex/skills/dev-supervisor/scripts/'
+            f'codex-supervisor-hook.py" --event {event}'
+        ),
+        "commandWindows": (
+            'py -3 "%USERPROFILE%\\.codex\\skills\\dev-supervisor\\scripts\\'
+            f'codex-supervisor-hook.py" --event {event}'
+        ),
+    }
+
+
+def _is_managed_codex_handler(
+    value: Any,
+    *,
+    event: str,
+    expected: dict[str, Any],
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    legacy = _legacy_codex_hook_handler(event)
+    commands_match_expected = (
+        value.get("command") == expected["command"]
+        and value.get("commandWindows") == expected["commandWindows"]
+    )
+    if commands_match_expected:
+        return value.get("type") == "command"
+    if value.get("type") == "command":
+        try:
+            candidate_posix = shlex.split(str(value.get("command") or ""), posix=True)
+            expected_posix = shlex.split(str(expected.get("command") or ""), posix=True)
+        except ValueError:
+            candidate_posix = []
+            expected_posix = []
+        windows_shape = re.compile(
+            r'^"(?P<python>[^"\r\n]+)" "(?P<adapter>[^"\r\n]+)" '
+            r'--event (?P<event>[A-Za-z]+)$'
+        )
+        candidate_windows = windows_shape.fullmatch(
+            str(value.get("commandWindows") or "")
+        )
+        expected_windows = windows_shape.fullmatch(
+            str(expected.get("commandWindows") or "")
+        )
+        if (
+            len(candidate_posix) == 4
+            and len(expected_posix) == 4
+            and candidate_posix[2] == expected_posix[2] == "--event"
+            and candidate_posix[1:] == expected_posix[1:]
+            and Path(candidate_posix[0]).is_absolute()
+            and candidate_windows is not None
+            and expected_windows is not None
+            and candidate_windows.group("adapter")
+            == expected_windows.group("adapter")
+            and candidate_windows.group("event") == expected_windows.group("event")
+            and Path(candidate_windows.group("python")).is_absolute()
+        ):
+            return True
+    commands_match_legacy = (
+        value.get("command") == legacy["command"]
+        and value.get("commandWindows") == legacy["commandWindows"]
+    )
+    return commands_match_legacy and value.get("type") in {None, "command"}
+
+
+def _merge_codex_hooks(
+    existing: bytes | None,
+    *,
+    install_home: Path,
+    interpreter: Path,
+) -> bytes:
+    if existing is None:
+        current: dict[str, Any] = {}
+    else:
+        try:
+            current = json.loads(
+                existing.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InstallError("existing Codex hooks.json is not valid UTF-8 JSON") from exc
+        if not isinstance(current, dict):
+            raise InstallError("existing Codex hooks.json must be an object")
+    merged = json.loads(json.dumps(current, ensure_ascii=False))
+    hooks = merged.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise InstallError("existing Codex hooks.json hooks field must be an object")
+    for event, managed_groups in _codex_managed_hooks(install_home, interpreter).items():
+        expected_handler = managed_groups[0]["hooks"][0]
+        existing_groups = hooks.get(event, [])
+        if not isinstance(existing_groups, list):
+            raise InstallError(f"existing Codex hook event {event} must be a list")
+        retained: list[dict[str, Any]] = []
+        for raw_group in existing_groups:
+            if not isinstance(raw_group, dict):
+                raise InstallError(f"existing Codex hook group {event} must be an object")
+            group = json.loads(json.dumps(raw_group, ensure_ascii=False))
+            if "hooks" not in group:
+                retained.append(group)
+                continue
+            handlers = group["hooks"]
+            if not isinstance(handlers, list):
+                raise InstallError(f"existing Codex hook handlers {event} must be a list")
+            group["hooks"] = [
+                handler
+                for handler in handlers
+                if not _is_managed_codex_handler(
+                    handler,
+                    event=event,
+                    expected=expected_handler,
+                )
+            ]
+            if group["hooks"]:
+                retained.append(group)
+        hooks[event] = retained + managed_groups
+    merged.setdefault("description", _CODEX_HOOK_DESCRIPTION)
+    if existing is not None and merged == current:
+        return existing
+    return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+
+
+def _merge_global_agents(existing: bytes | None) -> bytes:
+    if existing is None:
+        return _GLOBAL_AGENTS_BLOCK.encode("utf-8")
+    try:
+        text = existing.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InstallError("existing Codex AGENTS.md is not valid UTF-8") from exc
+    start_count = text.count(_AGENTS_BLOCK_START)
+    end_count = text.count(_AGENTS_BLOCK_END)
+    start = text.find(_AGENTS_BLOCK_START)
+    end = text.find(_AGENTS_BLOCK_END)
+    if (
+        start_count > 1
+        or end_count > 1
+        or (start < 0) != (end < 0)
+        or (start >= 0 and end < start)
+    ):
+        raise InstallError("existing Codex AGENTS.md has an incomplete managed block")
+    if start >= 0:
+        end += len(_AGENTS_BLOCK_END)
+        merged = text[:start] + _GLOBAL_AGENTS_BLOCK.rstrip("\n") + text[end:]
+    elif text.strip():
+        merged = _GLOBAL_AGENTS_BLOCK.rstrip("\n") + "\n\n" + text.lstrip("\n")
+    else:
+        merged = _GLOBAL_AGENTS_BLOCK
+    if not merged.endswith("\n"):
+        merged += "\n"
+    return merged.encode("utf-8")
+
+
+def _optional_profile_file(path: Path, *, label: str) -> bytes | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    candidate = _lexical_absolute(path)
+    _reject_existing_indirection(candidate, label=label)
+    try:
+        details = candidate.lstat()
+    except OSError as exc:
+        raise InstallError(f"{label} is unavailable") from exc
+    if stat.S_ISREG(details.st_mode) and details.st_size == 0:
+        return None
+    return _stable_bytes(path, maximum=_MAX_CONTROL_BYTES, label=label)
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -106,7 +373,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _stable_bytes(path: Path, *, maximum: int, label: str) -> bytes:
+def _stable_bytes(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+    allow_empty: bool = False,
+) -> bytes:
     candidate = _lexical_absolute(path)
     _reject_existing_indirection(candidate, label=label)
     descriptor = -1
@@ -115,7 +388,7 @@ def _stable_bytes(path: Path, *, maximum: int, label: str) -> bytes:
         if (
             _stat_is_link_or_reparse(path_before)
             or not stat.S_ISREG(path_before.st_mode)
-            or path_before.st_size < 1
+            or path_before.st_size < (0 if allow_empty else 1)
             or path_before.st_size > maximum
         ):
             raise InstallError(f"{label} size is invalid")
@@ -190,13 +463,24 @@ def _private_directory(path: Path) -> None:
         pass
 
 
-def _atomic_write(path: Path, content: bytes) -> None:
-    _private_directory(path.parent)
+def _atomic_write(
+    path: Path,
+    content: bytes,
+    *,
+    preserve_parent_permissions: bool = False,
+) -> None:
+    existing_mode: int | None = None
+    if preserve_parent_permissions:
+        _reject_existing_indirection(path.parent.parent, label="output parent")
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        _private_directory(path.parent)
     _reject_existing_indirection(path.parent, label="output parent")
     if path.exists() or path.is_symlink():
         _reject_existing_indirection(path, label="output path")
         if not path.is_file():
             raise InstallError("output path is not a regular file")
+        existing_mode = stat.S_IMODE(path.lstat().st_mode)
     descriptor, temporary = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -211,6 +495,8 @@ def _atomic_write(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        if preserve_parent_permissions and existing_mode is not None:
+            Path(temporary).chmod(existing_mode)
         _reject_existing_indirection(path.parent, label="output parent")
         os.replace(temporary, path)
     except BaseException:
@@ -358,6 +644,80 @@ def _bundle_member_bytes(
     return content
 
 
+def _materialize_release_members(
+    release_root: Path,
+    inspected: dict[str, Any],
+) -> int:
+    """Materialize the already-verified immutable runtime before pointer publish."""
+    members = inspected.get("members") if isinstance(inspected, dict) else None
+    if not isinstance(members, dict) or not members:
+        raise InstallError("runtime bundle members are unavailable")
+    release_absolute = _lexical_absolute(release_root)
+    written = 0
+    folded: set[str] = set()
+    targets: list[tuple[Path, bytes]] = []
+    for raw_name, content in sorted(members.items()):
+        if not isinstance(raw_name, str) or not isinstance(content, bytes) or not content:
+            raise InstallError("runtime bundle member is invalid")
+        relative = PurePosixPath(raw_name)
+        if (
+            relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in raw_name
+            or "\x00" in raw_name
+            or any(":" in part for part in relative.parts)
+        ):
+            raise InstallError("runtime bundle member path is invalid")
+        folded_name = relative.as_posix().casefold()
+        if folded_name in folded:
+            raise InstallError("runtime bundle member path is duplicated")
+        folded.add(folded_name)
+        target = _lexical_absolute(release_root.joinpath(*relative.parts))
+        if not target.is_relative_to(release_absolute):
+            raise InstallError("runtime bundle member path is invalid")
+        targets.append((target, content))
+        if target.exists() or target.is_symlink():
+            observed = _stable_bytes(
+                target,
+                maximum=max(len(content), 1),
+                label="installed release member",
+            )
+            if observed != content:
+                raise InstallError(
+                    "release version already exists with different member bytes"
+                )
+            continue
+        _atomic_write(target, content)
+        written += 1
+
+    for target, content in targets:
+        observed = _stable_bytes(
+            target,
+            maximum=max(len(content), 1),
+            label="materialized release member",
+        )
+        if observed != content:
+            raise InstallError("materialized release member verification failed")
+    return written
+
+
+def _materialize_release_identity(
+    identity: dict[str, Any],
+    install_home: Path,
+) -> int:
+    bundle_path = _identity_bundle(identity, install_home)
+    bundle = _stable_bytes(
+        bundle_path,
+        maximum=128 * 1024 * 1024,
+        label="rollback release bundle",
+    )
+    try:
+        inspected = inspect_runtime_bundle(bundle, expected_identity=identity)
+    except RuntimeBundleError as exc:
+        raise InstallError("rollback release bundle is invalid") from exc
+    return _materialize_release_members(Path(str(identity["path"])), inspected)
+
+
 def _adapter_files_from_bundle(
     source_root: Path,
     inspected: dict[str, Any],
@@ -435,6 +795,7 @@ def _backup_if_changed(
         target,
         maximum=max(_MAX_ADAPTER_FILE_BYTES, _MAX_CONTROL_BYTES),
         label="installed file",
+        allow_empty=True,
     )
     if current == replacement:
         return False
@@ -449,6 +810,7 @@ def install_release(
     install_home: Path,
     apply: bool,
     install_adapters: bool = True,
+    activate_codex: bool = True,
 ) -> dict[str, Any]:
     source = _lexical_absolute(source_root)
     home = _lexical_absolute(install_home)
@@ -492,6 +854,20 @@ def install_release(
         maximum=_MAX_ADAPTER_FILE_BYTES,
         label="stage-zero launcher",
     )
+    codex_activation = bool(install_adapters and activate_codex)
+    codex_hooks_path = home / ".codex" / "hooks.json"
+    codex_agents_path = home / ".codex" / "AGENTS.md"
+    merged_codex_hooks = None
+    merged_codex_agents = None
+    if codex_activation:
+        merged_codex_hooks = _merge_codex_hooks(
+            _optional_profile_file(codex_hooks_path, label="existing Codex hooks"),
+            install_home=home,
+            interpreter=Path(sys.executable),
+        )
+        merged_codex_agents = _merge_global_agents(
+            _optional_profile_file(codex_agents_path, label="existing Codex AGENTS")
+        )
 
     previous = None
     if existing_pointer is not None:
@@ -516,6 +892,9 @@ def install_release(
         "release_root": str(release_root),
         "bundle_sha256": identity["bundle_sha256"],
         "adapter_file_count": len(adapters),
+        "codex_global_activation": codex_activation,
+        "codex_hooks": str(codex_hooks_path) if codex_activation else None,
+        "codex_agents": str(codex_agents_path) if codex_activation else None,
         "pointer": str(pointer_path),
     }
     if not apply:
@@ -544,7 +923,19 @@ def install_release(
         maximum=128 * 1024 * 1024,
         label="installed release bundle",
     )
-    inspect_runtime_bundle(installed_bundle, expected_identity=identity)
+    installed_inspected = inspect_runtime_bundle(
+        installed_bundle,
+        expected_identity=identity,
+    )
+    plan["release_members_written"] = _materialize_release_members(
+        release_root,
+        installed_inspected,
+    )
+    plan["rollback_members_written"] = (
+        _materialize_release_identity(previous, home)
+        if isinstance(previous, dict)
+        else 0
+    )
 
     backup_name = (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -573,6 +964,24 @@ def install_release(
         ):
             _atomic_write(target, adapter.content)
 
+    if codex_activation:
+        assert merged_codex_hooks is not None and merged_codex_agents is not None
+        for target, replacement in (
+            (codex_hooks_path, merged_codex_hooks),
+            (codex_agents_path, merged_codex_agents),
+        ):
+            if _backup_if_changed(
+                target,
+                replacement,
+                install_home=home,
+                backup_root=backup_root,
+            ):
+                _atomic_write(
+                    target,
+                    replacement,
+                    preserve_parent_permissions=True,
+                )
+
     if pointer_path.exists() or pointer_path.is_symlink():
         pointer_bytes = _stable_bytes(
             pointer_path,
@@ -600,6 +1009,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--install-home", type=Path, default=Path.home())
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--core-only", action="store_true")
+    parser.add_argument(
+        "--no-codex-global-activation",
+        action="store_true",
+        help="install adapters without merging user-level Codex hooks and AGENTS.md",
+    )
     args = parser.parse_args(argv)
     try:
         result = install_release(
@@ -607,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
             install_home=args.install_home,
             apply=args.apply,
             install_adapters=not args.core_only,
+            activate_codex=not args.no_codex_global_activation,
         )
     except (InstallError, RuntimeBundleError, OSError, ValueError) as exc:
         print(

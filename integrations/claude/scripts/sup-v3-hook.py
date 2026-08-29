@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-ADAPTER_VERSION = "3.1.6"
+ADAPTER_VERSION = "3.1.12"
 POINTER_CONTRACT = "ActiveVersionPointer/v4"
 IDENTITY_CONTRACT = "SupervisorReleaseIdentity/v1"
 MANIFEST_CONTRACT = "SupervisorRuntimeManifest/v1"
@@ -74,6 +74,7 @@ EVENT_ALIASES = {
 SAFE_FILE_NOT_FOUND_REASONS = frozenset(
     {
         "active_pointer_rejected",
+        "adapter_layout_rejected",
         "core_dependency_missing",
         "core_rejected",
         "core_missing",
@@ -89,23 +90,12 @@ def _safe_file_not_found_reason(exc: FileNotFoundError) -> str:
     token = exc.args[0] if exc.args else ""
     return token if isinstance(token, str) and token in SAFE_FILE_NOT_FOUND_REASONS else "core_missing"
 
-
-def _home() -> Path:
-    # Path.home() does not consistently honor a synthetic USERPROFILE in every
-    # Windows Python build, while Claude and the harness both define it.
-    raw = os.environ.get("USERPROFILE") or os.environ.get("HOME")
-    return Path(raw).expanduser() if raw else Path.home()
-
-
 def _lexical_absolute(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
-def _is_reparse(path: Path) -> bool:
-    try:
-        info = path.lstat()
-    except OSError:
-        return False
+def _stat_is_reparse(path: Path, info: os.stat_result) -> bool:
+    del path
     return bool(
         stat.S_ISLNK(info.st_mode)
         or (
@@ -116,6 +106,14 @@ def _is_reparse(path: Path) -> bool:
             )
         )
     )
+
+
+def _is_reparse(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return _stat_is_reparse(path, info)
 
 
 def _path_has_reparse(path: Path) -> bool:
@@ -143,6 +141,97 @@ def _canonical_existing(path: Path, *, directory: bool) -> Path | None:
     if os.path.normcase(str(resolved)) != os.path.normcase(str(lexical)):
         return None
     return resolved
+
+
+def _adapter_install_home() -> Path:
+    """Derive the production trust anchor from this canonical adapter path."""
+    lexical_script = _lexical_absolute(Path(__file__))
+    scripts_root = lexical_script.parent
+    adapter_root = scripts_root.parent
+    skills_root = adapter_root.parent
+    claude_root = skills_root.parent
+    expected = (
+        (scripts_root, "scripts"),
+        (adapter_root, "supervisor"),
+        (skills_root, "skills"),
+        (claude_root, ".claude"),
+    )
+    if all(path.name.casefold() == name.casefold() for path, name in expected):
+        managed = (
+            (claude_root, True),
+            (skills_root, True),
+            (adapter_root, True),
+            (scripts_root, True),
+            (lexical_script, False),
+        )
+
+        def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_size,
+                value.st_mtime_ns,
+            )
+
+        try:
+            resolved_before = lexical_script.resolve(strict=True)
+            before = []
+            for path, directory in managed:
+                details = path.lstat()
+                is_reparse = _stat_is_reparse(path, details)
+                if (
+                    is_reparse
+                    or (directory and not stat.S_ISDIR(details.st_mode))
+                    or (not directory and not stat.S_ISREG(details.st_mode))
+                ):
+                    raise FileNotFoundError("adapter_layout_rejected")
+                before.append(identity(details))
+            resolved_after = lexical_script.resolve(strict=True)
+            after = [identity(path.lstat()) for path, _ in managed]
+        except OSError as exc:
+            raise FileNotFoundError("adapter_layout_rejected") from exc
+        if (
+            os.path.normcase(str(resolved_before))
+            != os.path.normcase(str(resolved_after))
+            or before != after
+        ):
+            raise FileNotFoundError("adapter_layout_rejected")
+
+        script = resolved_before
+        canonical_scripts_root = script.parent
+        canonical_adapter_root = canonical_scripts_root.parent
+        canonical_skills_root = canonical_adapter_root.parent
+        canonical_claude_root = canonical_skills_root.parent
+        canonical_install_home = canonical_claude_root.parent
+        canonical_expected = (
+            (canonical_scripts_root, "scripts"),
+            (canonical_adapter_root, "supervisor"),
+            (canonical_skills_root, "skills"),
+            (canonical_claude_root, ".claude"),
+        )
+        if (
+            script.name != "sup-v3-hook.py"
+            or not all(
+                path.name.casefold() == name.casefold()
+                for path, name in canonical_expected
+            )
+            or not canonical_install_home.is_dir()
+        ):
+            raise FileNotFoundError("adapter_layout_rejected")
+        return canonical_install_home
+
+    # Source-tree execution is supported only for the explicit test harness.
+    # Production adapters installed under ~/.claude never consult ambient home
+    # or release-root variables.
+    if os.environ.get("AGENT_SUPERVISOR_TEST_MODE") == "1":
+        raw = os.environ.get("AGENT_SUPERVISOR_TEST_INSTALL_HOME")
+        raw = raw or os.environ.get("USERPROFILE") or os.environ.get("HOME")
+        if raw:
+            candidate = _lexical_absolute(Path(raw))
+            if candidate.is_absolute():
+                return candidate
+    raise FileNotFoundError("adapter_layout_rejected")
 
 
 def _contained_path(path: Path, root: Path) -> bool:
@@ -782,19 +871,9 @@ def _inspect_runtime_bundle(
 
 
 def _active_pointer_location() -> tuple[Path, list[Path]]:
-    default = _lexical_absolute(_home() / ".agent-supervisor")
-    pointer = Path(
-        os.environ.get("AGENT_SUPERVISOR_ACTIVE_POINTER", str(default / "active-version.json"))
-    ).expanduser()
-    if not pointer.is_absolute():
-        raise _BootstrapError("active-pointer-path-invalid")
+    default = _lexical_absolute(_installation_home() / ".agent-supervisor")
+    pointer = default / "active-version.json"
     allowed_roots = [default, default.parent / ".agent-supervisor-releases"]
-    configured_release = os.environ.get("AGENT_SUPERVISOR_RELEASE_ROOT")
-    if configured_release:
-        release = Path(configured_release).expanduser()
-        if not release.is_absolute():
-            raise _BootstrapError("configured-release-root-invalid")
-        allowed_roots.append(release)
     return pointer, allowed_roots
 
 
@@ -895,12 +974,14 @@ def _core_root(*, require_active_pointer: bool = False) -> Path:
 def _installation_home() -> Path:
     """Return the real profile containing the installed .claude tree."""
     try:
-        for parent in Path(__file__).resolve().parents:
-            if parent.name.casefold() == ".claude":
-                return parent.parent
-    except (OSError, RuntimeError):
-        pass
-    return _home()
+        return _adapter_install_home()
+    except FileNotFoundError as exc:
+        reason = (
+            exc.args[0]
+            if exc.args and exc.args[0] == "adapter_layout_rejected"
+            else "adapter_layout_rejected"
+        )
+        raise FileNotFoundError(reason) from exc
 
 
 def _hook_timeout() -> float:
@@ -934,38 +1015,43 @@ def _session_id(payload: dict[str, Any]) -> str:
 
 
 def _fallback_paths(session_id: str) -> tuple[Path, Path]:
-    root = _home() / ".agent-supervisor" / "fallback" / "claude"
+    root = _installation_home() / ".agent-supervisor" / "fallback" / "claude"
     return root / (datetime.now(timezone.utc).strftime("%Y-%m-%d") + ".jsonl"), root / "markers" / (_sha(session_id) + ".json")
 
 
 def _prepare_fallback_storage() -> None:
-    root = _home() / ".agent-supervisor"
+    root = _installation_home() / ".agent-supervisor"
     for directory in (root, root / "fallback", root / "fallback" / "claude", root / "fallback" / "claude" / "markers"):
         _ensure_private_directory(directory)
 
 
 def _has_degraded_marker(session_id: str) -> bool:
-    marker = _fallback_paths(session_id)[1]
     try:
+        marker = _fallback_paths(session_id)[1]
         info = marker.lstat()
     except OSError:
         return False
     return stat.S_ISREG(info.st_mode) and not _is_reparse(marker)
 
 
-def _degraded_session_lock(session_id: str) -> Path:
+def _degraded_session_lock(session_id: str, *, marker_path: Path | None = None) -> Path:
     """Return the single lock that serializes marker writes and clears."""
-    return _fallback_paths(session_id)[1].with_suffix(".lock")
+    marker = marker_path if marker_path is not None else _fallback_paths(session_id)[1]
+    return marker.with_suffix(".lock")
 
 
 def _clear_degraded_marker(session_id: str) -> None:
     """Clear only the retry marker after the core has durably received it."""
-    lock = _degraded_session_lock(session_id)
+    try:
+        marker = _fallback_paths(session_id)[1]
+        lock = _degraded_session_lock(session_id, marker_path=marker)
+    except OSError:
+        return
     fd = _acquire_lock(lock)
     if fd is None:
         return
     try:
-        _fallback_paths(session_id)[1].unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
     except OSError:
         # Failure to clear is itself safe: the next core call remains degraded.
         pass
@@ -1137,10 +1223,10 @@ def _prune_retention(directory: Path, pattern: str, keep: int, cutoff: float) ->
 def _record_degraded(event: str, payload: dict[str, Any], reason: str) -> None:
     """Persist metadata only: never prompt text, command arguments, or tool output."""
     session_id = _session_id(payload)
-    log_path, marker_path = _fallback_paths(session_id)
     try:
+        log_path, marker_path = _fallback_paths(session_id)
         _prepare_fallback_storage()
-    except OSError:
+    except (FileNotFoundError, OSError):
         return
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1176,7 +1262,7 @@ def _record_degraded(event: str, payload: dict[str, Any], reason: str) -> None:
         "first_seen": record["ts"],
         "reason_category": reason,
     }
-    session_lock = _degraded_session_lock(session_id)
+    session_lock = _degraded_session_lock(session_id, marker_path=marker_path)
     session_fd = _acquire_lock(session_lock)
     if session_fd is None:
         _atomic_create_marker_if_absent(marker_path, marker_record)
@@ -1784,6 +1870,7 @@ def _run_frozen_runtime(
     event: str,
     forwarded: dict[str, Any],
 ) -> tuple[int, bytes]:
+    install_home = _installation_home()
     payload_bytes = json.dumps(
         forwarded,
         ensure_ascii=False,
@@ -1813,8 +1900,8 @@ def _run_frozen_runtime(
     env["AGENT_SUPERVISOR_DEPENDENCY_ROOTS"] = os.pathsep.join(
         str(path) for path in _verified_dependency_roots()
     )
-    env["AGENT_SUPERVISOR_INSTALL_HOME"] = str(_installation_home())
-    state_root = _home() / ".agent-supervisor" / "state"
+    env["AGENT_SUPERVISOR_INSTALL_HOME"] = str(install_home)
+    state_root = install_home / ".agent-supervisor" / "state"
     proc = subprocess.run(
         [
             sys.executable,
@@ -1829,7 +1916,7 @@ def _run_frozen_runtime(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
-        cwd=str(_installation_home()),
+        cwd=str(install_home),
         timeout=_hook_timeout(),
         check=False,
     )

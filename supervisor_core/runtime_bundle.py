@@ -232,6 +232,7 @@ def _runtime_paths(root: Path) -> list[PurePosixPath]:
             "LICENSE",
             "NOTICE",
             ".gitignore",
+            ".github/workflows/ci.yml",
             "README.md",
             "pyproject.toml",
             "bin/agent-supervisor.py",

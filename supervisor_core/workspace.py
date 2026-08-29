@@ -30,6 +30,10 @@ from .util import (
 
 
 _GIT_TIMEOUT_SECONDS = 15
+_SUPPORTED_GIT_FILE_MODES = frozenset({"100644", "100755", "120000"})
+_GIT_BATCH_TIMEOUT_MAX_SECONDS = 300
+_GIT_BATCH_BYTES_PER_SECOND_FLOOR = 2 * 1024 * 1024
+_GIT_BATCH_OBJECTS_PER_SECOND_FLOOR = 256
 _MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
 _MAX_WORKSPACE_FILES = 10_000
 _MAX_WORKSPACE_FILE_BYTES = 64 * 1024 * 1024
@@ -59,6 +63,31 @@ _GIT_REDIRECT_ENVIRONMENT = frozenset(
         "GIT_WORK_TREE",
     }
 )
+
+
+def _git_batch_timeout_seconds(request_count: int) -> int:
+    """Return a bounded timeout for the maximum accepted batch workload.
+
+    Object sizes are not known until ``cat-file --batch`` starts producing its
+    response.  Scale against the largest byte budget the requested object count
+    is allowed to consume, plus a small per-object allowance, instead of applying
+    the single-command timeout to an entire potentially 512 MiB batch.
+    """
+    bounded_count = max(1, min(int(request_count), _MAX_WORKSPACE_FILES))
+    byte_budget = min(
+        _MAX_WORKSPACE_TOTAL_BYTES,
+        bounded_count * _MAX_WORKSPACE_FILE_BYTES,
+    )
+    byte_seconds = (
+        byte_budget + _GIT_BATCH_BYTES_PER_SECOND_FLOOR - 1
+    ) // _GIT_BATCH_BYTES_PER_SECOND_FLOOR
+    object_seconds = (
+        bounded_count + _GIT_BATCH_OBJECTS_PER_SECOND_FLOOR - 1
+    ) // _GIT_BATCH_OBJECTS_PER_SECOND_FLOOR
+    return min(
+        _GIT_BATCH_TIMEOUT_MAX_SECONDS,
+        _GIT_TIMEOUT_SECONDS + byte_seconds + object_seconds,
+    )
 _RAW_WORKSPACE_PATH_PREFIX = "@agent-supervisor-raw-path-v1:"
 _ESCAPED_WORKSPACE_PATH_PREFIX = "@agent-supervisor-utf8-path-v1:"
 _REVIEW_OUTPUT_ARTIFACT_FIELDS = {
@@ -485,6 +514,170 @@ def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.CompletedProcess(command, 127, b"", b"agent-supervisor:git-unavailable")
 
 
+def _git_batch_blob_sha256(
+    workspace: Path,
+    requests: list[tuple[str, str]],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Hash a bounded tree through one ``git cat-file --batch`` process."""
+    if not requests:
+        return {}, None
+    if len(requests) > _MAX_WORKSPACE_FILES:
+        return None, "git-batch-request-limit"
+    try:
+        request_bytes = b"".join(
+            object_id.encode("ascii") + b"\n" for _, object_id in requests
+        )
+    except UnicodeError:
+        return None, "git-batch-object-id-invalid"
+    if len(request_bytes) > _MAX_GIT_OUTPUT_BYTES:
+        return None, "git-batch-request-limit"
+    executable = _resolve_git_executable(workspace)
+    if executable is None:
+        return None, "git-unavailable"
+    command = [str(executable), "-C", str(workspace), "cat-file", "--batch"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            env=_sanitized_git_environment(),
+            bufsize=0,
+        )
+    except OSError:
+        return None, "git-unavailable"
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        try:
+            process.kill()
+            process.wait()
+        except OSError:
+            pass
+        return None, "git-batch-pipes-unavailable"
+
+    observed: dict[str, str] = {}
+    failure: list[str] = []
+    total_bytes = [0]
+
+    def fail(reason: str) -> None:
+        if not failure:
+            failure.append(reason)
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    def parse_stdout() -> None:
+        try:
+            for relative_path, expected_oid in requests:
+                header = process.stdout.readline(256)
+                if not header.endswith(b"\n"):
+                    fail("git-batch-header-invalid")
+                    return
+                parts = header[:-1].split()
+                if len(parts) != 3:
+                    fail("git-batch-header-invalid")
+                    return
+                try:
+                    observed_oid = parts[0].decode("ascii")
+                    object_type = parts[1].decode("ascii")
+                    size = int(parts[2].decode("ascii"))
+                except (UnicodeError, ValueError):
+                    fail("git-batch-header-invalid")
+                    return
+                if (
+                    observed_oid != expected_oid
+                    or object_type != "blob"
+                    or size < 0
+                    or size > _MAX_GIT_OUTPUT_BYTES
+                    or total_bytes[0] + size > _MAX_WORKSPACE_TOTAL_BYTES
+                ):
+                    fail("git-batch-object-invalid")
+                    return
+                digest = hashlib.sha256()
+                remaining = size
+                while remaining:
+                    chunk = process.stdout.read(
+                        min(_WORKSPACE_HASH_CHUNK_BYTES, remaining)
+                    )
+                    if not chunk:
+                        fail("git-batch-object-truncated")
+                        return
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if process.stdout.read(1) != b"\n":
+                    fail("git-batch-delimiter-invalid")
+                    return
+                total_bytes[0] += size
+                observed[relative_path] = digest.hexdigest()
+            if process.stdout.read(1):
+                fail("git-batch-extra-output")
+        except OSError:
+            fail("git-batch-read-failed")
+        finally:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+    def drain_stderr() -> None:
+        observed_bytes = 0
+        try:
+            while True:
+                chunk = process.stderr.read(64 * 1024)
+                if not chunk:
+                    return
+                observed_bytes += len(chunk)
+                if observed_bytes > _MAX_GIT_OUTPUT_BYTES:
+                    fail("git-batch-stderr-limit")
+                    return
+        except OSError:
+            fail("git-batch-stderr-failed")
+        finally:
+            try:
+                process.stderr.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=parse_stdout, daemon=True),
+        threading.Thread(target=drain_stderr, daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        pending = memoryview(request_bytes)
+        while pending:
+            written = process.stdin.write(pending)
+            if (
+                not isinstance(written, int)
+                or written <= 0
+                or written > len(pending)
+            ):
+                raise OSError("git batch request short write")
+            pending = pending[written:]
+    except (OSError, ValueError):
+        fail("git-batch-write-failed")
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            fail("git-batch-write-failed")
+    try:
+        returncode = process.wait(timeout=_git_batch_timeout_seconds(len(requests)))
+    except subprocess.TimeoutExpired:
+        fail("git-timeout")
+        process.wait()
+        returncode = 124
+    for reader in readers:
+        reader.join(timeout=2)
+    if any(reader.is_alive() for reader in readers):
+        fail("git-batch-reader-timeout")
+    if returncode != 0 or failure or len(observed) != len(requests):
+        return None, failure[0] if failure else "git-batch-command-failed"
+    return observed, None
+
+
 def _git_runtime_failure(result: subprocess.CompletedProcess[bytes]) -> str | None:
     if result.returncode == 124 and b"agent-supervisor:git-timeout" in (result.stderr or b""):
         return "git-timeout"
@@ -787,32 +980,77 @@ def validate_review_artifact(
         )
         if not valid:
             return False, reason, None
+        expected_base_tree = dict(source_manifest)
+        for relative_path, delta in delta_manifest.items():
+            after_sha256 = delta.get("after")
+            if after_sha256 is None:
+                if relative_path in source_manifest:
+                    return False, "review-artifact-delta-head-mismatch", None
+            elif source_manifest.get(relative_path) != after_sha256:
+                return False, "review-artifact-delta-head-mismatch", None
+            before_sha256 = delta.get("before")
+            if before_sha256 is None:
+                expected_base_tree.pop(relative_path, None)
+            else:
+                expected_base_tree[relative_path] = before_sha256
         base_tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", str(base))
-        if base_tree.returncode != 0 or base_tree.stdout:
-            return False, "review-artifact-base-tree-not-empty", None
+        if base_tree.returncode != 0:
+            return False, "review-artifact-base-tree-unavailable", None
+        base_requests: list[tuple[str, str]] = []
+        base_paths: set[str] = set()
+        for entry in base_tree.stdout.split(b"\0"):
+            if not entry:
+                continue
+            try:
+                metadata, raw_path = entry.split(b"\t", 1)
+                mode, object_type, object_id = metadata.decode("ascii").split()
+                relative_path = raw_path.decode("utf-8")
+            except (UnicodeError, ValueError):
+                return False, "review-artifact-base-tree-invalid", None
+            if (
+                mode not in _SUPPORTED_GIT_FILE_MODES
+                or object_type != "blob"
+                or not _git_oid_shape(object_id, fmt)
+                or relative_path in base_paths
+            ):
+                return False, "review-artifact-base-tree-mode-invalid", None
+            base_paths.add(relative_path)
+            base_requests.append((relative_path, object_id))
+        observed_base_tree, base_batch_error = _git_batch_blob_sha256(
+            repo, base_requests
+        )
+        if base_batch_error or observed_base_tree is None:
+            return False, "review-artifact-base-tree-blob-unavailable", None
+        if observed_base_tree != expected_base_tree:
+            return False, "review-artifact-base-tree-manifest-mismatch", None
         head_tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", str(head))
         if head_tree.returncode != 0:
             return False, "review-artifact-head-tree-unavailable", None
-        observed_tree: dict[str, str] = {}
+        head_requests: list[tuple[str, str]] = []
+        head_paths: set[str] = set()
         for entry in head_tree.stdout.split(b"\0"):
             if not entry:
                 continue
             try:
                 metadata, raw_path = entry.split(b"\t", 1)
-                mode, object_type, _ = metadata.decode("ascii").split()
+                mode, object_type, object_id = metadata.decode("ascii").split()
                 relative_path = raw_path.decode("utf-8")
             except (UnicodeError, ValueError):
                 return False, "review-artifact-head-tree-invalid", None
             if (
-                mode != "100644"
+                mode not in _SUPPORTED_GIT_FILE_MODES
                 or object_type != "blob"
-                or relative_path in observed_tree
+                or not _git_oid_shape(object_id, fmt)
+                or relative_path in head_paths
             ):
                 return False, "review-artifact-head-tree-mode-invalid", None
-            blob = _git(repo, "cat-file", "blob", f"{head}:{relative_path}")
-            if blob.returncode != 0:
-                return False, "review-artifact-head-tree-blob-unavailable", None
-            observed_tree[relative_path] = sha256_bytes(blob.stdout)
+            head_paths.add(relative_path)
+            head_requests.append((relative_path, object_id))
+        observed_tree, head_batch_error = _git_batch_blob_sha256(
+            repo, head_requests
+        )
+        if head_batch_error or observed_tree is None:
+            return False, "review-artifact-head-tree-blob-unavailable", None
         if observed_tree != source_manifest:
             return False, "review-artifact-head-tree-manifest-mismatch", None
         rendered = _git(

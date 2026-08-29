@@ -46,9 +46,7 @@ LOG_DIR = SUP_HOME / "logs"
 STATE_DIR = SUP_HOME / "state"
 CONTEXTS_DIR = STATE_DIR / "contexts"   # v4: per-project context files
 TRANSCRIPTS_DIR = SUP_HOME / "transcripts"
-PROMPT_ARCHIVE_ENABLED = os.environ.get(
-    "SUPERVISOR_LEGACY_PERSIST_PROMPTS", ""
-).strip().casefold() in {"1", "true", "yes"}
+PROMPT_ARCHIVE_ENABLED = False
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -729,7 +727,7 @@ def emit_lite_banner(turn_no: int) -> None:
 
 # -------------------------------------------------------------------- events ---
 
-# ---------------------------------------------------- v7: 提示词全文存档 ----
+# -------------------------------------- legacy prompt helpers (persistence disabled) ----
 MAX_PROMPT_CHARS = 20000      # 单条上限，防病态巨型输入把文件撑爆
 
 
@@ -786,69 +784,9 @@ def _fence_for(body: str) -> str:
 
 
 def append_transcript(prompt: str, cwd: str, turn: int, dev: bool) -> str:
-    """Optionally append a redacted prompt archive after explicit user opt-in.
-
-    Prompt content is never persisted by default. The legacy archive remains
-    available only through ``SUPERVISOR_LEGACY_PERSIST_PROMPTS=1`` for users who
-    knowingly accept that local retention tradeoff.
-    """
-    if not STORAGE_READY or not PROMPT_ARCHIVE_ENABLED:
-        return ""
-    try:
-        key = project_key(cwd) if cwd else "unknown"
-        d = _confined_direct_child(TRANSCRIPTS_DIR, key)
-        if d is None:
-            return ""
-        _ensure_private_directory(d)
-        # Recheck after mkdir so an existing link cannot redirect the write.
-        d = _confined_direct_child(TRANSCRIPTS_DIR, key)
-        if d is None or not d.is_dir():
-            return ""
-        f = _confined_direct_child(d, datetime.now().strftime("%Y-%m") + ".md")
-        if f is None:
-            return ""
-        head = ("# 提示词全文存档 · " + key + chr(10) + chr(10)
-                + "> 已明确启用 legacy prompt archive；内容会先做凭据抹除。" + chr(10)
-                + "> 只增不改；需要检索用 `sup-query.py`。" + chr(10) + chr(10))
-        try:
-            with _private_text_open(
-                f,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                "w",
-            ) as fh:
-                fh.write(head)
-        except FileExistsError:
-            pass
-        # Redact the complete prompt first. Truncating first can split a credential at
-        # the boundary so neither half matches a secret pattern and the prefix leaks.
-        cleaned_prompt, redacted = redact_secrets(prompt)
-        truncated = len(prompt) > MAX_PROMPT_CHARS or len(cleaned_prompt) > MAX_PROMPT_CHARS
-        if truncated:
-            visible = cleaned_prompt[:MAX_PROMPT_CHARS]
-            # Do not leave a partial redaction placeholder at the size boundary.
-            open_marker = visible.rfind("[[已抹除:")
-            if open_marker >= 0 and visible.find("]]", open_marker) < 0:
-                visible = visible[:open_marker]
-            body = (visible + chr(10) + "…（超长，已截断，原长 "
-                    + str(len(prompt)) + " 字）")
-        else:
-            body = cleaned_prompt
-        fence = _fence_for(body)
-        head_line = ("## 第 " + str(turn) + " 轮 · "
-                     + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                     + " · " + ("研发轮" if dev else "非研发轮")
-                     + ((" · 已抹除 " + str(redacted) + " 处疑似凭据") if redacted else ""))
-        block = (head_line + chr(10) + chr(10)
-                 + fence + "text" + chr(10) + body + chr(10) + fence + chr(10) + chr(10))
-        with _private_text_open(
-            f,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            "a",
-        ) as fh:
-            fh.write(block)
-        return str(f)
-    except Exception:
-        return ""
+    """Retain the legacy call shape while refusing all prompt-content persistence."""
+    del prompt, cwd, turn, dev
+    return ""
 
 
 def plan_block(prompt: str) -> str:

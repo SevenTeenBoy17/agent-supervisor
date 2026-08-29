@@ -1,4 +1,4 @@
-# Agent Supervisor v3.1.6
+# Agent Supervisor v3.1.12
 
 Runtime-neutral goal and quality supervision for Claude Code and Codex. The shared core owns contracts, isolated state, evidence validation, capability discovery/routing, lifecycle finalization, and migration. Host integrations are deliberately thin adapters.
 
@@ -11,8 +11,11 @@ state, and credentials out of the repository and external review inputs.
 ```powershell
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 Set-Location agent-supervisor
-git checkout v3.1.6
+git checkout v3.1.12
 python -m pip install .
+python bin/install-agent-supervisor.py --no-codex-global-activation
+python bin/install-agent-supervisor.py --no-codex-global-activation --apply
+# Configure executable trust as documented in docs/INSTALL.md, then activate:
 python bin/install-agent-supervisor.py
 python bin/install-agent-supervisor.py --apply
 python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
@@ -23,19 +26,26 @@ On Linux or macOS, use the equivalent shell commands:
 ```bash
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 cd agent-supervisor
-git checkout v3.1.6
+git checkout v3.1.12
 python3 -m pip install .
+python3 bin/install-agent-supervisor.py --no-codex-global-activation
+python3 bin/install-agent-supervisor.py --no-codex-global-activation --apply
+# Configure executable trust as documented in docs/INSTALL.md, then activate:
 python3 bin/install-agent-supervisor.py
 python3 bin/install-agent-supervisor.py --apply
 python3 "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
 ```
 
 The package install supplies the declared PyYAML and jsonschema runtime dependencies.
-The first Supervisor installer call is a read-only plan. `--apply` builds and verifies a
-deterministic runtime bundle, installs the core and thin adapters, backs up changed
-managed files, and publishes the v4 active pointer last. It never edits Codex
-`AGENTS.md`/hooks, Claude settings, or the machine-local executable trust registry.
-Complete those explicit activation steps in [the installation guide](docs/INSTALL.md).
+The first pass installs the verified core and thin adapters while deliberately deferring
+global Codex activation. Configure the machine-local executable trust registry, then run
+the normal plan and `--apply`; that final pass backs up changed managed files, merges the
+user-level Codex `hooks.json` and a marked `AGENTS.md` block, and publishes the v4 active
+pointer last. Existing unrelated hooks and instructions are preserved. Review the hooks
+once with `/hooks`, then start a fresh task; the user-level hook layer applies across
+projects. Keep `--no-codex-global-activation` on the final pass to opt out. The installer
+never changes Claude settings or the executable trust registry itself.
+See [the installation guide](docs/INSTALL.md) for trust and verification steps.
 The published wheel installs the shared Python core only; use the tagged source tree or
 runtime ZIP installer when you also need Codex and Claude adapters.
 

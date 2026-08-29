@@ -549,7 +549,7 @@ def test_recursive_delete_is_detected_after_a_command_boundary(newline: str) -> 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(None, 1200), (True, 1200), ("invalid", 1200), (-99, 1), (0, 1), (7, 7), (999999, 1800)],
+    [(None, 1800), (True, 1800), ("invalid", 1800), (-99, 1), (0, 1), (7, 7), (999999, 1800)],
 )
 def test_gate_timeout_is_parsed_and_clamped(raw, expected: int) -> None:
     assert _gate_timeout_seconds(raw) == expected

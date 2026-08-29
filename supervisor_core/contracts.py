@@ -1452,17 +1452,27 @@ def render_round_process_summary(summary: dict[str, Any] | None) -> str:
     lines = [
         "# RoundProcessSummary/v1",
         "",
-        f"本轮：{started}–{ended}｜{goal_id} v{version}｜{change_mode}｜终态 {terminal}",
-        f"意图：{intent_line}",
+        f"🧭 本轮：{started}–{ended}｜{goal_id} v{version}｜{change_mode}｜终态 {terminal}",
+        f"🎯 意图：{intent_line}",
     ]
+    status_icons = {
+        "success": "✅",
+        "failed": "❌",
+        "fallback": "⚠",
+        "refused": "⛔",
+        "cancelled": "◻",
+        "methodology-only": "📐",
+        "not-invoked": "➖",
+    }
     for item in _fold_timeline_for_view([row for row in timeline if isinstance(row, dict)]):
         at = _hhmm(item.get("at"))
         kind = _KIND_LABELS.get(str(item.get("kind") or ""), str(item.get("kind") or "Skill"))
         canonical = sanitize_process_summary_text(item.get("canonical_id") or "", limit=48)
         status = sanitize_process_summary_text(_display_status(item, quality), limit=24)
+        status_icon = status_icons.get(status, "•")
         contribution = sanitize_process_summary_text(item.get("contribution") or "", limit=_CONTRIBUTION_MAX)
         evidence = ",".join(_string_list(item.get("evidence_ids"))[:4]) or "-"
-        lines.append(f"{at} {kind}｜{canonical}｜{status}｜{contribution}｜{evidence}")
+        lines.append(f"{status_icon} {at} {kind}｜{canonical}｜{status}｜{contribution}｜{evidence}")
     gate_parts = []
     for gate in _list(quality.get("gates")):
         if isinstance(gate, dict) and gate.get("id"):
@@ -1472,10 +1482,10 @@ def render_round_process_summary(summary: dict[str, Any] | None) -> str:
     gate_text = "；".join(gate_parts) if gate_parts else "无登记门"
     redundancy = quality.get("redundancy") if isinstance(quality.get("redundancy"), dict) else {}
     lines.append(
-        f"质量：{gate_text}；独立 reviewer {verdict}；未解决 P0/P1={len(unresolved)}"
+        f"🛡️ 质量：{gate_text}；独立 reviewer {verdict}；未解决 P0/P1={len(unresolved)}"
     )
     lines.append(
-        "冗余：拒绝重复 "
+        "♻️ 冗余：拒绝重复 "
         f"{int(redundancy.get('refused_redundant') or 0)}；"
         "已覆盖跳过 "
         f"{int(redundancy.get('already_covered_skipped') or 0)}；"
@@ -1483,13 +1493,13 @@ def render_round_process_summary(summary: dict[str, Any] | None) -> str:
         f"{int(redundancy.get('degraded_fallbacks') or 0)}"
     )
     if terminal == "complete":
-        conclusion = "结论：已满足完成条件"
+        conclusion = "✅ 结论：已满足完成条件"
     elif terminal == "user-waived":
-        conclusion = "结论：用户豁免未闭环项；终态 user-waived；未把豁免写成 complete"
+        conclusion = "⚠️ 结论：用户豁免未闭环项；终态 user-waived；未把豁免写成 complete"
     elif terminal == "blocked":
-        conclusion = "结论：已阻断；未宣称 complete"
+        conclusion = "⛔ 结论：已阻断；未宣称 complete"
     else:
-        conclusion = "结论：未满足完成条件，未宣称 complete"
+        conclusion = "❌ 结论：未满足完成条件，未宣称 complete"
         if unresolved:
             conclusion += "；下一步处理未解决 P0/P1"
     lines.append(conclusion)

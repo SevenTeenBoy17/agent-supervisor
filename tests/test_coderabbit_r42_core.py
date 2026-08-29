@@ -184,6 +184,7 @@ def _review_output_artifact(
     binding: dict,
     *,
     suffix: str,
+    before: bytes | None = b'{"v":2}\n',
     after: bytes = b'{"v":3}\n',
     executable_payload: bool = False,
 ) -> dict:
@@ -192,9 +193,6 @@ def _review_output_artifact(
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "artifact@example.invalid")
     _git(repo, "config", "user.name", "Review Artifact")
-    _git(repo, "commit", "--allow-empty", "-qm", "artifact empty base")
-    base = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
-    (repo / "config.json").write_bytes(after)
     payload_manifest = {
         "files": [{"path": "config.json", "sha256": sha256_bytes(after)}]
     }
@@ -202,7 +200,16 @@ def _review_output_artifact(
         json.dumps(payload_manifest, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     (repo / "REVIEW_MANIFEST.json").write_bytes(review_manifest_bytes)
-    _git(repo, "add", "config.json", "REVIEW_MANIFEST.json")
+    (repo / "CONTEXT.md").write_bytes(b"bounded review context\n")
+    if before is not None:
+        (repo / "config.json").write_bytes(before)
+    _git(repo, "add", "REVIEW_MANIFEST.json", "CONTEXT.md")
+    if before is not None:
+        _git(repo, "add", "config.json")
+    _git(repo, "commit", "-qm", "artifact baseline")
+    base = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    (repo / "config.json").write_bytes(after)
+    _git(repo, "add", "config.json")
     if executable_payload:
         _git(repo, "update-index", "--chmod=+x", "config.json")
     _git(repo, "commit", "-qm", "artifact head")
@@ -213,6 +220,7 @@ def _review_output_artifact(
         repo, "diff", "--binary", "--full-index", "--no-ext-diff", base, head
     ).stdout
     source_review_manifest = {
+        "CONTEXT.md": sha256_bytes(b"bounded review context\n"),
         "REVIEW_MANIFEST.json": sha256_bytes(review_manifest_bytes),
         "config.json": sha256_bytes(after),
     }
@@ -697,7 +705,7 @@ def test_review_gate_output_rejects_missing_malformed_tampered_and_mismatched_ar
     parsed, reason = cli_module._parse_review_gate_output(
         json.dumps(wrong_tree, separators=(",", ":")), "", binding
     )
-    assert parsed is None and reason == "review-artifact-head-tree-manifest-mismatch"
+    assert parsed is None and reason == "review-artifact-delta-head-mismatch"
 
 
 def test_review_artifact_git_argv_isolated_from_leading_dash_bundle(
@@ -726,13 +734,20 @@ def test_review_artifact_git_argv_isolated_from_leading_dash_bundle(
     output["review_artifact"]["bundle_path"] = str(leading_dash_bundle.resolve())
 
     observed_calls: list[tuple[str, ...]] = []
+    observed_process_commands: list[tuple[str, ...]] = []
     real_git = workspace_module._git
+    real_popen = workspace_module.subprocess.Popen
 
     def recording_git(repo: Path, *args: str):
         observed_calls.append(args)
         return real_git(repo, *args)
 
+    def recording_popen(command, *args, **kwargs):
+        observed_process_commands.append(tuple(str(value) for value in command))
+        return real_popen(command, *args, **kwargs)
+
     monkeypatch.setattr(workspace_module, "_git", recording_git)
+    monkeypatch.setattr(workspace_module.subprocess, "Popen", recording_popen)
     valid, reason, _ = workspace_module.validate_review_output_artifact(
         output, binding
     )
@@ -749,9 +764,19 @@ def test_review_artifact_git_argv_isolated_from_leading_dash_bundle(
     assert Path(fetch[3]).name == "review.bundle"
     assert fetch[4].endswith(":refs/review/head")
     assert all(str(leading_dash_bundle) not in args for args in observed_calls)
+    batch_commands = [
+        command
+        for command in observed_process_commands
+        if command[-2:] == ("cat-file", "--batch")
+    ]
+    assert len(batch_commands) == 2
+    assert not any(
+        "cat-file" in command and "blob" in command
+        for command in observed_process_commands
+    )
 
 
-def test_full_snapshot_artifact_rejects_duplicate_manifest_nonempty_base_and_bad_mode(tmp_path):
+def test_full_snapshot_artifact_rejects_duplicate_manifest_and_bad_base(tmp_path):
     delta_manifest = {
         "config.json": {
             "before": sha256_bytes(b'{"v":2}\n'),
@@ -808,15 +833,15 @@ def test_full_snapshot_artifact_rejects_duplicate_manifest_nonempty_base_and_bad
     parsed, reason = cli_module._parse_review_gate_output(
         json.dumps(nonempty_base, separators=(",", ":")), "", binding
     )
-    assert parsed is None and reason == "review-artifact-base-tree-not-empty"
+    assert parsed is None and reason == "review-artifact-base-tree-manifest-mismatch"
 
     executable = _review_output_artifact(
-        tmp_path, binding, suffix="bad-mode", executable_payload=True
+        tmp_path, binding, suffix="executable-mode", executable_payload=True
     )
     parsed, reason = cli_module._parse_review_gate_output(
         json.dumps(executable, separators=(",", ":")), "", binding
     )
-    assert parsed is None and reason == "review-artifact-head-tree-mode-invalid"
+    assert parsed is not None and reason == "verified"
 
 
 def test_immutable_full_git_bundle_and_manifest_is_a_valid_alternate_binding(tmp_path, valid_bundle):
@@ -838,6 +863,7 @@ def test_immutable_full_git_bundle_and_manifest_is_a_valid_alternate_binding(tmp
         tmp_path,
         binding_input,
         suffix="alternate-binding",
+        before=b'{"v":1}\n',
         after=b'{"v":2}\n',
     )
     artifact = review_output["review_artifact"]

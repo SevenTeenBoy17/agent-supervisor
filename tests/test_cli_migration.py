@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from supervisor_core.attestation import verify_record
 from supervisor_core.cli import _classify_goal_change, main
+from supervisor_core.contracts import build_round_process_summary
 from supervisor_core.executable_trust import trusted_command_approval_sha256
 from supervisor_core.runtime_bundle import build_runtime_bundle, release_identity
 from supervisor_core.util import canonical_sha256, sha256_file
@@ -353,6 +355,60 @@ def test_gate_runner_attests_real_exit_and_rejects_self_report(tmp_path, capsys,
     assert any("lacks a valid local-core execution attestation" in error for error in forged_report["errors"])
 
 
+def test_explicit_native_command_keeps_kind_and_category_in_signed_pair(
+    tmp_path, capsys, monkeypatch
+):
+    _use_isolated_skill_home(tmp_path, monkeypatch)
+    common = [
+        "--runtime", "codex", "--workspace", str(tmp_path),
+        "--session", "native-kind", "--round", "r",
+        "--state-root", str(tmp_path / "state"),
+    ]
+    assert main([
+        "start", *common, "--message", "validate dev-supervisor native command timeline kind",
+        "--change-mode", "replace", "--execution-mode", "observe",
+    ]) == 0
+    state_file = Path(json.loads(capsys.readouterr().out)["state_file"])
+    invocation = [
+        *common, "--invocation-id", "inv-native", "--capability", "pytest",
+        "--actor", "codex", "--command-category", "test",
+        "--data-json", json.dumps({
+            "kind": "skill",
+            "capability_kind": "agent",
+            "tool_kind": "mcp",
+        }),
+    ]
+    assert main(["event", *invocation, "--event-type", "invocation_attempt"]) == 0
+    capsys.readouterr()
+    assert main([
+        "event", *invocation, "--event-type", "invocation_result",
+        "--result", "success",
+    ]) == 0
+    capsys.readouterr()
+    event_rows = [
+        json.loads(line)
+        for path in state_file.parent.glob("events*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    pair = [
+        row for row in event_rows if row.get("invocation_id") == "inv-native"
+    ]
+    assert len(pair) == 2
+    assert all(verify_record(row) for row in pair)
+    assert all(row["details"]["kind"] == "native_command" for row in pair)
+    assert all("tool_kind" not in row["details"] for row in pair)
+    assert all(row["details"]["command_category"] == "test" for row in pair)
+    summary = build_round_process_summary(
+        json.loads(state_file.read_text(encoding="utf-8")), event_rows
+    )
+    native = next(
+        row for row in summary["timeline"] if row["canonical_id"] == "pytest"
+    )
+    assert native["kind"] == "native_command"
+    assert native["status"] == "success"
+
+
 def test_two_failures_open_breaker_but_untrusted_fallback_is_unavailable(tmp_path, capsys, monkeypatch):
     _use_isolated_skill_home(tmp_path, monkeypatch)
     project = tmp_path / ".agent-supervisor" / "project.json"
@@ -393,6 +449,17 @@ def test_two_failures_open_breaker_but_untrusted_fallback_is_unavailable(tmp_pat
         capsys.readouterr()
         assert main(["event", *common, "--event-type", "invocation_result", "--invocation-id", invocation_id, "--capability", "primary-agent", "--actor", "worker", "--result", "failed"]) == 0
         capsys.readouterr()
+    event_rows = [
+        json.loads(line)
+        for path in state_file.parent.glob("events*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    result_rows = [
+        row for row in event_rows if row.get("event_type") == "invocation_result"
+    ]
+    assert len(result_rows) == 2
+    assert all(verify_record(row) for row in result_rows)
     row = json.loads(state_file.read_text(encoding="utf-8"))["capability_breakers"]["primary-agent"]
     assert row["open"] is True
     assert "active_capability" not in row

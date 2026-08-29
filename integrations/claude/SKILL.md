@@ -5,7 +5,7 @@ metadata:
   type: persistent-monitor
   scope: all-task-types
   state: shared-core-namespaced
-  version: 3.1.6
+  version: 3.1.12
 ---
 
 # Agent Supervisor v3 — Claude Adapter Contract

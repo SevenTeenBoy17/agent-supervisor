@@ -14,7 +14,9 @@ import pytest
 
 import supervisor_core.cli as cli_module
 import supervisor_core.workspace as workspace_module
+from supervisor_core.attestation import verify_record
 from supervisor_core.cli import command_hook
+from supervisor_core.contracts import build_round_process_summary, render_round_process_summary
 from supervisor_core.lifecycle import start_round
 from supervisor_core.storage import StateContext
 from supervisor_core.util import sha256_file, sha256_text
@@ -277,6 +279,60 @@ def codex_round(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.
         root=state_file.parent,
     )
     return workspace, state_root, common, ctx
+
+
+def test_codex_prompt_records_supervisor_as_a_real_skill_contribution(codex_round) -> None:
+    _workspace, _state_root, _common, ctx = codex_round
+    rows = [
+        row
+        for row in ctx.events()
+        if row.get("capability") == "dev-supervisor"
+        and row.get("event_type") in {"invocation_attempt", "invocation_result"}
+    ]
+    assert len(rows) == 2
+    assert {row.get("stage") for row in rows} == {"attempt", "result"}
+    result = next(row for row in rows if row.get("stage") == "result")
+    assert result.get("result") == "success"
+    rendered = render_round_process_summary(
+        build_round_process_summary(ctx.load(), ctx.events())
+    )
+    assert "Skill｜dev-supervisor｜success" in rendered
+    assert "GoalContract" in rendered
+
+
+def test_round_summary_status_icons_do_not_use_variation_selectors() -> None:
+    summary = {
+        "round": {
+            "goal_id": "goal-icons",
+            "goal_version": 1,
+            "change_mode": "replace",
+            "terminal_state": "incomplete",
+        },
+        "timeline": [
+            {
+                "kind": "skill",
+                "canonical_id": "fallback-skill",
+                "status": "fallback",
+                "contribution": "bounded fallback",
+                "evidence_ids": ["evidence-fallback"],
+            },
+            {
+                "kind": "skill",
+                "canonical_id": "cancelled-skill",
+                "status": "cancelled",
+                "contribution": "cancelled invocation",
+                "evidence_ids": ["evidence-cancelled"],
+            },
+        ],
+        "quality": {"gates": [], "redundancy": {}},
+    }
+
+    rendered = render_round_process_summary(summary)
+
+    assert "⚠ " in rendered
+    assert "◻ " in rendered
+    assert "⚠️ " not in rendered
+    assert "◻️ " not in rendered
 
 
 def test_codex_apply_patch_scope_and_native_invocation_correlation(
@@ -568,6 +624,19 @@ def test_codex_subagent_and_stop_lifecycle_never_force_success(
     codex_round, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _, state_root, common, ctx = codex_round
+    ctx.update(
+        lambda state: state["capability_inventory"].setdefault("agents", []).append(
+            {
+                "id": "reviewer",
+                "active": True,
+                "automatic": True,
+                "availability": "enabled",
+                "health": "healthy",
+                "host_liveness_status": "verified",
+                "error": "",
+            }
+        )
+    )
     initial = ctx.load()
     for event in ("SubagentStart", "SubagentStop"):
         code, output = _run_hook(
@@ -619,11 +688,129 @@ def test_codex_subagent_and_stop_lifecycle_never_force_success(
         outputs.append(output)
     assert outputs[0]["decision"] == "block"
     assert outputs[1]["decision"] == "block"
+    assert "# RoundProcessSummary/v1" in outputs[0]["reason"]
+    assert "# RoundProcessSummary/v1" in outputs[1]["reason"]
+    assert "最终回答" in outputs[0]["reason"]
     assert outputs[2] == {}
     final_state = ctx.load()
     assert final_state["stop_attempts"] == 3
     assert final_state["terminal_state"] == "incomplete"
     assert final_state["host_gate"]["stop_cap_reached"] is True
+
+
+def test_codex_stop_requires_summary_once_even_when_round_is_complete(
+    codex_round, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, state_root, common, ctx = codex_round
+    finalize_calls = 0
+
+    def complete_round(ctx, **_kwargs: Any):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        state = ctx.load()
+        state["terminal_state"] = "complete"
+        state["stop_attempts"] = 1
+        state["updated_at"] = f"2026-08-28T12:00:0{finalize_calls}.000Z"
+        state["host_gate"] = {
+            "should_block": False,
+            "stop_cap_reached": False,
+            "note": "fixture",
+        }
+        return state, 0
+
+    monkeypatch.setattr(cli_module, "finalize_round", complete_round)
+    code, output = _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="Stop",
+        payload={**common, "last_assistant_message": "Task finished."},
+    )
+    assert code == 0
+    assert output["decision"] == "block"
+    assert "# RoundProcessSummary/v1" in output["reason"]
+
+    rendered_summary = output["reason"].split(
+        "不得删除时间线、调用类型、任务贡献、Evidence 或真实终态：\n\n",
+        maxsplit=1,
+    )[1]
+    first_hash = ctx.load()["stop_summary_sha256"]
+    assert first_hash == sha256_text(rendered_summary)
+    assert ctx.load()["stop_summary_text"] == rendered_summary
+    binding = next(
+        row for row in ctx.events() if row.get("event_type") == "round_summary_bound"
+    )
+    assert binding["summary_sha256"] == first_hash
+    assert verify_record(binding)
+    code, output = _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="Stop",
+        payload={
+            **common,
+            "stop_hook_active": True,
+            "last_assistant_message": "# RoundProcessSummary/v1\nforged summary",
+        },
+    )
+    assert code == 0
+    assert output["decision"] == "block"
+    assert output["reason"].endswith(rendered_summary)
+
+    code, output = _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="Stop",
+        payload={
+            **common,
+            "stop_hook_active": True,
+            "last_assistant_message": f"Task finished.\n\n{rendered_summary}",
+        },
+    )
+    assert code == 0
+    assert output == {}
+    assert ctx.load()["stop_summary_sha256"] == first_hash
+    assert ctx.load()["stop_summary_text"] == rendered_summary
+
+    composed_summary = rendered_summary + "\nCaf\u00e9"
+    ctx.update(
+        lambda state: state.update(
+            {
+                "stop_summary_sha256": sha256_text(composed_summary),
+                "stop_summary_text": composed_summary,
+            }
+        )
+    )
+    finalized = ctx.load()
+    output = cli_module._stop_response_with_round_summary(
+        finalized,
+        ctx.events(),
+        {
+            "last_assistant_message": composed_summary.replace("\u00e9", "e\u0301"),
+        },
+    )
+    assert output == {}
+
+
+def test_codex_stop_summary_is_advisory_outside_enforce_mode(
+    codex_round, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, state_root, common, ctx = codex_round
+    ctx.update(lambda state: state.update({"execution_mode": "observe"}))
+
+    code, output = _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="Stop",
+        payload={**common, "last_assistant_message": "Task finished."},
+    )
+
+    assert code == 0
+    assert "decision" not in output
+    assert "observe/warn mode does not hard-block" in output["systemMessage"]
+    assert "# RoundProcessSummary/v1" in output["systemMessage"]
 
 
 def test_codex_degraded_hook_fails_open_and_persists_health(

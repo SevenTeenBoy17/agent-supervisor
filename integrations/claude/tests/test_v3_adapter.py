@@ -30,6 +30,20 @@ CLAUDE_SKILL = HERE.parent / "SKILL.md"
 PRECISION = HERE / "test_precision.py"
 RETRIEVAL = HERE / "test_retrieval.py"
 RUNTIME_BUNDLE = HERE.parents[2] / "supervisor_core" / "runtime_bundle.py"
+_PREVIOUS_TEST_MODE = None
+
+
+def setUpModule() -> None:
+    global _PREVIOUS_TEST_MODE
+    _PREVIOUS_TEST_MODE = os.environ.get("AGENT_SUPERVISOR_TEST_MODE")
+    os.environ["AGENT_SUPERVISOR_TEST_MODE"] = "1"
+
+
+def tearDownModule() -> None:
+    if _PREVIOUS_TEST_MODE is None:
+        os.environ.pop("AGENT_SUPERVISOR_TEST_MODE", None)
+    else:
+        os.environ["AGENT_SUPERVISOR_TEST_MODE"] = _PREVIOUS_TEST_MODE
 
 
 def load_module(name: str, path: Path):
@@ -114,7 +128,7 @@ class CoreTrustResolver(unittest.TestCase):
     def test_adapter_and_skill_release_metadata_are_3_1_6(self) -> None:
         match = re.search(r"(?m)^\s*version:\s*([^\s]+)\s*$", CLAUDE_SKILL.read_text(encoding="utf-8"))
         self.assertIsNotNone(match)
-        self.assertEqual(self.adapter.ADAPTER_VERSION, "3.1.6")
+        self.assertEqual(self.adapter.ADAPTER_VERSION, "3.1.12")
         self.assertEqual(match.group(1), self.adapter.ADAPTER_VERSION)
 
     def _pointer(
@@ -139,6 +153,145 @@ class CoreTrustResolver(unittest.TestCase):
             "AGENT_SUPERVISOR_ACTIVE_POINTER": str(pointer),
             "AGENT_SUPERVISOR_RELEASE_ROOT": str(self.release_root),
         }
+
+    def test_installed_adapter_ignores_ambient_home_and_release_overrides(self) -> None:
+        trusted_home = self.base / "trusted-home"
+        installed = (
+            trusted_home
+            / ".claude"
+            / "skills"
+            / "supervisor"
+            / "scripts"
+            / "sup-v3-hook.py"
+        )
+        installed.parent.mkdir(parents=True)
+        installed.write_bytes(ADAPTER.read_bytes())
+        hostile = self.base / "hostile-home"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USERPROFILE": str(hostile),
+                "HOME": str(hostile),
+                "AGENT_SUPERVISOR_ACTIVE_POINTER": str(hostile / "pointer.json"),
+                "AGENT_SUPERVISOR_RELEASE_ROOT": str(hostile / "releases"),
+            },
+            clear=False,
+        ):
+            module = load_module("supervisor_v3_installed_anchor_probe", installed)
+            pointer, roots = module._active_pointer_location()
+
+        self.assertEqual(module._installation_home(), trusted_home.resolve())
+        self.assertEqual(pointer, trusted_home.resolve() / ".agent-supervisor" / "active-version.json")
+        self.assertNotIn(hostile, roots)
+
+    def test_installed_adapter_accepts_a_redirected_profile_ancestor(self) -> None:
+        real_home = self.base / "real-profile-home"
+        real_home.mkdir()
+        redirected_home = self.base / "redirected-profile-home"
+        try:
+            redirected_home.symlink_to(real_home, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory link unavailable: {exc}")
+        installed = (
+            redirected_home
+            / ".claude"
+            / "skills"
+            / "supervisor"
+            / "scripts"
+            / "sup-v3-hook.py"
+        )
+        installed.parent.mkdir(parents=True)
+        installed.write_bytes(ADAPTER.read_bytes())
+
+        module = load_module("supervisor_v3_redirected_profile_probe", installed)
+
+        self.assertEqual(module._installation_home(), real_home.resolve())
+
+    def test_installed_adapter_rejects_a_redirected_managed_claude_root(self) -> None:
+        lexical_home = self.base / "lexical-profile-home"
+        lexical_home.mkdir()
+        external_claude = self.base / "external-claude-root"
+        installed = (
+            external_claude
+            / "skills"
+            / "supervisor"
+            / "scripts"
+            / "sup-v3-hook.py"
+        )
+        installed.parent.mkdir(parents=True)
+        installed.write_bytes(ADAPTER.read_bytes())
+        try:
+            (lexical_home / ".claude").symlink_to(
+                external_claude,
+                target_is_directory=True,
+            )
+        except OSError as exc:
+            self.skipTest(f"directory link unavailable: {exc}")
+        lexical_adapter = (
+            lexical_home
+            / ".claude"
+            / "skills"
+            / "supervisor"
+            / "scripts"
+            / "sup-v3-hook.py"
+        )
+        module = load_module(
+            "supervisor_v3_redirected_managed_root_probe",
+            lexical_adapter,
+        )
+
+        with self.assertRaises(FileNotFoundError):
+            module._installation_home()
+
+    def test_install_home_reparse_policy_distinguishes_profile_from_managed_tree(self) -> None:
+        trusted_home = self.base / "policy-profile-home"
+        installed = (
+            trusted_home
+            / ".claude"
+            / "skills"
+            / "supervisor"
+            / "scripts"
+            / "sup-v3-hook.py"
+        )
+        installed.parent.mkdir(parents=True)
+        installed.write_bytes(ADAPTER.read_bytes())
+        module = load_module("supervisor_v3_profile_reparse_policy_probe", installed)
+        original_stat_is_reparse = module._stat_is_reparse
+
+        def profile_only(path: Path, info: os.stat_result) -> bool:
+            return (
+                module._lexical_absolute(path) == trusted_home
+                or original_stat_is_reparse(path, info)
+            )
+
+        with mock.patch.object(module, "_stat_is_reparse", side_effect=profile_only):
+            self.assertEqual(module._installation_home(), trusted_home.resolve())
+
+        managed_root = trusted_home / ".claude"
+
+        def managed_only(path: Path, info: os.stat_result) -> bool:
+            return (
+                module._lexical_absolute(path) == managed_root
+                or original_stat_is_reparse(path, info)
+            )
+
+        with mock.patch.object(module, "_stat_is_reparse", side_effect=managed_only):
+            with self.assertRaises(FileNotFoundError):
+                module._installation_home()
+
+    def test_pytest_marker_alone_does_not_enable_source_tree_home_fallback(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTEST_CURRENT_TEST": "synthetic::test",
+                "USERPROFILE": str(self.home),
+                "HOME": str(self.home),
+            },
+            clear=False,
+        ):
+            os.environ.pop("AGENT_SUPERVISOR_TEST_MODE", None)
+            with self.assertRaises(FileNotFoundError):
+                self.adapter._installation_home()
 
     def test_recursive_python_tree_requires_main_and_rejects_structural_reparse(self) -> None:
         write_core(self.release_core)
@@ -1222,7 +1375,19 @@ def main():
         self.assertTrue(forwarded[0]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
         self.assertTrue(forwarded[1]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
         self.assertFalse(forwarded[2]["payload"]["_agent_supervisor_adapter"]["degraded_prior"])
-        self.assertEqual(forwarded[0]["payload"]["_agent_supervisor_adapter"]["adapter_version"], "3.1.6")
+        self.assertEqual(forwarded[0]["payload"]["_agent_supervisor_adapter"]["adapter_version"], "3.1.12")
+
+    def test_rejected_adapter_layout_keeps_marker_operations_fail_open(self) -> None:
+        adapter = load_module("supervisor_v3_rejected_layout_marker_probe", ADAPTER)
+        rejected = FileNotFoundError("adapter_layout_rejected")
+        with mock.patch.object(adapter, "_installation_home", side_effect=rejected):
+            self.assertFalse(adapter._has_degraded_marker("rejected-layout-session"))
+            adapter._record_degraded(
+                "SessionStart",
+                {"session_id": "rejected-layout-session", "cwd": "D:/project"},
+                "adapter_layout_rejected",
+            )
+            adapter._clear_degraded_marker("rejected-layout-session")
 
     def test_core_degraded_response_creates_marker(self) -> None:
         env = self.env(self.stub_core)
@@ -1872,7 +2037,7 @@ class LegacyLogSafety(unittest.TestCase):
                 {"first-skill": "success", "second-skill": "failed"},
             )
 
-    def test_transcript_redacts_complete_prompt_before_bounded_truncation(self) -> None:
+    def test_legacy_transcript_opt_in_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-transcript-cutoff-") as temp:
             home = Path(temp) / "home"
             with mock.patch.object(Path, "home", return_value=home):
@@ -1887,19 +2052,9 @@ class LegacyLogSafety(unittest.TestCase):
 
             secret = "sk-" + "A" * 24
             prompt = "x" * 14 + " " + secret + "tail"
-            with mock.patch.object(log, "MAX_PROMPT_CHARS", 20):
-                transcript = Path(log.append_transcript(prompt, "D:/fixture", 1, True))
-
-            content = transcript.read_text(encoding="utf-8")
-            body_match = re.search(r"(`{3,})text\n(.*?)\n\1\n", content, re.S)
-            self.assertIsNotNone(body_match)
-            body = body_match.group(2)
-            visible = body.split("\n…（超长，已截断", 1)[0]
-            self.assertLessEqual(len(visible), 20)
-            self.assertIn("超长，已截断，原长 " + str(len(prompt)) + " 字", body)
-            self.assertIn("已抹除 1 处疑似凭据", content)
-            self.assertNotIn(secret, content)
-            self.assertNotIn("sk-AA", content)
+            self.assertFalse(log.PROMPT_ARCHIVE_ENABLED)
+            self.assertEqual(log.append_transcript(prompt, "D:/fixture", 1, True), "")
+            self.assertEqual(list(log.TRANSCRIPTS_DIR.rglob("*.md")), [])
     def test_briefing_discovery_recognizes_sections_four_and_five(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-brief-marks-") as temp:
             home = Path(temp) / "home"
@@ -1956,10 +2111,8 @@ class LegacyLogSafety(unittest.TestCase):
                 ):
                     log = load_module("supervisor_v3_project_key_paths_probe", LOG)
 
-            transcript = Path(log.append_transcript("probe", "..", 1, True)).resolve()
-            transcript_root = log.TRANSCRIPTS_DIR.resolve()
-            self.assertTrue(transcript.is_relative_to(transcript_root))
-            self.assertFalse((log.SUP_HOME / transcript.name).exists())
+            self.assertEqual(log.append_transcript("probe", "..", 1, True), "")
+            self.assertEqual(list(log.TRANSCRIPTS_DIR.rglob("*.md")), [])
 
             # Call sites retain their own boundary check even if key generation later
             # regresses or is replaced by an unsafe adapter value.
@@ -2000,7 +2153,7 @@ class LegacyLogSafety(unittest.TestCase):
             self.assertEqual(json.loads(first.read_text(encoding="utf-8"))["event"], "before-midnight")
             self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["event"], "after-midnight")
 
-    def test_transcript_header_exclusive_create_preserves_race_winner(self) -> None:
+    def test_disabled_transcript_archive_preserves_existing_file(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-transcript-race-") as temp:
             home = Path(temp) / "home"
             with mock.patch.object(Path, "home", return_value=home):
@@ -2022,18 +2175,10 @@ class LegacyLogSafety(unittest.TestCase):
             target.parent.mkdir(parents=True)
             race_winner = "race-winner-content\n"
             target.write_text(race_winner, encoding="utf-8")
-            original_exists = Path.exists
-
-            def stale_exists(path: Path) -> bool:
-                return False if path == target else original_exists(path)
-
-            with mock.patch.object(Path, "exists", stale_exists):
-                result = log.append_transcript("new prompt", project, 1, True)
-
+            result = log.append_transcript("new prompt", project, 1, True)
             content = target.read_text(encoding="utf-8")
-            self.assertEqual(result, str(target))
-            self.assertTrue(content.startswith(race_winner))
-            self.assertIn("new prompt", content)
+            self.assertEqual(result, "")
+            self.assertEqual(content, race_winner)
 
     def test_retention_prunes_only_old_valid_noncurrent_state_logs_and_transcripts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="supervisor-v3-log-retention-") as temp:

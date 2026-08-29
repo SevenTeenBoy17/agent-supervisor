@@ -1830,7 +1830,7 @@ def test_hook_bounds_ingress_and_rechecks_serialized_forwarding() -> None:
             {"session_id": "bounded-forward", "value": "x" * 64},
             False,
         )
-    assert hook["ADAPTER_VERSION"] == "3.1.6"
+    assert hook["ADAPTER_VERSION"] == "3.1.12"
 
 
 def test_hook_oversized_stdin_is_rejected_without_parsing_or_echoing_payload() -> None:
@@ -3093,7 +3093,31 @@ def test_powershell_python_command_runs_real_production_identity_probe(
     assert Path(observed["command"]) == python_path
     dependencies = {Path(value).resolve() for value in observed["dependencies"]}
     expected_system_site = Path(sysconfig.get_paths()["purelib"]).resolve()
-    expected_user_site = Path(site.getusersitepackages()).resolve()
+    identity_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("PYTHON")
+        and key.upper() not in {"APPDATA", "LOCALAPPDATA"}
+    }
+    user_site_probe = subprocess.run(
+        [
+            str(python_path),
+            "-I",
+            "-S",
+            "-c",
+            "import site; print(site.getusersitepackages())",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        env=identity_environment,
+        timeout=15,
+    )
+    assert user_site_probe.returncode == 0, (
+        user_site_probe.stdout + user_site_probe.stderr
+    )
+    expected_user_site = Path(user_site_probe.stdout.strip()).resolve()
     assert expected_system_site in dependencies
     if expected_user_site.is_dir():
         assert expected_user_site in dependencies

@@ -682,3 +682,33 @@ def test_skill_and_unknown_tools_are_not_forced_native(
     view = render_round_process_summary(summary)
     assert "Command｜dev-supervisor｜" not in view
     assert "Command｜VendorAudit｜" not in view
+
+
+def test_uninventoried_skill_label_cannot_spoof_signed_timeline(
+    codex_round, monkeypatch, capsys
+) -> None:
+    _, state_root, common, ctx = codex_round
+    payload = {
+        **common,
+        "tool_use_id": "spoofed-skill",
+        "tool_name": "Skill",
+        "tool_input": {"skill": "not-installed-capability"},
+    }
+    assert _run_hook(
+        monkeypatch, capsys, state_root=state_root, event="PreToolUse", payload=payload
+    )[0] == 0
+    assert _run_hook(
+        monkeypatch,
+        capsys,
+        state_root=state_root,
+        event="PostToolUse",
+        payload={**payload, "tool_response": {"exitCode": 0}},
+    )[0] == 0
+
+    result = next(
+        row
+        for row in ctx.events()
+        if row.get("invocation_id") == "spoofed-skill"
+        and row.get("event_type") == "invocation_result"
+    )
+    assert result["capability"] == "Skill"

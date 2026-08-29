@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -12,10 +13,86 @@ from typing import Any
 
 import pytest
 
-from supervisor_core import runtime_bundle
+from supervisor_core import runtime_bundle, workspace as workspace_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _git_fixture_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(name, None)
+    return env
+
+
+def test_git_batch_blob_hashing_transmits_the_complete_request_after_short_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    object_id = "a" * 40
+    payload = b"blob"
+    expected_request = object_id.encode("ascii") + b"\n"
+
+    class ShortWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.closed = False
+
+        def write(self, value: bytes | memoryview) -> int:
+            chunk = bytes(value[:3])
+            self.data.extend(chunk)
+            return len(chunk)
+
+        def close(self) -> None:
+            self.closed = True
+
+    writer = ShortWriter()
+    observed_timeout: list[int | None] = []
+
+    class FakeProcess:
+        stdin = writer
+        stdout = io.BytesIO(
+            f"{object_id} blob {len(payload)}\n".encode("ascii")
+            + payload
+            + b"\n"
+        )
+        stderr = io.BytesIO()
+
+        def wait(self, timeout: int | None = None) -> int:
+            observed_timeout.append(timeout)
+            return 0
+
+        def kill(self) -> None:
+            pytest.fail("a valid short write must not kill the batch process")
+
+    monkeypatch.setattr(
+        workspace_module, "_resolve_git_executable", lambda _workspace: Path("git")
+    )
+    monkeypatch.setattr(
+        workspace_module.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+    )
+
+    observed, error = workspace_module._git_batch_blob_sha256(
+        tmp_path, [("file.txt", object_id)]
+    )
+
+    assert error is None
+    assert observed == {"file.txt": hashlib.sha256(payload).hexdigest()}
+    assert bytes(writer.data) == expected_request
+    assert writer.closed is True
+    assert observed_timeout == [workspace_module._git_batch_timeout_seconds(1)]
+    assert observed_timeout[0] > workspace_module._GIT_TIMEOUT_SECONDS
+
+
+def test_git_batch_timeout_scales_with_bounded_object_and_byte_budget() -> None:
+    one_object = workspace_module._git_batch_timeout_seconds(1)
+    large_batch = workspace_module._git_batch_timeout_seconds(
+        workspace_module._MAX_WORKSPACE_FILES
+    )
+
+    assert workspace_module._GIT_TIMEOUT_SECONDS < one_object < large_batch
+    assert large_batch == workspace_module._GIT_BATCH_TIMEOUT_MAX_SECONDS
 
 
 def _load_builder():
@@ -40,10 +117,41 @@ def _load_review_runner():
     return module
 
 
+def _configure_builder_trusted_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    executable: Path,
+    *,
+    digest: str | None = None,
+) -> None:
+    install_home = tmp_path / "builder-install-home"
+    registry = install_home / ".agent-supervisor" / "trusted-executables.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    observed_digest = digest
+    if observed_digest is None:
+        observed_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    registry.write_text(
+        json.dumps({
+            "contract": "TrustedExecutableRegistry/v1",
+            "entries": {
+                "git": {
+                    "kind": "local",
+                    "path": str(executable.resolve()),
+                    "sha256": observed_digest,
+                }
+            },
+            "generated_at": "2000-01-01T00:00:00Z",
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_SUPERVISOR_INSTALL_HOME", str(install_home))
+
+
 def _write_runtime_root(root: Path) -> None:
     package = root / "supervisor_core"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("VALUE = 'trusted'\n", encoding="utf-8")
+    (root / "VERSION").write_text("3.1.6\n", encoding="ascii")
 
 
 def _run_builder(
@@ -67,6 +175,83 @@ def _run_builder(
         arguments.extend(["--identity-output", str(identity_output)])
     monkeypatch.setattr(sys, "argv", arguments)
     return builder.main()
+
+
+def test_builder_rejects_version_that_differs_from_repository_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    _write_runtime_root(root)
+    output = root / "runtime.zip"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build-core-release-manifest.py",
+            "--root",
+            str(root),
+            "--version",
+            "3.1.7",
+            "--output",
+            str(output),
+        ],
+    )
+
+    with pytest.raises(runtime_bundle.RuntimeBundleError, match="does-not-match"):
+        builder.main()
+    assert not output.exists()
+
+
+def test_builder_rejects_git_ignored_runtime_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    _write_runtime_root(root)
+    ignored = root / "supervisor_core" / "ignored-local.py"
+    ignored.write_text("TOKEN = 'fixture-only'\n", encoding="utf-8")
+    (root / ".gitignore").write_text("supervisor_core/ignored-local.py\n", encoding="utf-8")
+    git_env = _git_fixture_env()
+    subprocess.run(["git", "init", "-q", str(root)], check=True, env=git_env)
+    subprocess.run(
+        ["git", "-C", str(root), "add", "VERSION", ".gitignore", "supervisor_core/__init__.py"],
+        check=True,
+        env=git_env,
+    )
+    output = root / "runtime.zip"
+
+    with pytest.raises(runtime_bundle.RuntimeBundleError, match="non-publishable"):
+        _run_builder(builder, monkeypatch, root=root, output=output)
+    assert not output.exists()
+
+
+def test_builder_rejects_untracked_runtime_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    _write_runtime_root(root)
+    untracked = root / "supervisor_core" / "local-only.py"
+    untracked.write_text("TOKEN = 'fixture-only'\n", encoding="utf-8")
+    git_env = _git_fixture_env()
+    subprocess.run(["git", "init", "-q", str(root)], check=True, env=git_env)
+    subprocess.run(
+        ["git", "-C", str(root), "add", "VERSION", "supervisor_core/__init__.py"],
+        check=True,
+        env=git_env,
+    )
+    output = root / "runtime.zip"
+
+    with pytest.raises(runtime_bundle.RuntimeBundleError, match="non-publishable"):
+        _run_builder(builder, monkeypatch, root=root, output=output)
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("escaped_argument", ["output", "identity"])
@@ -198,6 +383,134 @@ def test_builder_rejects_reparse_component_even_when_target_stays_inside_root(
         builder._contained_output(root, output_parent / "core.zip")
 
 
+def test_builder_resolves_git_once_and_executes_the_absolute_regular_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    (root / ".git").mkdir()
+    git_executable = tmp_path / "trusted" / "git.exe"
+    git_executable.parent.mkdir()
+    git_executable.write_bytes(b"bounded executable fixture")
+    observed: dict[str, Any] = {}
+
+    _configure_builder_trusted_git(tmp_path, monkeypatch, git_executable)
+    poison = tmp_path / "poison" / "git.exe"
+    poison.parent.mkdir()
+    poison.write_bytes(b"must never execute")
+    monkeypatch.setenv("PATH", str(poison.parent))
+
+    def run(command, **kwargs):
+        observed.setdefault("commands", []).append(command)
+        observed["kwargs"] = kwargs
+        if command[-2:] == ["rev-parse", "--show-toplevel"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=str(root.resolve()).encode("utf-8") + b"\n",
+                stderr=b"",
+            )
+        return SimpleNamespace(returncode=0, stdout=b"VERSION\0", stderr=b"")
+
+    monkeypatch.setattr(builder.subprocess, "run", run)
+
+    assert builder._git_publishable_paths(root) == {"VERSION"}
+    assert len(observed["commands"]) == 2
+    assert all(command[0] == str(git_executable.resolve()) for command in observed["commands"])
+    assert Path(observed["commands"][0][0]).is_absolute()
+    assert observed["kwargs"]["cwd"] == root
+    assert observed["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert observed["kwargs"]["env"]["PATH"] == str(git_executable.parent)
+    assert observed["kwargs"]["env"]["LANG"] == "C"
+    assert observed["kwargs"]["env"]["LC_ALL"] == "C"
+    assert str(poison.parent) not in observed["kwargs"]["env"].values()
+
+
+def test_builder_rejects_nested_git_worktree_as_release_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    checkout = tmp_path / "checkout"
+    root = checkout / "nested-release"
+    root.mkdir(parents=True)
+    git_executable = tmp_path / "trusted" / "git.exe"
+    git_executable.parent.mkdir()
+    git_executable.write_bytes(b"bounded executable fixture")
+    _configure_builder_trusted_git(tmp_path, monkeypatch, git_executable)
+    monkeypatch.setattr(
+        builder.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=str(checkout.resolve()).encode("utf-8") + b"\n",
+            stderr=b"",
+        ),
+    )
+
+    with pytest.raises(runtime_bundle.RuntimeBundleError, match="git-publishable-root-mismatch"):
+        builder._git_publishable_paths(root)
+
+
+def test_builder_rejects_non_file_git_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    (root / ".git").mkdir()
+    fake_git_directory = tmp_path / "fake-git"
+    fake_git_directory.mkdir()
+    _configure_builder_trusted_git(
+        tmp_path,
+        monkeypatch,
+        fake_git_directory,
+        digest="0" * 64,
+    )
+
+    with pytest.raises(runtime_bundle.RuntimeBundleError, match="git-publishable-set-unavailable"):
+        builder._git_publishable_paths(root)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b"fatal: not a git repository (or any parent): .git\n", None),
+        (b"fatal: unsafe repository ownership\n", "error"),
+    ],
+)
+def test_builder_distinguishes_non_repository_from_git_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: bytes,
+    expected: str | None,
+) -> None:
+    builder = _load_builder()
+    root = tmp_path / "release"
+    root.mkdir()
+    git_executable = tmp_path / "trusted" / "git.exe"
+    git_executable.parent.mkdir()
+    git_executable.write_bytes(b"bounded executable fixture")
+    _configure_builder_trusted_git(tmp_path, monkeypatch, git_executable)
+    monkeypatch.setattr(
+        builder.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=128,
+            stdout=b"",
+            stderr=stderr,
+        ),
+    )
+
+    if expected is None:
+        assert builder._git_publishable_paths(root) is None
+    else:
+        with pytest.raises(runtime_bundle.RuntimeBundleError, match="git-publishable-set-unavailable"):
+            builder._git_publishable_paths(root)
+
+
 def test_source_checkout_review_uses_only_git_indexed_release_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -315,7 +628,11 @@ def test_builder_stages_and_fully_validates_before_ordered_atomic_publication(
         return real_inspect(blob, expected_identity=expected_identity)
 
     def observed_atomic_write(path: Path, content: bytes) -> None:
-        assert events == ["inspect"] or events == ["inspect", "payload"]
+        assert events == ["inspect", "inspect"] or events == [
+            "inspect",
+            "inspect",
+            "payload",
+        ]
         if path == output:
             assert not identity_output.exists()
             events.append("payload")
@@ -336,7 +653,7 @@ def test_builder_stages_and_fully_validates_before_ordered_atomic_publication(
         output=output,
         identity_output=identity_output,
     ) == 0
-    assert events == ["inspect", "payload", "identity"]
+    assert events == ["inspect", "inspect", "payload", "identity"]
     identity = json.loads(identity_output.read_text(encoding="utf-8"))
     assert json.loads(capsys.readouterr().out) == identity
     assert runtime_bundle.inspect_runtime_bundle(
@@ -547,6 +864,7 @@ def test_runtime_paths_include_release_selftest_support_tools() -> None:
     }
 
     assert {
+        ".github/workflows/ci.yml",
         "LICENSE",
         "NOTICE",
         "bin/install-agent-supervisor.py",

@@ -412,7 +412,7 @@ jobs:
         run: |
           & $env:AGENT_SUPERVISOR_CI_PYTHON bin/build-core-release-manifest.py `
             --root . `
-            --version 3.1.6 `
+            --version 3.1.12 `
             --output .ci-artifacts/supervisor-runtime.zip `
             --identity-output .ci-artifacts/release-identity.json
 

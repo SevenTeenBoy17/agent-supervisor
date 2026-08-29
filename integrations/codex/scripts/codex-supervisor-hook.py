@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-ADAPTER_VERSION = "3.1.6"
+ADAPTER_VERSION = "3.1.12"
 POINTER_CONTRACT = "ActiveVersionPointer/v4"
 IDENTITY_CONTRACT = "SupervisorReleaseIdentity/v1"
 TRUSTED_EXECUTABLE_REGISTRY_CONTRACT = "TrustedExecutableRegistry/v1"

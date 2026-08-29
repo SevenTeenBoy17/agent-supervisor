@@ -14,6 +14,7 @@ import sys
 import sysconfig
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -189,7 +190,7 @@ class _FrozenGateCommand(list[str]):
         return encoded
 
 
-_DEFAULT_GATE_TIMEOUT_SECONDS = 1200
+_DEFAULT_GATE_TIMEOUT_SECONDS = 1800
 _MIN_GATE_TIMEOUT_SECONDS = 1
 _MAX_GATE_TIMEOUT_SECONDS = 1800
 _DEFAULT_ROLLBACK_CLAIM_LEASE_SECONDS = 30
@@ -887,6 +888,8 @@ def _clean_event_payload(args: argparse.Namespace) -> dict[str, Any]:
     payload = _json_arg(args.data_json, {}) or {}
     if not isinstance(payload, dict):
         raise InvalidState("event data must be an object")
+    if "attestation" in payload:
+        raise InvalidState("caller-supplied event attestation is forbidden")
     for key, value in {
         "event_type": args.event_type,
         "phase": args.phase,
@@ -903,9 +906,99 @@ def _clean_event_payload(args: argparse.Namespace) -> dict[str, Any]:
             payload[key] = value
     # Raw command lines do not belong in the event ledger. Structured EvidenceRecord
     # retains sanitized args separately when explicitly supplied to state.
-    for unsafe in ("command", "argv", "args", "raw", "stdin", "stdout", "stderr"):
+    for unsafe in (
+        "command",
+        "argv",
+        "args",
+        "raw",
+        "stdin",
+        "stdout",
+        "stderr",
+        # Invocation kind is derived later from the trusted inventory/tool
+        # identity.  Letting a caller supply either marker would cause the
+        # core-signed timeline to misattribute a native command as a Skill,
+        # Agent, or plugin invocation.
+        "kind",
+        "capability_kind",
+        "tool_kind",
+    ):
         payload.pop(unsafe, None)
     return payload
+
+
+def _inventory_row_invocable(row: Any, collection: str) -> bool:
+    """Apply the fail-closed invocability policy to one discovery record."""
+    if not isinstance(row, dict) or collection not in {"skills", "agents"}:
+        return False
+    if (
+        row.get("active") is not True
+        or row.get("availability") != "enabled"
+        or row.get("health") != "healthy"
+        or str(row.get("error") or "").strip()
+    ):
+        return False
+    if collection == "agents":
+        return (
+            row.get("automatic") is True
+            and row.get("host_liveness_status") == "verified"
+        )
+    return row.get("automatic") is True or row.get("user_invocable") is True
+
+
+def _core_bound_invocation_kinds(
+    state: dict[str, Any], capability: str, command_category: Any
+) -> tuple[str | None, str | None]:
+    """Derive timeline attribution without trusting caller kind markers."""
+    inventory = state.get("capability_inventory")
+    if isinstance(inventory, dict):
+        capability_key = str(capability or "").strip().casefold()
+        for collection, kind in (("agents", "agent"), ("skills", "skill")):
+            rows = inventory.get(collection)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not _inventory_row_invocable(row, collection):
+                    continue
+                canonical = str(row.get("id") or row.get("name") or "").strip()
+                if not canonical or canonical.casefold() != capability_key:
+                    continue
+                if kind == "skill" and (
+                    "plugin" in str(row.get("source") or "").casefold()
+                    or str(row.get("capability_kind") or "").strip()
+                    in {"plugin", "plugin_app", "app"}
+                    or str(row.get("kind") or "").strip()
+                    in {"plugin", "plugin_app", "app"}
+                ):
+                    return "plugin_app", "plugin_app"
+                return kind, kind
+
+    category = str(command_category or "").strip().casefold()
+    marker = _normalized_tool_marker(str(capability or ""))
+    native_markers = {
+        "applypatch",
+        "bash",
+        "cmd",
+        "docker",
+        "execcommand",
+        "gh",
+        "git",
+        "node",
+        "npm",
+        "npx",
+        "powershell",
+        "pwsh",
+        "pytest",
+        "python",
+        "python3",
+        "shell",
+        "uv",
+    }
+    if category in {"shell", "git", "native", "native-command", "command", "exec", "test"} or marker in native_markers:
+        return "native_command", "native_command"
+    capability_key = str(capability or "").strip().casefold()
+    if capability_key.startswith(("mcp__", "mcp:", "plugin:")):
+        return "plugin_app", "plugin_app"
+    return None, None
 
 
 def _record_from_payload(payload: dict[str, Any], event_type: str) -> dict[str, Any]:
@@ -1119,7 +1212,11 @@ def _breaker_fallback_id(
     ) else ""
 
 
-def _record_breaker_result(state: dict[str, Any], capability: str, result: str) -> None:
+def _record_breaker_result(
+    state: dict[str, Any], capability: str | None, result: str
+) -> None:
+    if not capability:
+        return
     breakers = state.setdefault("capability_breakers", {})
     fallback_map = state.get("capability_fallbacks")
     configured_fallback = (
@@ -3188,9 +3285,19 @@ def command_event(args: argparse.Namespace) -> int:
     invocation_details: dict[str, Any] = {}
     if event_type in {"invocation_attempt", "skill_attempt"} or is_result:
         invocation_state = ctx.load()
+        invocation_kind, capability_kind = _core_bound_invocation_kinds(
+            invocation_state,
+            capability,
+            payload.get("command_category"),
+        )
         invocation_details = {
             "phase": payload.get("phase"),
             "summary": payload.get("summary"),
+            "kind": invocation_kind,
+            "capability_kind": capability_kind,
+            "command_category": payload.get("command_category"),
+            "intent_ids": payload.get("intent_ids"),
+            "evidence_ids": payload.get("evidence_ids"),
             **_invocation_state_binding(invocation_state),
         }
     if event_type in {"invocation_attempt", "skill_attempt"}:
@@ -3266,6 +3373,19 @@ def command_event(args: argparse.Namespace) -> int:
                 state["health"] = "degraded"
             state["updated_at"] = utc_now()
 
+        core_built_invocation = (
+            event_type in {
+                "invocation_attempt", "skill_attempt",
+                "invocation_result", "skill_result",
+            }
+            and payload.get("contract") == "InvocationEvent/v3"
+            and isinstance(payload.get("attestation"), str)
+        )
+        if core_built_invocation:
+            payload.setdefault("transaction_id", stable_id("transaction"))
+            payload["attestation"] = sign_record(payload)
+        elif "attestation" in payload:
+            raise InvalidState("only core-built invocation events may be signed here")
         _, recorded = ctx.transact(mutate, payload)
     else:
         if not ctx.load():
@@ -4562,6 +4682,63 @@ def _timeline_kind_for_tool(tool_name: str) -> str | None:
     return None
 
 
+def _inventory_bound_breaker_capability_name(
+    state: dict[str, Any],
+    *,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    payload: dict[str, Any],
+) -> str | None:
+    """Return a breaker key only when the observed capability identity is trustworthy."""
+    marker = _normalized_tool_marker(tool_name)
+    if marker not in {"skill", "agent", "task", "subagent"}:
+        return tool_name
+    inventory = state.get("capability_inventory")
+    if not isinstance(inventory, dict):
+        return None
+    if marker == "skill":
+        declared = tool_input.get("skill") or tool_input.get("capability")
+        rows = inventory.get("skills")
+    elif marker in {"agent", "task", "subagent"}:
+        declared = (
+            tool_input.get("agent")
+            or tool_input.get("subagent_type")
+            or payload.get("agent_type")
+            or payload.get("subagent_type")
+        )
+        rows = inventory.get("agents")
+    else:
+        return None
+    declared_name = str(declared or "").strip()
+    if not declared_name or not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not _inventory_row_invocable(
+            row, "skills" if marker == "skill" else "agents"
+        ):
+            continue
+        canonical = str(row.get("id") or row.get("name") or "").strip()
+        if canonical and canonical.casefold() == declared_name.casefold():
+            return canonical
+    return None
+
+
+def _inventory_bound_capability_name(
+    state: dict[str, Any],
+    *,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    """Use verified identities for attribution; otherwise retain only the tool kind."""
+    return _inventory_bound_breaker_capability_name(
+        state,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        payload=payload,
+    ) or tool_name
+
+
 def _apply_patch_write_paths(tool_input: dict[str, Any]) -> tuple[list[str], str | None]:
     raw_patch = next(
         (
@@ -5057,6 +5234,139 @@ def _persist_hook_degraded(payload: Any, args: argparse.Namespace, exc: Exceptio
         pass
 
 
+def _stop_response_with_round_summary(
+    finalized: dict[str, Any],
+    events: list[dict[str, Any]],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the bounded Stop continuation needed for an honest final report."""
+    current_summary_text = render_round_process_summary(
+        build_round_process_summary(finalized, events)
+    ).strip()
+    bound_hash = str(finalized.get("stop_summary_sha256") or "").strip()
+    bound_text = str(finalized.get("stop_summary_text") or "").strip()
+    summary_text = (
+        bound_text
+        if re.fullmatch(r"[0-9a-f]{64}", bound_hash)
+        and sha256_text(bound_text) == bound_hash
+        else current_summary_text
+    )
+    last_message = str(payload.get("last_assistant_message") or "").rstrip()
+    marker = "# RoundProcessSummary/v1"
+    marker_index = last_message.rfind(marker)
+    submitted_summary = (
+        last_message[marker_index:].strip() if marker_index >= 0 else ""
+    )
+    normalized_summary = unicodedata.normalize("NFC", summary_text)
+    normalized_submitted_summary = unicodedata.normalize("NFC", submitted_summary)
+    accepted_hashes = {sha256_text(normalized_summary)}
+    summary_missing = (
+        not normalized_submitted_summary
+        or sha256_text(normalized_submitted_summary) not in accepted_hashes
+    )
+    host_gate = (
+        finalized.get("host_gate")
+        if isinstance(finalized.get("host_gate"), dict)
+        else {}
+    )
+    should_block = host_gate.get("should_block") is True
+    stop_attempt = int(finalized.get("stop_attempts") or 0)
+    execution_mode = str(finalized.get("execution_mode") or "enforce").strip().casefold()
+    if execution_mode not in {"observe", "warn", "enforce"}:
+        execution_mode = "enforce"
+    should_request_summary = (
+        summary_missing and stop_attempt <= 2 and execution_mode == "enforce"
+    )
+    if summary_missing and execution_mode != "enforce" and not should_block:
+        return {
+            "systemMessage": (
+                "Agent Supervisor advisory: Codex observe/warn mode does not hard-block "
+                "turn completion. Include this signed RoundProcessSummary/v1 in the final "
+                "answer when possible:\n\n" + summary_text
+            )
+        }
+    if not should_block and not should_request_summary:
+        return {}
+
+    reasons: list[str] = []
+    if should_block:
+        validation = (
+            finalized.get("validation")
+            if isinstance(finalized.get("validation"), dict)
+            else {}
+        )
+        errors = [str(value) for value in validation.get("errors", [])[:5]]
+        reasons.append(
+            "Supervisor v3 未满足完成门禁："
+            + ("；".join(errors) if errors else "存在未闭环条件")
+            + "。"
+        )
+    if should_request_summary:
+        reasons.append(
+            "结束前必须在最终回答末尾原样输出下面的可视化工作简报；"
+            "不得删除时间线、调用类型、任务贡献、Evidence 或真实终态：\n\n"
+            + summary_text
+        )
+    return {
+        "decision": "block",
+        "reason": "\n\n".join(reasons),
+        "systemMessage": "Agent Supervisor 要求最终回答包含 RoundProcessSummary/v1。",
+    }
+
+
+def _bind_first_stop_summary(
+    ctx: StateContext,
+    finalized: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind the first rendered Stop summary before later finalization timestamps move."""
+    summary_text = render_round_process_summary(
+        build_round_process_summary(finalized, events)
+    ).strip()
+    summary_sha256 = sha256_text(summary_text)
+    existing = str(finalized.get("stop_summary_sha256") or "").strip()
+    existing_text = str(finalized.get("stop_summary_text") or "").strip()
+    stop_attempt = int(finalized.get("stop_attempts") or 0)
+    goal = finalized.get("goal") if isinstance(finalized.get("goal"), dict) else {}
+    existing_is_bound = bool(
+        re.fullmatch(r"[0-9a-f]{64}", existing)
+        and sha256_text(existing_text) == existing
+        and any(
+            event.get("event_type") == "round_summary_bound"
+            and event.get("summary_sha256") == existing
+            and event.get("goal_id") == goal.get("goal_id")
+            and event.get("goal_version") == goal.get("version")
+            and event.get("round") == finalized.get("round")
+            and verify_record(event)
+            for event in events
+            if isinstance(event, dict)
+        )
+    )
+    if existing_is_bound:
+        return finalized
+    event = {
+        "contract": "RoundSummaryBinding/v1",
+        "event_type": "round_summary_bound",
+        "goal_id": str(goal.get("goal_id") or ""),
+        "goal_version": int(goal.get("version") or 1),
+        "round": str(finalized.get("round") or ""),
+        "stop_attempt": stop_attempt,
+        "summary_sha256": summary_sha256,
+        "transaction_id": stable_id("round-summary-binding"),
+    }
+    event["attestation"] = sign_record(event)
+
+    def persist(current: dict[str, Any]) -> None:
+        current["stop_summary_sha256"] = summary_sha256
+        current["stop_summary_text"] = summary_text
+
+    ctx.transact(persist, event)
+    bound = copy.deepcopy(finalized)
+    bound["stop_summary_sha256"] = summary_sha256
+    bound["stop_summary_text"] = summary_text
+    return bound
+
+
 def command_hook(args: argparse.Namespace) -> int:
     payload: Any = {}
     try:
@@ -5123,6 +5433,28 @@ def command_hook(args: argparse.Namespace) -> int:
                     "updated_at": utc_now(),
                 }))
             state = _initialize_cli_source_snapshot(ctx, state, shadow=False)
+            supervisor_invocation_id = stable_id("supervisor-bootstrap")
+            supervisor_intent_ids = [
+                str(item.get("intent_id") or "")
+                for item in state.get("intents", [])
+                if isinstance(item, dict) and str(item.get("intent_id") or "").strip()
+            ]
+            ctx.append_event(invocation_event(
+                invocation_id=supervisor_invocation_id,
+                capability="dev-supervisor",
+                stage="attempt",
+                result=None,
+                actor=ns.runtime,
+                details={
+                    "phase": "intake",
+                    "kind": "skill",
+                    "summary": "Started GoalContract analysis and current capability scan",
+                    "intent_ids": supervisor_intent_ids,
+                    **_invocation_state_binding(state),
+                },
+                identity_assurance=_hook_identity_assurance(ns.runtime),
+                responsibility_group="supervision",
+            ))
             route: dict[str, Any] | None = None
             try:
                 roots, inventory, discovery = _trusted_capability_discovery(
@@ -5153,6 +5485,22 @@ def command_hook(args: argparse.Namespace) -> int:
                     current["updated_at"] = utc_now()
 
                 state = ctx.update(persist_capabilities)
+                ctx.append_event(invocation_event(
+                    invocation_id=supervisor_invocation_id,
+                    capability="dev-supervisor",
+                    stage="result",
+                    result="success",
+                    actor=ns.runtime,
+                    details={
+                        "phase": "intake",
+                        "kind": "skill",
+                        "summary": "Created GoalContract and refreshed the current capability route",
+                        "intent_ids": supervisor_intent_ids,
+                        **_invocation_state_binding(state),
+                    },
+                    identity_assurance=_hook_identity_assurance(ns.runtime),
+                    responsibility_group="supervision",
+                ))
             except Exception as exc:
                 degradation = {
                     "contract": "CapabilityBootstrapDegradation/v3",
@@ -5166,6 +5514,22 @@ def command_hook(args: argparse.Namespace) -> int:
                     "capability_bootstrap_degradation": degradation,
                     "updated_at": utc_now(),
                 }))
+                ctx.append_event(invocation_event(
+                    invocation_id=supervisor_invocation_id,
+                    capability="dev-supervisor",
+                    stage="result",
+                    result="failed",
+                    actor=ns.runtime,
+                    details={
+                        "phase": "intake",
+                        "kind": "skill",
+                        "summary": "Capability scan or routing failed; Supervisor state is degraded",
+                        "intent_ids": supervisor_intent_ids,
+                        **_invocation_state_binding(state),
+                    },
+                    identity_assurance=_hook_identity_assurance(ns.runtime),
+                    responsibility_group="supervision",
+                ))
             if isinstance(adapter, dict) and adapter.get("degraded_prior") is True:
                 state = ctx.update(lambda current: current.update({"health": "degraded", "updated_at": utc_now()}))
                 ctx.append_event({"event_type": "adapter_recovered", "status": "degraded", "degraded_prior": True, "adapter_version": adapter.get("adapter_version")})
@@ -5249,15 +5613,18 @@ def command_hook(args: argparse.Namespace) -> int:
             if raw_responsibility_group is not None
             else None
         ) or None
-        capability_name = str(
-            tool_input.get("skill")
-            or tool_input.get("capability")
-            or tool_input.get("agent")
-            or tool_input.get("subagent_type")
-            or payload.get("agent_type")
-            or payload.get("subagent_type")
-            or tool_name
+        observed_tool_name = (
+            "Subagent"
+            if tool_name == "unknown" and args.event in {"SubagentStart", "SubagentStop"}
+            else tool_name
         )
+        breaker_capability_name = _inventory_bound_breaker_capability_name(
+            state,
+            tool_name=observed_tool_name,
+            tool_input=tool_input,
+            payload=payload,
+        )
+        capability_name = breaker_capability_name or observed_tool_name
         invocation_id = str(
             payload.get("tool_use_id")
             or payload.get("tool_call_id")
@@ -5335,10 +5702,14 @@ def command_hook(args: argparse.Namespace) -> int:
                         ),
                     }
                 }
-            breaker = state.get("capability_breakers", {}).get(capability_name, {})
+            breaker = (
+                state.get("capability_breakers", {}).get(breaker_capability_name, {})
+                if breaker_capability_name
+                else {}
+            )
             if isinstance(breaker, dict) and breaker.get("open") is True:
                 fallback_id = _breaker_fallback_id(
-                    state, capability_name, breaker
+                    state, breaker_capability_name, breaker
                 )
                 ctx.append_event({
                     "event_type": "invocation_fallback_required",
@@ -5400,7 +5771,11 @@ def command_hook(args: argparse.Namespace) -> int:
                 or response_failed
             )
             result_name = "failed" if failed else "success"
-            ctx.update(lambda state_value: _record_breaker_result(state_value, capability_name, result_name))
+            ctx.update(
+                lambda state_value: _record_breaker_result(
+                    state_value, breaker_capability_name, result_name
+                )
+            )
             result_details = {"summary": f"{tool_name} completed", **_invocation_state_binding(state)}
             tool_kind = _timeline_kind_for_tool(tool_name)
             if tool_kind:
@@ -5465,11 +5840,14 @@ def command_hook(args: argparse.Namespace) -> int:
             except SupervisorSourceSnapshotMismatch:
                 pass
             finalized, _ = finalize_round(ctx)
-            if finalized["host_gate"]["should_block"]:
-                reason = "; ".join(finalized["validation"]["errors"][:5])
-                print(json.dumps({"decision": "block", "reason": f"Supervisor v3 incomplete: {reason}"}, ensure_ascii=False))
-            else:
-                print("{}")
+            events = ctx.events()
+            finalized = _bind_first_stop_summary(ctx, finalized, events)
+            output = _stop_response_with_round_summary(
+                finalized,
+                events,
+                payload,
+            )
+            print(json.dumps(output, ensure_ascii=False))
             return EXIT_COMPLETE  # hooks fail open; persisted state remains authoritative
         ctx.append_event({"event_type": f"hook_{args.event}", "status": "observed", "summary": "hook lifecycle event"})
         print("{}")
@@ -5491,7 +5869,7 @@ def _add_namespace(parser: argparse.ArgumentParser, *, round_required: bool = Fa
 
 def build_parser() -> Parser:
     parser = Parser(prog="agent-supervisor", description="Agent Supervisor v3 shared core")
-    parser.add_argument("--version", action="version", version="3.1.6")
+    parser.add_argument("--version", action="version", version="3.1.12")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("start")
     _add_namespace(p)

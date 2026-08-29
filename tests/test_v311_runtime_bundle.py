@@ -317,6 +317,7 @@ def test_runtime_bundle_contains_deterministic_non_test_adapter_snapshot() -> No
     assert first_blob == second_blob
     paths = {item["path"] for item in _manifest(first_blob)["files"]}
     assert {
+        ".github/workflows/ci.yml",
         "integrations/codex/scripts/codex-supervisor-hook.py",
         "integrations/codex/scripts/supervisor-core.ps1",
         "integrations/codex/scripts/supervisor-process-job.py",

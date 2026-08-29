@@ -10,9 +10,9 @@ previous version, backs up changed managed files, copies the thin adapters, and 
 ```powershell
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 Set-Location agent-supervisor
-git checkout v3.1.6
+git checkout v3.1.12
 python -m pip install .
-python bin/install-agent-supervisor.py
+python bin/install-agent-supervisor.py --no-codex-global-activation
 ```
 
 Linux and macOS:
@@ -20,16 +20,17 @@ Linux and macOS:
 ```bash
 git clone https://github.com/SevenTeenBoy17/agent-supervisor.git
 cd agent-supervisor
-git checkout v3.1.6
+git checkout v3.1.12
 python3 -m pip install .
-python3 bin/install-agent-supervisor.py
+python3 bin/install-agent-supervisor.py --no-codex-global-activation
 ```
 
 The package install supplies the declared PyYAML and jsonschema dependencies used by
-the isolated runtime. Review the JSON plan. Then apply it:
+the isolated runtime. Review the JSON plan. The first applied pass intentionally
+installs the core and adapters without writing global Codex hooks:
 
 ```powershell
-python bin/install-agent-supervisor.py --apply
+python bin/install-agent-supervisor.py --no-codex-global-activation --apply
 python "$HOME/.agent-supervisor/bin/agent-supervisor.py" --version
 ```
 
@@ -40,50 +41,24 @@ runtime ZIP and run its installer. The installer itself makes no network calls, 
 `pip install` may need network access for PyYAML and jsonschema unless those dependencies
 are already available locally.
 
+Complete the executable-trust step below, then return to the Codex activation step and
+run the installer without `--no-codex-global-activation`. This ordering prevents a new
+global hook from running before its exact Python executable is trusted.
+
 Use `--install-home <absolute-path>` for an isolated profile and `--core-only` to omit
-adapter copies. The installer does not create or change
-`trusted-executables.json`, Codex hooks/`AGENTS.md`, or Claude settings.
+adapter copies. A normal adapter install merges Agent Supervisor into the user-level
+Codex `hooks.json` and inserts one replaceable managed block in `AGENTS.md`; it preserves
+unrelated entries and backs up changed files. Use `--no-codex-global-activation` to
+install adapters without those two Codex activation changes. The installer does not
+change `trusted-executables.json` or Claude settings.
 
-## 2. Activate the Codex monitoring layer
+When upgrading from an earlier v3.1.x installation, use the same two-pass sequence:
+first apply with `--no-codex-global-activation`, refresh executable trust if the Python
+path or hash changed, and only then apply without the opt-out flag. The final pass
+replaces the legacy PATH-resolved Codex handler with commands bound to the installer
+Python while preserving unrelated hooks.
 
-The Codex files are installed at `~/.codex/skills/dev-supervisor/`. Add the following
-policy to your user-level Codex `AGENTS.md` after reviewing it:
-
-```markdown
-Apply the `dev-supervisor` skill as the default monitoring layer whenever a workspace is
-available. Begin each round with `scripts/supervisor-bootstrap.ps1`, pass the newest
-request and classify it as continue, extend, or replace. Require criterion-bound
-EvidenceRecords, independent review, registered gates, and successful finalization before
-claiming completion. Project AGENTS.md and the current user request remain authoritative.
-```
-
-Complete the executable-trust step below before enabling lifecycle hooks. On Windows,
-the native Codex adapter requires an exact `python` path and SHA-256 in
-`trusted-executables.json`; without it the hook deliberately fails open as degraded. On
-Linux and macOS, the running Python and `pwsh` must resolve through a supported,
-root-owned fixed path or an exact registry entry.
-
-If your Codex host supports project hooks, configure the installed
-`scripts/codex-supervisor-hook.py` for the supported lifecycle events and confirm the
-result in `/hooks` after starting a fresh task. Host hook availability is a platform
-capability; do not claim it is active until a real probe reaches the adapter.
-
-## 3. Activate the Claude adapter
-
-The Claude files are installed at `~/.claude/skills/supervisor/`. The settings
-configurator preserves unrelated settings and replaces only exact Supervisor-owned hook
-entries. Run it explicitly, inspect its before/after hashes, and restart Claude Code:
-
-The configurator intentionally refuses a missing or invalid settings file. Start Claude
-Code once so it creates `~/.claude/settings.json`. If Claude has never been started, you
-may instead create that file with exactly `{}` after confirming it does not already
-exist; never overwrite existing settings.
-
-```powershell
-python "$HOME/.claude/skills/supervisor/scripts/configure-v3-hooks.py"
-```
-
-## 4. Configure executable trust for Codex hooks and external gates
+## 2. Configure executable trust for Codex hooks and external gates
 
 The machine-local registry is used by the Codex lifecycle adapter as well as registered
 external commands. The Windows adapter requires the exact Python executable entry shown
@@ -131,6 +106,49 @@ commands.
 
 Do not commit this file. Recompute approvals whenever an executable path, executable
 bytes, or gate argv changes.
+
+## 3. Activate the Codex monitoring layer
+
+The Codex files are installed at `~/.codex/skills/dev-supervisor/`. The installer also
+creates or merges `~/.codex/hooks.json` and a marked global policy block in
+`~/.codex/AGENTS.md`. Those user-level hooks are discovered in every project, including
+projects without `.codex/hooks.json`.
+
+After the trust registry is ready, review the normal plan and enable the global layer:
+
+```powershell
+python bin/install-agent-supervisor.py
+python bin/install-agent-supervisor.py --apply
+```
+
+Use `python3` on Linux and macOS. On Windows, the native Codex adapter requires the exact
+`python` path and SHA-256 in `trusted-executables.json`; without it the hook deliberately
+fails open as degraded. On Linux and macOS, the running Python and `pwsh` must resolve
+through a supported, root-owned fixed path or an exact registry entry.
+
+Open `/hooks`, review and trust the user-level Agent Supervisor definitions, then start
+a fresh task. In `enforce` mode, the Stop hook requests one bounded continuation whenever
+the assistant's last message omits the rendered `RoundProcessSummary/v1`. In `observe`
+and `warn` modes it records the omission as an advisory warning without blocking the
+host loop. The supplied summary contains the timestamped Skill/Agent/Plugin/native-command
+timeline and completed contribution for each signed invocation. Host hook availability
+remains a platform capability; do not claim activation until `/hooks` lists the user
+source and a fresh-session probe reaches the adapter.
+
+## 4. Activate the Claude adapter
+
+The Claude files are installed at `~/.claude/skills/supervisor/`. The settings
+configurator preserves unrelated settings and replaces only exact Supervisor-owned hook
+entries. Run it explicitly, inspect its before/after hashes, and restart Claude Code:
+
+The configurator intentionally refuses a missing or invalid settings file. Start Claude
+Code once so it creates `~/.claude/settings.json`. If Claude has never been started, you
+may instead create that file with exactly `{}` after confirming it does not already
+exist; never overwrite existing settings.
+
+```powershell
+python "$HOME/.claude/skills/supervisor/scripts/configure-v3-hooks.py"
+```
 
 ## Uninstall and rollback
 

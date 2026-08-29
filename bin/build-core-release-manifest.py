@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -19,6 +20,18 @@ from supervisor_core.runtime_bundle import (
     inspect_runtime_bundle,
     release_identity,
 )
+from supervisor_core.executable_trust import (
+    ExecutableTrustError,
+    load_trusted_executable_registry,
+    resolve_trusted_executable,
+)
+
+
+_SAFE_ENV_NAMES = {
+    "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+    "OS", "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP",
+    "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+}
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -174,6 +187,105 @@ def _atomic_write(path: Path, content: bytes) -> None:
         raise
 
 
+def _repository_version(root: Path) -> str:
+    path = root / "VERSION"
+    try:
+        raw = path.read_bytes()
+        value = raw.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeBundleError("repository-version-invalid") from exc
+    allowed = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.+-"
+    if not value or any(char not in allowed for char in value):
+        raise RuntimeBundleError("repository-version-invalid")
+    return value
+
+
+def _trusted_git(root: Path) -> str:
+    try:
+        registry = load_trusted_executable_registry()
+        executable, _ = resolve_trusted_executable("git", registry, cwd=str(root))
+    except (ExecutableTrustError, OSError, ValueError) as exc:
+        raise RuntimeBundleError("git-publishable-set-unavailable") from exc
+    if not Path(executable).is_absolute():
+        raise RuntimeBundleError("git-publishable-set-unavailable")
+    return executable
+
+
+def _minimal_git_environment(executable: str) -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in _SAFE_ENV_NAMES and isinstance(value, str)
+    }
+    environment.update({
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "NoDefaultCurrentDirectoryInExePath": "1",
+        "PATH": str(Path(executable).parent),
+    })
+    return environment
+
+
+def _git_publishable_paths(root: Path) -> set[str] | None:
+    """Return the exact Git-tracked set when the source is a checkout."""
+    git_executable = _trusted_git(root)
+    command_prefix = [git_executable, "-C", str(root)]
+    environment = _minimal_git_environment(git_executable)
+    try:
+        top_level = subprocess.run(
+            [*command_prefix, "rev-parse", "--show-toplevel"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeBundleError("git-publishable-set-unavailable") from exc
+    if len(top_level.stdout) > 32 * 1024 or len(top_level.stderr) > 32 * 1024:
+        raise RuntimeBundleError("git-publishable-set-unavailable")
+    if top_level.returncode != 0:
+        if b"not a git repository" in top_level.stderr.lower():
+            return None
+        raise RuntimeBundleError("git-publishable-set-unavailable")
+    try:
+        checkout_root = Path(top_level.stdout.decode("utf-8").strip()).resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError, UnicodeDecodeError) as exc:
+        raise RuntimeBundleError("git-publishable-set-unavailable") from exc
+    if os.path.normcase(str(checkout_root)) != os.path.normcase(str(root)):
+        raise RuntimeBundleError("git-publishable-root-mismatch")
+    try:
+        completed = subprocess.run(
+            [*command_prefix, "ls-files", "-z"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeBundleError("git-publishable-set-unavailable") from exc
+    if completed.returncode != 0 or len(completed.stdout) > 32 * 1024 * 1024:
+        raise RuntimeBundleError("git-publishable-set-unavailable")
+    return {
+        value.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        for value in completed.stdout.split(b"\0")
+        if value
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=ROOT)
@@ -194,7 +306,17 @@ def main() -> int:
     if identity_output is not None:
         _validate_distinct_outputs(output, identity_output)
 
+    repository_version = _repository_version(root)
+    if args.version != repository_version:
+        raise RuntimeBundleError("requested-version-does-not-match-VERSION")
+
     bundle = build_runtime_bundle(root, args.version)
+    inspected = inspect_runtime_bundle(bundle, expected_identity=None)
+    publishable = _git_publishable_paths(root)
+    if publishable is not None:
+        bundled_sources = set(inspected["members"]) - {"SUPERVISOR-RUNTIME-MANIFEST.json"}
+        if not bundled_sources <= publishable:
+            raise RuntimeBundleError("runtime-bundle-includes-non-publishable-source")
     identity = release_identity(
         root,
         args.version,

@@ -68,15 +68,19 @@ sub-agent spawn, or intentional compaction. Do not hand-edit generated state.
 
 ## Codex host integration and limits
 
-Codex project hooks are configured through `.codex/hooks.json`. After the user trusts
-the workspace and reloads/starts a fresh session, this adapter covers the 11 supported
+Codex user hooks are configured through `~/.codex/hooks.json` and apply across projects;
+project `.codex/hooks.json` layers may add narrower policies. After the user reviews the
+user hook source with `/hooks` and reloads/starts a fresh session, this adapter covers the 11 supported
 lifecycle events: SessionStart, UserPromptSubmit, PreToolUse, PermissionRequest,
 PostToolUse, PreCompact, PostCompact, SubagentStart, SubagentStop, Stop, and SessionEnd.
-PreToolUse can deny an unsafe action and Stop can request continuation, but activation
-must not be claimed until `/hooks` shows the project configuration and a fresh-session
-probe reaches the adapter. Hosted WebSearch and host-special tools that opt out of
-hooks remain coverage limitations; record them as degraded instead of inventing an
-event or a hard block.
+PreToolUse can deny an unsafe action. Stop finalizes the round and requests a bounded
+continuation when the final assistant message lacks the rendered
+`RoundProcessSummary/v1`, so every normal task ends with a visual timestamped timeline
+of signed Skill/Agent/Plugin/native-command contributions. Activation must not be
+claimed until `/hooks` shows the user configuration and a fresh-session probe reaches
+the adapter. Hosted WebSearch and host-special tools that opt out of hooks remain
+coverage limitations; record them as degraded instead of inventing an event or hard
+block.
 
 ## Commands
 
