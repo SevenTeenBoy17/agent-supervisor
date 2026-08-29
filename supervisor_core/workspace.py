@@ -284,7 +284,7 @@ def _runtime_only_path(relative: str) -> bool:
     if parts[1] == ".pytest_cache" or parts[1].startswith(".pytest-tmp"):
         return True
     return parts[1] in {
-        "handoffs", "state", "logs", "spool", "cache",
+        "handoffs", "state", "logs", "spool", "cache", "records",
         "timeline.jsonl", "ledger.json", "status.md", "context-snapshot.md",
         "current-goal.md", "handoff.md", ".attestation-key",
     }

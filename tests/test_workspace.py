@@ -40,6 +40,9 @@ def test_runtime_supervisor_files_cannot_manufacture_a_workspace_diff(tmp_path):
     tracked_runtime_cache = workspace / ".agent-supervisor" / ".pytest-tmp-versioned" / "result.json"
     tracked_runtime_cache.parent.mkdir(parents=True)
     tracked_runtime_cache.write_text('{"result":1}\n', encoding="utf-8")
+    tracked_task_record = workspace / ".agent-supervisor" / "records" / "task-record.json"
+    tracked_task_record.parent.mkdir(parents=True)
+    tracked_task_record.write_text('{"status":"doing"}\n', encoding="utf-8")
     tracked_codex_state = workspace / ".codex-supervisor" / "context-snapshot.md"
     tracked_codex_state.parent.mkdir(parents=True)
     tracked_codex_state.write_text("tracked context v1\n", encoding="utf-8")
@@ -57,6 +60,7 @@ def test_runtime_supervisor_files_cannot_manufacture_a_workspace_diff(tmp_path):
         ".agent-supervisor/project.json",
         ".agent-supervisor/handoffs/tracked/latest.md",
         ".agent-supervisor/.pytest-tmp-versioned/result.json",
+        ".agent-supervisor/records/task-record.json",
         ".codex-supervisor/context-snapshot.md",
         "scripts/__pycache__/adapter.py",
         "fixtures/.pytest_cache/contract.json",
@@ -79,6 +83,7 @@ def test_runtime_supervisor_files_cannot_manufacture_a_workspace_diff(tmp_path):
     codex_state.write_text("runtime context\n", encoding="utf-8")
     tracked_handoff.write_text("tracked runtime handoff v2\n", encoding="utf-8")
     tracked_runtime_cache.write_text('{"result":2}\n', encoding="utf-8")
+    tracked_task_record.write_text('{"status":"done"}\n', encoding="utf-8")
     tracked_codex_state.write_text("tracked context v2\n", encoding="utf-8")
 
     runtime_only = workspace_delta(
