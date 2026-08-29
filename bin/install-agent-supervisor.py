@@ -45,7 +45,7 @@ _ADAPTER_SUFFIXES = {".json", ".md", ".ps1", ".py"}
 _CODEX_HOOK_DESCRIPTION = (
     "Agent Supervisor v3 lifecycle hooks. Review and trust changes with /hooks. "
     "Local tool hooks are guardrails; hosted WebSearch is outside their coverage. "
-    "SessionEnd uses the official 3-second maximum."
+    "Configured hook budgets include the adapter's identity, startup, and cleanup margin."
 )
 _AGENTS_BLOCK_START = "<!-- agent-supervisor:managed:start -->"
 _AGENTS_BLOCK_END = "<!-- agent-supervisor:managed:end -->"
@@ -123,18 +123,24 @@ def _codex_managed_hooks(
     install_home: Path,
     interpreter: Path,
 ) -> dict[str, list[dict[str, Any]]]:
+    # The configured Codex timeout covers the adapter's complete outer bridge,
+    # not only the inner Supervisor core deadline.  The bridge can spend up to
+    # 12.5 seconds on interpreter identity, process startup, stream cleanup, and
+    # its final grace period.  Keep an additional bounded host margin so Codex
+    # does not terminate a healthy hook before the adapter can return its
+    # structured result.
     definitions = {
-        "SessionStart": ("startup|resume|clear|compact", 15, "Starting Supervisor"),
-        "UserPromptSubmit": (None, 30, "Aligning goal"),
-        "PreToolUse": ("*", 15, "Checking tool policy"),
-        "PermissionRequest": ("*", 15, "Checking permission"),
-        "PostToolUse": ("*", 15, "Recording tool result"),
-        "PreCompact": ("manual|auto", 15, "Preserving context"),
-        "PostCompact": ("manual|auto", 15, "Restoring context"),
-        "SubagentStart": ("*", 15, "Registering subagent"),
-        "SubagentStop": ("*", 20, "Reviewing subagent"),
-        "Stop": (None, 30, "Running quality gate"),
-        "SessionEnd": ("*", 3, "Closing Supervisor"),
+        "SessionStart": ("startup|resume|clear|compact", 60, "Starting Supervisor"),
+        "UserPromptSubmit": (None, 60, "Aligning goal"),
+        "PreToolUse": ("*", 60, "Checking tool policy"),
+        "PermissionRequest": ("*", 60, "Checking permission"),
+        "PostToolUse": ("*", 60, "Recording tool result"),
+        "PreCompact": ("manual|auto", 60, "Preserving context"),
+        "PostCompact": ("manual|auto", 60, "Restoring context"),
+        "SubagentStart": ("*", 60, "Registering subagent"),
+        "SubagentStop": ("*", 60, "Reviewing subagent"),
+        "Stop": (None, 45, "Running quality gate"),
+        "SessionEnd": ("*", 45, "Closing Supervisor"),
     }
     result: dict[str, list[dict[str, Any]]] = {}
     for event, (matcher, timeout, status) in definitions.items():

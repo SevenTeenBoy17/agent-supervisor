@@ -51,6 +51,10 @@ All notable release changes are documented here.
 
 ### Fixed
 
+- Global Codex hook activation now gives the lifecycle bridge enough outer time for
+  interpreter identity, process startup, the event-specific core deadline, and bounded
+  cleanup. This prevents Codex from terminating healthy cross-project hooks before
+  they can return their structured result or final `RoundProcessSummary/v1`.
 - The core-owned default registered-gate timeout now matches the existing
   30-minute hard ceiling, allowing the full cross-platform source suite to finish
   without accepting caller-selected timeout overrides.

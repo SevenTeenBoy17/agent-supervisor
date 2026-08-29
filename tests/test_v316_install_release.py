@@ -84,11 +84,25 @@ def test_installer_is_dry_run_by_default_and_publishes_pointer_last(
         / "scripts"
         / "codex-supervisor-hook.py"
     )
-    for groups in hooks["hooks"].values():
+    expected_timeouts = {
+        "SessionStart": 60,
+        "UserPromptSubmit": 60,
+        "PreToolUse": 60,
+        "PermissionRequest": 60,
+        "PostToolUse": 60,
+        "PreCompact": 60,
+        "PostCompact": 60,
+        "SubagentStart": 60,
+        "SubagentStop": 60,
+        "Stop": 45,
+        "SessionEnd": 45,
+    }
+    for event, groups in hooks["hooks"].items():
         managed = groups[-1]["hooks"][0]
         assert managed["commandWindows"].startswith(expected_python + " ")
         assert expected_adapter in managed["commandWindows"]
         assert "py -3" not in managed["commandWindows"]
+        assert managed["timeout"] == expected_timeouts[event]
     agents = agents_path.read_text(encoding="utf-8")
     assert "<!-- agent-supervisor:managed:start -->" in agents
     assert "RoundProcessSummary/v1" in agents
